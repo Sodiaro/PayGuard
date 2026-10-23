@@ -1,0 +1,11 @@
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+// Prisma 7: the URL lives in prisma.config.ts; at runtime PrismaService connects via the pg adapter.
+datasource db {
+  provider = "postgresql"
+}
