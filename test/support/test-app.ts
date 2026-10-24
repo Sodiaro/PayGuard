@@ -5,16 +5,30 @@ import { AppModule } from '../../src/app.module.js';
 import { configureApp } from '../../src/app.setup.js';
 import { PrismaService } from '../../src/database/prisma.service.js';
 import { MerchantsService } from '../../src/merchants/merchants.service.js';
+import {
+  PAYMENT_PROVIDER,
+  type PaymentProvider,
+} from '../../src/payments/providers/payment-provider.js';
+
+export interface TestAppOptions {
+  logger?: LoggerService | false;
+  // Test-only replacement for the configured simulator.
+  provider?: PaymentProvider;
+}
 
 export async function createTestApp(
-  logger: LoggerService | false = false,
+  options: TestAppOptions = {},
 ): Promise<INestApplication<App>> {
-  const moduleRef = await Test.createTestingModule({
-    imports: [AppModule],
-  }).compile();
+  let builder = Test.createTestingModule({ imports: [AppModule] });
+  if (options.provider) {
+    builder = builder
+      .overrideProvider(PAYMENT_PROVIDER)
+      .useValue(options.provider);
+  }
+  const moduleRef = await builder.compile();
 
   const app = moduleRef.createNestApplication<INestApplication<App>>({
-    logger,
+    logger: options.logger ?? false,
   });
   configureApp(app);
   await app.init();

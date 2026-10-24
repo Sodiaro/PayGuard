@@ -35,7 +35,7 @@ describe('API-key authentication over HTTP (PostgreSQL)', () => {
   let logOutput: string[];
 
   beforeAll(async () => {
-    app = await createTestApp(new AppLogger({ json: true }));
+    app = await createTestApp({ logger: new AppLogger({ json: true }) });
     prisma = prismaOf(app);
   });
 
