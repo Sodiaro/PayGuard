@@ -9,3 +9,42 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+enum MerchantStatus {
+  ACTIVE
+  SUSPENDED
+
+  @@map("merchant_status")
+}
+
+model Merchant {
+  id        String         @id @default(uuid(7)) @db.Uuid
+  // Operator-chosen handle; the unique constraint makes provisioning retries fail instead of duplicating.
+  slug      String         @unique @db.VarChar(64)
+  name      String         @db.VarChar(200)
+  status    MerchantStatus @default(ACTIVE)
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  apiKeys MerchantApiKey[]
+
+  @@map("merchants")
+}
+
+model MerchantApiKey {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  merchantId String    @map("merchant_id") @db.Uuid
+  prefix     String    @unique @db.VarChar(32)
+  // SHA-256 of the secret part only; see src/auth/api-key.ts for why a fast hash is sufficient.
+  secretHash Bytes     @map("secret_hash")
+  label      String?   @db.VarChar(100)
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(3)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  // Restrict: merchants are suspended, never deleted, so key history stays auditable.
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  @@index([merchantId])
+  @@map("merchant_api_keys")
+}
