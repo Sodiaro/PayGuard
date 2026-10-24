@@ -26,7 +26,8 @@ model Merchant {
   createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  apiKeys MerchantApiKey[]
+  apiKeys  MerchantApiKey[]
+  payments Payment[]
 
   @@map("merchants")
 }
@@ -47,4 +48,73 @@ model MerchantApiKey {
 
   @@index([merchantId])
   @@map("merchant_api_keys")
+}
+
+// Allowed transitions live in src/payments/payment-lifecycle.ts.
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+
+  @@map("payment_status")
+}
+
+enum PaymentAttemptStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+
+  @@map("payment_attempt_status")
+}
+
+enum PaymentFailureCode {
+  DECLINED
+  PROVIDER_UNAVAILABLE
+
+  @@map("payment_failure_code")
+}
+
+model Payment {
+  id         String        @id @default(uuid(7)) @db.Uuid
+  merchantId String        @map("merchant_id") @db.Uuid
+  // Smallest currency unit (kobo, cents, yen...); BIGINT because INT caps at ~21M major units.
+  amount     BigInt
+  currency   String        @db.Char(3)
+  status     PaymentStatus @default(PENDING)
+  // Merchant's own reference (e.g. an order ID). Informational only: not unique, not used for idempotency.
+  reference  String?       @db.VarChar(64)
+
+  idempotencyKey     String @map("idempotency_key") @db.VarChar(255)
+  // SHA-256 hex of the canonical request; see src/payments/idempotency.ts.
+  requestFingerprint String @map("request_fingerprint") @db.Char(64)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant         @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  attempts PaymentAttempt[]
+
+  // The idempotency guarantee: one payment per (merchant, key), enforced by the database.
+  @@unique([merchantId, idempotencyKey])
+  @@index([merchantId, createdAt])
+  @@index([merchantId, reference])
+  @@map("payments")
+}
+
+model PaymentAttempt {
+  id                String               @id @default(uuid(7)) @db.Uuid
+  paymentId         String               @map("payment_id") @db.Uuid
+  attemptNumber     Int                  @map("attempt_number")
+  provider          String               @db.VarChar(32)
+  status            PaymentAttemptStatus @default(PENDING)
+  providerReference String?              @map("provider_reference") @db.VarChar(100)
+  failureCode       PaymentFailureCode?  @map("failure_code")
+  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  // Null while the outcome is unknown; set when the attempt reaches a terminal status.
+  completedAt       DateTime?            @map("completed_at") @db.Timestamptz(3)
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([paymentId, attemptNumber])
+  @@map("payment_attempts")
 }
