@@ -13,6 +13,7 @@ describe('validateEnvironment', () => {
       PORT: 3000,
       DATABASE_URL,
       SWAGGER_ENABLED: false,
+      CORS_ALLOWED_ORIGINS: [],
     });
   });
 
@@ -22,6 +23,7 @@ describe('validateEnvironment', () => {
       PORT: '8080',
       DATABASE_URL,
       SWAGGER_ENABLED: 'true',
+      CORS_ALLOWED_ORIGINS: ' https://app.example.com, http://localhost:5173 ,',
       PATH: '/usr/bin',
     });
 
@@ -30,8 +32,21 @@ describe('validateEnvironment', () => {
       PORT: 8080,
       DATABASE_URL,
       SWAGGER_ENABLED: true,
+      CORS_ALLOWED_ORIGINS: [
+        'https://app.example.com',
+        'http://localhost:5173',
+      ],
     });
   });
+
+  it.each(['*', 'https://app.example.com/', 'app.example.com', 'ftp://x.io'])(
+    'rejects CORS_ALLOWED_ORIGINS=%s',
+    (origins) => {
+      expect(() =>
+        validateEnvironment({ DATABASE_URL, CORS_ALLOWED_ORIGINS: origins }),
+      ).toThrow(/CORS_ALLOWED_ORIGINS/);
+    },
+  );
 
   it('rejects a missing DATABASE_URL', () => {
     expect(() => validateEnvironment({})).toThrow(/DATABASE_URL/);

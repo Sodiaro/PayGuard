@@ -1,5 +1,6 @@
 import { Expose, plainToInstance, Transform, Type } from 'class-transformer';
 import {
+  IsArray,
   IsBoolean,
   IsEnum,
   IsInt,
@@ -42,6 +43,25 @@ export class EnvironmentVariables {
   )
   @IsBoolean()
   SWAGGER_ENABLED: boolean = false;
+
+  // Comma-separated exact origins. Empty means no CORS: secret API keys belong on servers,
+  // not in browsers. Wildcards and paths are rejected.
+  @Expose()
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string'
+      ? value
+          .split(',')
+          .map((origin) => origin.trim())
+          .filter(Boolean)
+      : value,
+  )
+  @IsArray()
+  @Matches(/^https?:\/\/[A-Za-z0-9.-]+(:\d{1,5})?$/, {
+    each: true,
+    message:
+      'CORS_ALLOWED_ORIGINS must be comma-separated origins like https://app.example.com',
+  })
+  CORS_ALLOWED_ORIGINS: string[] = [];
 }
 
 export function validateEnvironment(

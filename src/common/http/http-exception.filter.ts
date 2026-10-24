@@ -26,6 +26,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
         ? exception.getStatus()
         : HttpStatus.INTERNAL_SERVER_ERROR;
     const requestId = String(response.getHeader(REQUEST_ID_HEADER) ?? '');
+    // Query strings are dropped from both the response and the log: they are where leaked credentials turn up.
+    const path = request.originalUrl.split('?')[0];
 
     const body: ErrorResponse = {
       statusCode,
@@ -34,7 +36,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
       ...(exception instanceof RequestValidationException && {
         details: exception.details,
       }),
-      path: request.originalUrl,
+      path,
       timestamp: new Date().toISOString(),
       requestId,
     };
@@ -42,7 +44,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
     // Request bodies are deliberately not logged: they can carry credentials or card data.
     if (statusCode >= 500) {
       this.logger.error(
-        `${request.method} ${request.originalUrl} -> ${statusCode} [requestId=${requestId}]`,
+        `Unhandled error: ${request.method} ${path} -> ${statusCode}`,
         exception instanceof Error ? exception.stack : String(exception),
       );
     }
