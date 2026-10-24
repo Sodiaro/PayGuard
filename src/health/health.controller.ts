@@ -14,9 +14,11 @@ import {
   type HealthIndicatorFunction,
 } from '@nestjs/terminus';
 import type { Response } from 'express';
+import { Public } from '../auth/auth.decorators.js';
 import { DatabaseHealthIndicator } from './database.health-indicator.js';
 
 @ApiTags('Health')
+@Public()
 @Controller({ path: 'health', version: VERSION_NEUTRAL })
 export class HealthController {
   constructor(

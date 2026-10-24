@@ -13,6 +13,7 @@ import request from 'supertest';
 import { App } from 'supertest/types.js';
 import { AppModule } from '../src/app.module.js';
 import { configureApp, setupSwagger } from '../src/app.setup.js';
+import { Public } from '../src/auth/auth.decorators.js';
 import { ErrorResponse } from '../src/common/http/error-response.js';
 
 // Test-only DTOs and controller for exercising the global HTTP conventions end to end.
@@ -32,6 +33,7 @@ class ExampleDto {
   items: ExampleItemDto[];
 }
 
+@Public()
 @Controller('conventions')
 class ConventionsController {
   @Post()

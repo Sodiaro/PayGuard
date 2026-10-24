@@ -1,5 +1,6 @@
 import { describe, expect, it, jest } from '@jest/globals';
 import type { Request, Response } from 'express';
+import { requestContext } from '../logging/request-context.js';
 import {
   REQUEST_ID_HEADER,
   requestIdMiddleware,
@@ -52,5 +53,21 @@ describe('requestIdMiddleware', () => {
     const { responseId } = run(incoming);
 
     expect(responseId).toMatch(UUID);
+  });
+
+  it('runs the rest of the request inside a log context carrying the ID', () => {
+    const request = {
+      headers: {},
+      header: () => 'ctx-1',
+    } as unknown as Request;
+    const response = { setHeader: () => undefined } as unknown as Response;
+    let seen: string | undefined;
+
+    requestIdMiddleware(request, response, () => {
+      seen = requestContext.getStore()?.requestId;
+    });
+
+    expect(seen).toBe('ctx-1');
+    expect(requestContext.getStore()).toBeUndefined();
   });
 });
