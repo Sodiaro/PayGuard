@@ -1,4 +1,5 @@
 import { describe, expect, it } from '@jest/globals';
+import { SimulatorOutcome } from '../payments/providers/simulated-payment-provider.js';
 import { NodeEnvironment, validateEnvironment } from './environment.js';
 
 const DATABASE_URL =
@@ -14,6 +15,10 @@ describe('validateEnvironment', () => {
       DATABASE_URL,
       SWAGGER_ENABLED: false,
       CORS_ALLOWED_ORIGINS: [],
+      PAYMENT_SIMULATOR_OUTCOME: SimulatorOutcome.Succeeded,
+      RATE_LIMIT_IP_PER_MINUTE: 300,
+      RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: 60,
+      TRUST_PROXY_HOPS: 0,
     });
   });
 
@@ -24,6 +29,10 @@ describe('validateEnvironment', () => {
       DATABASE_URL,
       SWAGGER_ENABLED: 'true',
       CORS_ALLOWED_ORIGINS: ' https://app.example.com, http://localhost:5173 ,',
+      PAYMENT_SIMULATOR_OUTCOME: 'DECLINED',
+      RATE_LIMIT_IP_PER_MINUTE: '1000',
+      RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: '5',
+      TRUST_PROXY_HOPS: '1',
       PATH: '/usr/bin',
     });
 
@@ -36,7 +45,23 @@ describe('validateEnvironment', () => {
         'https://app.example.com',
         'http://localhost:5173',
       ],
+      PAYMENT_SIMULATOR_OUTCOME: SimulatorOutcome.Declined,
+      RATE_LIMIT_IP_PER_MINUTE: 1000,
+      RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: 5,
+      TRUST_PROXY_HOPS: 1,
     });
+  });
+
+  it.each([
+    ['PAYMENT_SIMULATOR_OUTCOME', 'succeeded'],
+    ['PAYMENT_SIMULATOR_OUTCOME', 'RANDOM'],
+    ['RATE_LIMIT_IP_PER_MINUTE', '0'],
+    ['RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE', '2.5'],
+    ['TRUST_PROXY_HOPS', '-1'],
+  ])('rejects %s=%s', (name, value) => {
+    expect(() => validateEnvironment({ DATABASE_URL, [name]: value })).toThrow(
+      new RegExp(name),
+    );
   });
 
   it.each(['*', 'https://app.example.com/', 'app.example.com', 'ftp://x.io'])(

@@ -10,6 +10,7 @@ import {
   Min,
   validateSync,
 } from 'class-validator';
+import { SimulatorOutcome } from '../payments/providers/simulated-payment-provider.js';
 
 export enum NodeEnvironment {
   Development = 'development',
@@ -62,6 +63,34 @@ export class EnvironmentVariables {
       'CORS_ALLOWED_ORIGINS must be comma-separated origins like https://app.example.com',
   })
   CORS_ALLOWED_ORIGINS: string[] = [];
+
+  // Operator-controlled outcome of the simulated provider; merchants cannot influence it.
+  @Expose()
+  @IsEnum(SimulatorOutcome)
+  PAYMENT_SIMULATOR_OUTCOME: SimulatorOutcome = SimulatorOutcome.Succeeded;
+
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100_000)
+  RATE_LIMIT_IP_PER_MINUTE: number = 300;
+
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10_000)
+  RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: number = 60;
+
+  // Number of reverse proxies in front of the API. 0 trusts no X-Forwarded-For header, so
+  // per-IP limits key on the socket address; set it to the real hop count behind a load balancer.
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(10)
+  TRUST_PROXY_HOPS: number = 0;
 }
 
 export function validateEnvironment(

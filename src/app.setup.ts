@@ -1,6 +1,7 @@
 import { INestApplication, VersioningType } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import type { Express } from 'express';
 import helmet from 'helmet';
 import { ErrorResponse } from './common/http/error-response.js';
 import { HttpExceptionFilter } from './common/http/http-exception.filter.js';
@@ -13,6 +14,14 @@ import { EnvironmentVariables } from './config/environment.js';
 export function configureApp(app: INestApplication): void {
   const config =
     app.get<ConfigService<EnvironmentVariables, true>>(ConfigService);
+
+  const proxyHops = config.get('TRUST_PROXY_HOPS', { infer: true });
+  if (proxyHops > 0) {
+    (app.getHttpAdapter().getInstance() as Express).set(
+      'trust proxy',
+      proxyHops,
+    );
+  }
 
   app.use(helmet());
   app.use(requestIdMiddleware);
@@ -39,7 +48,7 @@ export function setupSwagger(app: INestApplication): void {
   const config = new DocumentBuilder()
     .setTitle('PayGuard API')
     .setDescription('Payment Processing & Transaction Reliability API')
-    .setVersion('0.2.0')
+    .setVersion('0.3.0')
     .addBearerAuth({
       type: 'http',
       scheme: 'bearer',
