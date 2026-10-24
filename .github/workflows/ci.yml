@@ -66,6 +66,9 @@ jobs:
       - name: Apply migrations to the test database
         run: npm run db:migrate:deploy
 
+      - name: Check migrations match the Prisma schema
+        run: npm run db:migrate:check
+
       - name: Integration tests
         run: npm run test:e2e
 
