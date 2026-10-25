@@ -149,6 +149,7 @@ model PaymentRetryRequest {
 enum OutboxJobType {
   PROCESS_ATTEMPT
   RECONCILE_ATTEMPT
+  APPLY_WEBHOOK_EVENT
 
   @@map("outbox_job_type")
 }
@@ -190,15 +191,20 @@ model OutboxJob {
   lockedUntil     DateTime?            @map("locked_until") @db.Timestamptz(3)
   lastError       OutboxErrorCategory? @map("last_error")
   requestId       String?              @map("request_id") @db.VarChar(128)
+  // Set only on APPLY_WEBHOOK_EVENT jobs: the provider event the job applies.
+  webhookEventId  String?              @unique @map("webhook_event_id") @db.Uuid
   createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
   completedAt     DateTime?            @map("completed_at") @db.Timestamptz(3)
 
-  payment Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
-  attempt PaymentAttempt @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  payment      Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt      PaymentAttempt        @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  webhookEvent ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
 
-  // One job of each type per attempt: re-enqueueing is a no-op, never duplicate work.
-  @@unique([attemptId, type])
+  // One attempt job of each type per attempt, so re-enqueueing is a no-op: enforced by the partial
+  // unique index outbox_jobs_attempt_id_type_key (attempt jobs only), created in the migration
+  // because Prisma cannot express it. Webhook jobs are unique per event instead.
+  @@index([attemptId])
   @@index([paymentId])
   @@map("outbox_jobs")
 }
@@ -231,4 +237,59 @@ model OperatorAuditEvent {
   @@index([createdAt])
   @@index([targetType, targetId])
   @@map("operator_audit_events")
+}
+
+enum ProviderWebhookEventStatus {
+  RECEIVED
+  PROCESSED
+
+  @@map("provider_webhook_event_status")
+}
+
+// What processing concluded; see the README section on provider webhooks for the policy.
+enum ProviderWebhookEventResult {
+  APPLIED
+  ALREADY_APPLIED
+  NO_ACTION
+  UNKNOWN_ATTEMPT
+  OUTCOME_CONFLICT
+  DATA_MISMATCH
+  PAYLOAD_CONFLICT
+
+  @@map("provider_webhook_event_result")
+}
+
+// Authenticated provider notifications, stored before they are acknowledged. Only validated fields
+// are kept, never the raw body or signature. attempt_id is what the provider reported, so it has
+// no foreign key: an event for an unknown attempt is recorded, not applied.
+model ProviderWebhookEvent {
+  id                    String                      @id @default(uuid(7)) @db.Uuid
+  provider              String                      @db.VarChar(32)
+  eventId               String                      @map("event_id") @db.VarChar(100)
+  eventType             String                      @map("event_type") @db.VarChar(64)
+  attemptId             String                      @map("attempt_id") @db.Uuid
+  providerReference     String                      @map("provider_reference") @db.VarChar(100)
+  amount                BigInt
+  currency              String                      @db.Char(3)
+  eventCreatedAt        DateTime                    @map("event_created_at") @db.Timestamptz(3)
+  // Signed delivery timestamp of the first accepted delivery.
+  deliveredAt           DateTime                    @map("delivered_at") @db.Timestamptz(3)
+  // SHA-256 hex of the canonical event; see src/webhooks/provider-webhook.requests.ts.
+  payloadHash           String                      @map("payload_hash") @db.Char(64)
+  status                ProviderWebhookEventStatus  @default(RECEIVED)
+  result                ProviderWebhookEventResult?
+  receivedAt            DateTime                    @default(now()) @map("received_at") @db.Timestamptz(3)
+  processedAt           DateTime?                   @map("processed_at") @db.Timestamptz(3)
+  duplicateDeliveries   Int                         @default(0) @map("duplicate_deliveries")
+  // Deliveries that reused this event ID with different content. They are rejected, never stored.
+  conflictingDeliveries Int                         @default(0) @map("conflicting_deliveries")
+  lastConflictAt        DateTime?                   @map("last_conflict_at") @db.Timestamptz(3)
+
+  outboxJob OutboxJob?
+
+  // Deduplication: a provider event is stored once, however often it is delivered.
+  @@unique([provider, eventId])
+  @@index([attemptId])
+  @@index([receivedAt])
+  @@map("provider_webhook_events")
 }
