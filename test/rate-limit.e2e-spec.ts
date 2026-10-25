@@ -35,8 +35,8 @@ describe('Rate limiting', () => {
     const acme = await provisionMerchant(app, 'acme');
     const globex = await provisionMerchant(app, 'globex');
 
-    await createPayment(acme.apiKey, 'k1').expect(201);
-    await createPayment(acme.apiKey, 'k2').expect(201);
+    await createPayment(acme.apiKey, 'k1').expect(202);
+    await createPayment(acme.apiKey, 'k2').expect(202);
     const limited = await createPayment(acme.apiKey, 'k3').expect(429);
 
     expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0);
@@ -51,7 +51,7 @@ describe('Rate limiting', () => {
     });
     await expect(prismaOf(app).payment.count()).resolves.toBe(2);
 
-    await createPayment(globex.apiKey, 'k3').expect(201);
+    await createPayment(globex.apiKey, 'k3').expect(202);
     await request(app.getHttpServer())
       .get('/v1/merchants/me')
       .set('Authorization', `Bearer ${acme.apiKey}`)

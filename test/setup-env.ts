@@ -6,3 +6,6 @@ config({ quiet: true });
 // Point the app at the dedicated test database so e2e runs can never touch dev data.
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = requireTestDatabaseUrl();
+
+// Tests drive the outbox worker explicitly (processDueJobs) instead of racing a background loop.
+process.env.OUTBOX_WORKER_ENABLED = 'false';

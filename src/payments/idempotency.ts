@@ -36,3 +36,9 @@ export function fingerprintPaymentRequest(
   ]);
   return createHash('sha256').update(canonical, 'utf8').digest('hex');
 }
+
+// A retry has no body, so the logical request is the payment being retried.
+export function fingerprintRetryRequest(paymentId: string): string {
+  const canonical = JSON.stringify(['payments.retry.v1', paymentId]);
+  return createHash('sha256').update(canonical, 'utf8').digest('hex');
+}

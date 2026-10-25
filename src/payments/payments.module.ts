@@ -3,13 +3,14 @@ import { ConfigService } from '@nestjs/config';
 import { RateLimitModule } from '../common/rate-limit/rate-limit.module.js';
 import type { EnvironmentVariables } from '../config/environment.js';
 import { DatabaseModule } from '../database/database.module.js';
+import { OutboxModule } from '../outbox/outbox.module.js';
 import { PaymentsController } from './payments.controller.js';
 import { PaymentsService } from './payments.service.js';
 import { PAYMENT_PROVIDER } from './providers/payment-provider.js';
 import { SimulatedPaymentProvider } from './providers/simulated-payment-provider.js';
 
 @Module({
-  imports: [DatabaseModule, RateLimitModule],
+  imports: [DatabaseModule, OutboxModule, RateLimitModule],
   controllers: [PaymentsController],
   providers: [
     PaymentsService,
@@ -20,13 +21,19 @@ import { SimulatedPaymentProvider } from './providers/simulated-payment-provider
         const outcome = config.get('PAYMENT_SIMULATOR_OUTCOME', {
           infer: true,
         });
-        new Logger('PaymentsModule').warn(
-          `Payments use the simulated provider (outcome: ${outcome}); no real money is moved`,
+        const ambiguous = config.get(
+          'PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS',
+          {
+            infer: true,
+          },
         );
-        return new SimulatedPaymentProvider(outcome);
+        new Logger('PaymentsModule').warn(
+          `Payments use the simulated provider (outcome: ${outcome}, ambiguous submissions: ${ambiguous}); no real money is moved`,
+        );
+        return new SimulatedPaymentProvider(outcome, ambiguous);
       },
     },
   ],
-  exports: [PaymentsService],
+  exports: [PaymentsService, PAYMENT_PROVIDER],
 })
 export class PaymentsModule {}

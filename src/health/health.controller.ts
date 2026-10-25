@@ -17,6 +17,7 @@ import type { Response } from 'express';
 import { Public } from '../auth/auth.decorators.js';
 import { SkipRateLimit } from '../common/rate-limit/rate-limit.guards.js';
 import { DatabaseHealthIndicator } from './database.health-indicator.js';
+import { OutboxHealthIndicator } from './outbox.health-indicator.js';
 
 @ApiTags('Health')
 @Public()
@@ -26,6 +27,7 @@ export class HealthController {
   constructor(
     private readonly health: HealthCheckService,
     private readonly database: DatabaseHealthIndicator,
+    private readonly outbox: OutboxHealthIndicator,
   ) {}
 
   @Get()
@@ -33,12 +35,16 @@ export class HealthController {
   @ApiOperation({
     summary: 'Readiness: the API and its dependencies can serve traffic',
     description:
-      'Returns 503 when a dependency (currently PostgreSQL) is unavailable.',
+      'Returns 503 when PostgreSQL is unavailable. Background processing problems (backlog, stalled ' +
+      'or dead outbox jobs) report status "degraded" with HTTP 200.',
   })
   ready(
     @Res({ passthrough: true }) response: Response,
   ): Promise<HealthCheckResult> {
-    return this.check(response, [() => this.database.pingCheck('database')]);
+    return this.check(response, [
+      () => this.database.pingCheck('database'),
+      () => this.outbox.check('outbox'),
+    ]);
   }
 
   @Get('live')

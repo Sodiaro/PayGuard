@@ -19,6 +19,13 @@ describe('validateEnvironment', () => {
       RATE_LIMIT_IP_PER_MINUTE: 300,
       RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: 60,
       TRUST_PROXY_HOPS: 0,
+      PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: false,
+      OUTBOX_WORKER_ENABLED: true,
+      OUTBOX_POLL_INTERVAL_MS: 1000,
+      OUTBOX_LEASE_SECONDS: 60,
+      OUTBOX_MAX_RUNS: 10,
+      OUTBOX_BACKOFF_MAX_SECONDS: 300,
+      RECONCILIATION_DELAY_SECONDS: 60,
     });
   });
 
@@ -33,6 +40,13 @@ describe('validateEnvironment', () => {
       RATE_LIMIT_IP_PER_MINUTE: '1000',
       RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: '5',
       TRUST_PROXY_HOPS: '1',
+      PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: 'true',
+      OUTBOX_WORKER_ENABLED: 'false',
+      OUTBOX_POLL_INTERVAL_MS: '250',
+      OUTBOX_LEASE_SECONDS: '120',
+      OUTBOX_MAX_RUNS: '5',
+      OUTBOX_BACKOFF_MAX_SECONDS: '60',
+      RECONCILIATION_DELAY_SECONDS: '30',
       PATH: '/usr/bin',
     });
 
@@ -49,6 +63,13 @@ describe('validateEnvironment', () => {
       RATE_LIMIT_IP_PER_MINUTE: 1000,
       RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: 5,
       TRUST_PROXY_HOPS: 1,
+      PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: true,
+      OUTBOX_WORKER_ENABLED: false,
+      OUTBOX_POLL_INTERVAL_MS: 250,
+      OUTBOX_LEASE_SECONDS: 120,
+      OUTBOX_MAX_RUNS: 5,
+      OUTBOX_BACKOFF_MAX_SECONDS: 60,
+      RECONCILIATION_DELAY_SECONDS: 30,
     });
   });
 
@@ -58,6 +79,11 @@ describe('validateEnvironment', () => {
     ['RATE_LIMIT_IP_PER_MINUTE', '0'],
     ['RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE', '2.5'],
     ['TRUST_PROXY_HOPS', '-1'],
+    ['OUTBOX_WORKER_ENABLED', 'yes'],
+    ['OUTBOX_LEASE_SECONDS', '10'],
+    ['OUTBOX_POLL_INTERVAL_MS', '0'],
+    ['OUTBOX_MAX_RUNS', '0'],
+    ['RECONCILIATION_DELAY_SECONDS', 'soon'],
   ])('rejects %s=%s', (name, value) => {
     expect(() => validateEnvironment({ DATABASE_URL, [name]: value })).toThrow(
       new RegExp(name),

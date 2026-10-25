@@ -5,6 +5,7 @@ import { AppConfigModule } from './config/app-config.module.js';
 import { DatabaseModule } from './database/database.module.js';
 import { HealthModule } from './health/health.module.js';
 import { MerchantsModule } from './merchants/merchants.module.js';
+import { PaymentProcessingModule } from './payments/processing/payment-processing.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
 
 @Module({
@@ -18,6 +19,7 @@ import { PaymentsModule } from './payments/payments.module.js';
     HealthModule,
     MerchantsModule,
     PaymentsModule,
+    PaymentProcessingModule,
   ],
 })
 export class AppModule {}

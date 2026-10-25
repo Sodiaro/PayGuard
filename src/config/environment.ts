@@ -18,6 +18,13 @@ export enum NodeEnvironment {
   Production = 'production',
 }
 
+// Only "true"/"false" are accepted; implicit conversion would turn "false" into true.
+function StrictBoolean(): PropertyDecorator {
+  return Transform(({ value }: { value: unknown }) =>
+    value === 'true' ? true : value === 'false' ? false : value,
+  );
+}
+
 export class EnvironmentVariables {
   @Expose()
   @IsEnum(NodeEnvironment)
@@ -37,11 +44,8 @@ export class EnvironmentVariables {
   })
   DATABASE_URL: string;
 
-  // Only "true"/"false" are accepted; implicit conversion would turn "false" into true.
   @Expose()
-  @Transform(({ value }: { value: unknown }) =>
-    value === 'true' ? true : value === 'false' ? false : value,
-  )
+  @StrictBoolean()
   @IsBoolean()
   SWAGGER_ENABLED: boolean = false;
 
@@ -68,6 +72,54 @@ export class EnvironmentVariables {
   @Expose()
   @IsEnum(SimulatorOutcome)
   PAYMENT_SIMULATOR_OUTCOME: SimulatorOutcome = SimulatorOutcome.Succeeded;
+
+  @Expose()
+  @StrictBoolean()
+  @IsBoolean()
+  PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: boolean = false;
+
+  // Disable to run an instance that serves HTTP only; any number of instances may run workers.
+  @Expose()
+  @StrictBoolean()
+  @IsBoolean()
+  OUTBOX_WORKER_ENABLED: boolean = true;
+
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(100)
+  @Max(60_000)
+  OUTBOX_POLL_INTERVAL_MS: number = 1000;
+
+  // Must comfortably exceed a job's worst case: a lookup plus a resubmission, each bounded by the
+  // provider call timeout. A lease shorter than that lets a second worker take over a live job.
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(30)
+  @Max(3600)
+  OUTBOX_LEASE_SECONDS: number = 60;
+
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  OUTBOX_MAX_RUNS: number = 10;
+
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(86_400)
+  OUTBOX_BACKOFF_MAX_SECONDS: number = 300;
+
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(86_400)
+  RECONCILIATION_DELAY_SECONDS: number = 60;
 
   @Expose()
   @Type(() => Number)

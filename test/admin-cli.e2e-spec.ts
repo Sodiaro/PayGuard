@@ -12,6 +12,7 @@ import { runAdminCli } from '../src/cli/admin-cli.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../src/merchants/merchants.service.js';
+import { OutboxStore } from '../src/outbox/outbox-store.js';
 import { createTestApp, prismaOf } from './support/test-app.js';
 import { resetDatabase } from './support/test-database.js';
 
@@ -45,6 +46,7 @@ describe('Admin CLI (PostgreSQL)', () => {
       {
         merchants: app.get(MerchantsService),
         apiKeys: app.get(ApiKeysService),
+        outbox: app.get(OutboxStore),
       },
       { out: (line) => out.push(line), err: (line) => err.push(line) },
     );

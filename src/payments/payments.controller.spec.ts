@@ -1,11 +1,15 @@
 import { describe, expect, it } from '@jest/globals';
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import type { Response } from 'express';
-import { IdempotencyKeyReusedError } from './payment-errors.js';
+import {
+  IdempotencyKeyReusedError,
+  PaymentNotFoundError,
+  PaymentNotRetryableError,
+} from './payment-errors.js';
 import type { PaymentResponse } from './payment.responses.js';
 import { PaymentsController } from './payments.controller.js';
 import type {
-  CreatePaymentResult,
+  PaymentCommandResult,
   PaymentsService,
 } from './payments.service.js';
 
@@ -13,9 +17,10 @@ const auth = { merchantId: 'merchant-1', apiKeyId: 'key-1' };
 const body = { amount: 100, currency: 'USD' as const };
 const payment = { id: 'payment-1' } as PaymentResponse;
 
-function setup(create: () => Promise<CreatePaymentResult>) {
+function setup(command: () => Promise<PaymentCommandResult>) {
   const service = {
-    create,
+    create: command,
+    retry: command,
     findForMerchant: () => Promise.resolve(null),
   } as unknown as PaymentsService;
   const sent: { status?: number; headers: Record<string, string> } = {
@@ -29,53 +34,64 @@ function setup(create: () => Promise<CreatePaymentResult>) {
       sent.headers[name] = value;
     },
   } as unknown as Response;
-  return { controller: new PaymentsController(service), response, sent };
+  const controller = new PaymentsController(service);
+  return {
+    sent,
+    create: () => controller.create(auth, 'key', body, response),
+    retry: () => controller.retry(auth, 'payment-1', 'key', response),
+    get: () => controller.get(auth, 'missing'),
+  };
 }
 
 describe('PaymentsController', () => {
-  it('keeps the default 201 for a new payment', async () => {
-    const { controller, response, sent } = setup(() =>
-      Promise.resolve({ payment, replayed: false }),
-    );
+  it.each(['create', 'retry'] as const)(
+    'keeps the declared 202 for a new %s',
+    async (operation) => {
+      const subject = setup(() =>
+        Promise.resolve({ payment, replayed: false }),
+      );
 
-    await expect(controller.create(auth, 'key', body, response)).resolves.toBe(
-      payment,
-    );
-    expect(sent.status).toBeUndefined();
-    expect(sent.headers).toEqual({});
-  });
+      await expect(subject[operation]()).resolves.toBe(payment);
+      expect(subject.sent).toEqual({ headers: {} });
+    },
+  );
 
-  it('answers a replay with 200 and Idempotent-Replayed', async () => {
-    const { controller, response, sent } = setup(() =>
-      Promise.resolve({ payment, replayed: true }),
-    );
+  it.each(['create', 'retry'] as const)(
+    'answers a %s replay with 200 and Idempotent-Replayed',
+    async (operation) => {
+      const subject = setup(() => Promise.resolve({ payment, replayed: true }));
 
-    await controller.create(auth, 'key', body, response);
-    expect(sent.status).toBe(200);
-    expect(sent.headers).toEqual({ 'Idempotent-Replayed': 'true' });
-  });
+      await subject[operation]();
+      expect(subject.sent).toEqual({
+        status: 200,
+        headers: { 'Idempotent-Replayed': 'true' },
+      });
+    },
+  );
 
-  it('maps a reused key to 409 and lets other errors through untouched', async () => {
-    const conflict = setup(() =>
-      Promise.reject(new IdempotencyKeyReusedError()),
-    );
+  it.each([
+    ['a reused key', new IdempotencyKeyReusedError(), ConflictException],
+    [
+      'an ineligible payment',
+      new PaymentNotRetryableError('attempt_limit_reached'),
+      ConflictException,
+    ],
+    ['a payment it cannot see', new PaymentNotFoundError(), NotFoundException],
+  ])('maps %s to the HTTP error convention', async (_case, error, expected) => {
     await expect(
-      conflict.controller.create(auth, 'key', body, conflict.response),
-    ).rejects.toBeInstanceOf(ConflictException);
+      setup(() => Promise.reject(error)).retry(),
+    ).rejects.toBeInstanceOf(expected);
+  });
 
+  it('lets unexpected errors through untouched', async () => {
     const unexpected = new Error('database exploded');
-    const failing = setup(() => Promise.reject(unexpected));
-    await expect(
-      failing.controller.create(auth, 'key', body, failing.response),
-    ).rejects.toBe(unexpected);
+    await expect(setup(() => Promise.reject(unexpected)).create()).rejects.toBe(
+      unexpected,
+    );
   });
 
   it('returns 404 for a payment it cannot see', async () => {
-    const { controller } = setup(() =>
-      Promise.resolve({ payment, replayed: false }),
-    );
-    await expect(controller.get(auth, 'missing')).rejects.toBeInstanceOf(
-      NotFoundException,
-    );
+    const subject = setup(() => Promise.resolve({ payment, replayed: false }));
+    await expect(subject.get()).rejects.toBeInstanceOf(NotFoundException);
   });
 });

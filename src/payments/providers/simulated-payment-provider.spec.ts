@@ -1,4 +1,5 @@
 import { describe, expect, it } from '@jest/globals';
+import { ProviderTimeoutError } from './payment-provider.js';
 import {
   SimulatedPaymentProvider,
   SimulatorOutcome,
@@ -53,5 +54,50 @@ describe('SimulatedPaymentProvider', () => {
 
     expect(again).toEqual(first);
     expect(other).not.toEqual(first);
+  });
+
+  it.each([
+    [SimulatorOutcome.Succeeded, 'succeeded'],
+    [SimulatorOutcome.Declined, 'declined'],
+  ])(
+    'looks up a %s attempt with the same reference it was processed with',
+    async (outcome, status) => {
+      const provider = new SimulatedPaymentProvider(outcome);
+      const processed = await provider.processPayment(request);
+
+      await expect(
+        provider.lookupPayment({ attemptId: request.attemptId }),
+      ).resolves.toEqual({
+        status,
+        providerReference: (processed as { providerReference: string })
+          .providerReference,
+      });
+    },
+  );
+
+  it('reports an attempt it refused as unknown to lookup', async () => {
+    const provider = new SimulatedPaymentProvider(SimulatorOutcome.Unavailable);
+
+    await expect(
+      provider.lookupPayment({ attemptId: request.attemptId }),
+    ).resolves.toEqual({ status: 'not_found' });
+  });
+
+  it('can lose submission answers while lookups still return the outcome, across instances', async () => {
+    const beforeRestart = new SimulatedPaymentProvider(
+      SimulatorOutcome.Succeeded,
+      true,
+    );
+    await expect(beforeRestart.processPayment(request)).rejects.toBeInstanceOf(
+      ProviderTimeoutError,
+    );
+
+    const afterRestart = new SimulatedPaymentProvider(
+      SimulatorOutcome.Succeeded,
+      true,
+    );
+    await expect(
+      afterRestart.lookupPayment({ attemptId: request.attemptId }),
+    ).resolves.toMatchObject({ status: 'succeeded' });
   });
 });

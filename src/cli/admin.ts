@@ -2,6 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppLogger } from '../common/logging/app-logger.js';
 import { ApiKeysService } from '../merchants/api-keys.service.js';
 import { MerchantsService } from '../merchants/merchants.service.js';
+import { OutboxStore } from '../outbox/outbox-store.js';
 import { AdminModule } from './admin.module.js';
 import { runAdminCli } from './admin-cli.js';
 
@@ -13,7 +14,11 @@ const app = await NestFactory.createApplicationContext(AdminModule, {
 try {
   process.exitCode = await runAdminCli(
     process.argv.slice(2),
-    { merchants: app.get(MerchantsService), apiKeys: app.get(ApiKeysService) },
+    {
+      merchants: app.get(MerchantsService),
+      apiKeys: app.get(ApiKeysService),
+      outbox: app.get(OutboxStore),
+    },
     {
       out: (line) => process.stdout.write(`${line}\n`),
       err: (line) => process.stderr.write(`${line}\n`),

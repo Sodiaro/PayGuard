@@ -1,18 +1,24 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
+import { requestContext } from '../common/logging/request-context.js';
 import { PrismaService } from '../database/prisma.service.js';
 import { Prisma } from '../generated/prisma/client.js';
-import { PaymentStatus } from '../generated/prisma/enums.js';
-import { fingerprintPaymentRequest } from './idempotency.js';
+import { OutboxJobType, PaymentStatus } from '../generated/prisma/enums.js';
+import { OutboxStore } from '../outbox/outbox-store.js';
+import { applyAttemptResolution } from './attempt-outcomes.js';
+import {
+  fingerprintPaymentRequest,
+  fingerprintRetryRequest,
+} from './idempotency.js';
 import {
   IdempotencyKeyReusedError,
+  PaymentNotFoundError,
+  PaymentNotRetryableError,
   PaymentStateConflictError,
-  ProviderTimeoutError,
 } from './payment-errors.js';
 import {
-  attemptStatusesThatCanBecome,
   paymentStatusesThatCanBecome,
   resolveAttempt,
-  type AttemptResolution,
+  retryEligibility,
 } from './payment-lifecycle.js';
 import type { CreatePaymentRequest } from './payment.requests.js';
 import type { PaymentResponse } from './payment.responses.js';
@@ -22,8 +28,6 @@ import {
   type ProviderPaymentResult,
 } from './providers/payment-provider.js';
 
-const PROVIDER_TIMEOUT_MS = 10_000;
-
 const WITH_ATTEMPTS = {
   attempts: { orderBy: { attemptNumber: 'asc' } },
 } satisfies Prisma.PaymentInclude;
@@ -32,19 +36,20 @@ type PaymentRecord = Prisma.PaymentGetPayload<{
   include: typeof WITH_ATTEMPTS;
 }>;
 
-export interface CreatePaymentResult {
+type RetryRequestRecord = Prisma.PaymentRetryRequestGetPayload<object>;
+
+export interface PaymentCommandResult {
   payment: PaymentResponse;
   replayed: boolean;
 }
 
-// The provider is called outside any transaction. An attempt still PENDING after a crash or an
-// indefinite provider answer has an unknown outcome and is never retried automatically.
+// Commands only record intent: each new attempt is committed together with the outbox job that
+// will submit it, and the provider is contacted later by the outbox worker.
 @Injectable()
 export class PaymentsService {
-  private readonly logger = new Logger(PaymentsService.name);
-
   constructor(
     private readonly prisma: PrismaService,
+    private readonly outbox: OutboxStore,
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
   ) {}
 
@@ -52,30 +57,39 @@ export class PaymentsService {
     merchantId: string,
     idempotencyKey: string,
     request: CreatePaymentRequest,
-  ): Promise<CreatePaymentResult> {
+  ): Promise<PaymentCommandResult> {
     const requestFingerprint = fingerprintPaymentRequest(request);
 
     const existing = await this.findByIdempotencyKey(
       merchantId,
       idempotencyKey,
     );
-    if (existing) return this.replay(existing, requestFingerprint);
+    if (existing) return this.replayCreate(existing, requestFingerprint);
 
-    let payment: PaymentRecord;
+    let paymentId: string;
     try {
-      payment = await this.prisma.payment.create({
-        data: {
-          merchantId,
-          amount: BigInt(request.amount),
-          currency: request.currency,
-          reference: request.reference ?? null,
-          idempotencyKey,
-          requestFingerprint,
-          attempts: {
-            create: { attemptNumber: 1, provider: this.provider.id },
+      paymentId = await this.prisma.$transaction(async (tx) => {
+        const payment = await tx.payment.create({
+          data: {
+            merchantId,
+            amount: BigInt(request.amount),
+            currency: request.currency,
+            reference: request.reference ?? null,
+            idempotencyKey,
+            requestFingerprint,
+            attempts: {
+              create: { attemptNumber: 1, provider: this.provider.id },
+            },
           },
-        },
-        include: WITH_ATTEMPTS,
+          include: WITH_ATTEMPTS,
+        });
+        await this.outbox.enqueue(tx, {
+          type: OutboxJobType.PROCESS_ATTEMPT,
+          paymentId: payment.id,
+          attemptId: payment.attempts[0].id,
+          requestId: currentRequestId(),
+        });
+        return payment.id;
       });
     } catch (error) {
       // A concurrent request with the same key won the insert; answer with its payment.
@@ -85,12 +99,97 @@ export class PaymentsService {
         idempotencyKey,
       );
       if (!winner) throw error;
-      return this.replay(winner, requestFingerprint);
+      return this.replayCreate(winner, requestFingerprint);
     }
 
-    await this.processAttempt(payment, payment.attempts[0].id);
-    const current = await this.findForMerchant(merchantId, payment.id);
-    return { payment: current!, replayed: false };
+    return {
+      payment: await this.requireForMerchant(merchantId, paymentId),
+      replayed: false,
+    };
+  }
+
+  async retry(
+    merchantId: string,
+    paymentId: string,
+    idempotencyKey: string,
+  ): Promise<PaymentCommandResult> {
+    const requestFingerprint = fingerprintRetryRequest(paymentId);
+
+    const existing = await this.findRetryRequest(merchantId, idempotencyKey);
+    if (existing) return this.replayRetry(existing, requestFingerprint);
+
+    let raced: RetryRequestRecord | null;
+    try {
+      raced = await this.prisma.$transaction(async (tx) => {
+        // Serializes concurrent retries of one payment: the eligibility check and the new attempt
+        // below are only correct while no other transaction can add an attempt.
+        const locked = await tx.$queryRaw<{ id: string }[]>`
+          SELECT id FROM payments
+          WHERE id = ${paymentId}::uuid AND merchant_id = ${merchantId}::uuid
+          FOR UPDATE`;
+        if (locked.length === 0) throw new PaymentNotFoundError();
+
+        const sameKey = await tx.paymentRetryRequest.findUnique({
+          where: { merchantId_idempotencyKey: { merchantId, idempotencyKey } },
+        });
+        if (sameKey) return sameKey;
+
+        const payment = await tx.payment.findUniqueOrThrow({
+          where: { id: paymentId },
+          include: WITH_ATTEMPTS,
+        });
+        const eligibility = retryEligibility(payment, payment.attempts);
+        if (!eligibility.eligible) {
+          throw new PaymentNotRetryableError(eligibility.reason);
+        }
+
+        const attempt = await tx.paymentAttempt.create({
+          data: {
+            paymentId,
+            attemptNumber: payment.attempts.at(-1)!.attemptNumber + 1,
+            provider: this.provider.id,
+          },
+        });
+        const reopened = await tx.payment.updateMany({
+          where: {
+            id: paymentId,
+            status: { in: paymentStatusesThatCanBecome(PaymentStatus.PENDING) },
+          },
+          data: { status: PaymentStatus.PENDING },
+        });
+        if (reopened.count !== 1)
+          throw new PaymentStateConflictError(paymentId);
+
+        await tx.paymentRetryRequest.create({
+          data: {
+            merchantId,
+            idempotencyKey,
+            requestFingerprint,
+            paymentId,
+            attemptId: attempt.id,
+          },
+        });
+        await this.outbox.enqueue(tx, {
+          type: OutboxJobType.PROCESS_ATTEMPT,
+          paymentId,
+          attemptId: attempt.id,
+          requestId: currentRequestId(),
+        });
+        return null;
+      });
+    } catch (error) {
+      // The same key was used concurrently for a different payment, so no shared row lock applied.
+      if (!isUniqueViolation(error)) throw error;
+      const winner = await this.findRetryRequest(merchantId, idempotencyKey);
+      if (!winner) throw error;
+      return this.replayRetry(winner, requestFingerprint);
+    }
+
+    if (raced) return this.replayRetry(raced, requestFingerprint);
+    return {
+      payment: await this.requireForMerchant(merchantId, paymentId),
+      replayed: false,
+    };
   }
 
   async findForMerchant(
@@ -104,86 +203,23 @@ export class PaymentsService {
     return payment && toResponse(payment);
   }
 
-  // Applies a definite provider answer. Returns false when the attempt already has an outcome,
-  // so a late or duplicate result can never overwrite a terminal state.
+  // Returns false when the attempt already has an outcome; see applyAttemptResolution.
   async recordAttemptOutcome(
     attemptId: string,
     result: ProviderPaymentResult,
   ): Promise<boolean> {
-    return this.applyResolution(attemptId, resolveAttempt(result));
+    return this.prisma.$transaction((tx) =>
+      applyAttemptResolution(tx, attemptId, resolveAttempt(result)),
+    );
   }
 
-  private async processAttempt(
-    payment: PaymentRecord,
-    attemptId: string,
-  ): Promise<void> {
-    let resolution: AttemptResolution;
-    try {
-      const result = await withTimeout(
-        this.provider.processPayment({
-          attemptId,
-          merchantId: payment.merchantId,
-          amount: Number(payment.amount),
-          currency: payment.currency,
-        }),
-        PROVIDER_TIMEOUT_MS,
-      );
-      resolution = resolveAttempt(result);
-    } catch (error) {
-      // Not a failure: the provider may have processed the payment. Recording FAILED here could
-      // lead to a second charge on retry, so the attempt stays PENDING.
-      this.logger.error(
-        `Provider ${this.provider.id} gave no definite outcome for attempt ${attemptId} of payment ${payment.id}; left PENDING`,
-        error instanceof Error ? error.stack : String(error),
-      );
-      return;
-    }
-
-    const applied = await this.applyResolution(attemptId, resolution);
-    if (!applied) {
-      this.logger.warn(
-        `Attempt ${attemptId} already had an outcome; provider result ignored`,
-      );
-    }
-  }
-
-  private async applyResolution(
-    attemptId: string,
-    resolution: AttemptResolution,
-  ): Promise<boolean> {
-    return this.prisma.$transaction(async (tx) => {
-      const attempt = await tx.paymentAttempt.updateMany({
-        where: {
-          id: attemptId,
-          status: {
-            in: attemptStatusesThatCanBecome(resolution.attemptStatus),
-          },
-        },
-        data: {
-          status: resolution.attemptStatus,
-          providerReference: resolution.providerReference,
-          failureCode: resolution.failureCode,
-          completedAt: new Date(),
-        },
-      });
-      if (attempt.count === 0) return false;
-
-      const { paymentId } = await tx.paymentAttempt.findUniqueOrThrow({
-        where: { id: attemptId },
-        select: { paymentId: true },
-      });
-      const payment = await tx.payment.updateMany({
-        where: {
-          id: paymentId,
-          status: {
-            in: paymentStatusesThatCanBecome(resolution.paymentStatus),
-          },
-        },
-        data: { status: resolution.paymentStatus },
-      });
-      if (payment.count !== 1) throw new PaymentStateConflictError(paymentId);
-      return true;
-    });
+  private async requireForMerchant(
+    merchantId: string,
+    paymentId: string,
+  ): Promise<PaymentResponse> {
+    const payment = await this.findForMerchant(merchantId, paymentId);
+    if (!payment) throw new PaymentNotFoundError();
+    return payment;
   }
 
   private findByIdempotencyKey(
@@ -196,16 +232,42 @@ export class PaymentsService {
     });
   }
 
-  // Returns the current state, which may have progressed since the original response.
-  private replay(
+  private findRetryRequest(
+    merchantId: string,
+    idempotencyKey: string,
+  ): Promise<RetryRequestRecord | null> {
+    return this.prisma.paymentRetryRequest.findUnique({
+      where: { merchantId_idempotencyKey: { merchantId, idempotencyKey } },
+    });
+  }
+
+  // Replays return the current state, which may have progressed since the original response.
+  private replayCreate(
     payment: PaymentRecord,
     requestFingerprint: string,
-  ): CreatePaymentResult {
+  ): PaymentCommandResult {
     if (payment.requestFingerprint !== requestFingerprint) {
       throw new IdempotencyKeyReusedError();
     }
     return { payment: toResponse(payment), replayed: true };
   }
+
+  private async replayRetry(
+    retry: RetryRequestRecord,
+    requestFingerprint: string,
+  ): Promise<PaymentCommandResult> {
+    if (retry.requestFingerprint !== requestFingerprint) {
+      throw new IdempotencyKeyReusedError();
+    }
+    return {
+      payment: await this.requireForMerchant(retry.merchantId, retry.paymentId),
+      replayed: true,
+    };
+  }
+}
+
+function currentRequestId(): string | null {
+  return requestContext.getStore()?.requestId ?? null;
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -213,17 +275,6 @@ function isUniqueViolation(error: unknown): boolean {
     error instanceof Prisma.PrismaClientKnownRequestError &&
     error.code === 'P2002'
   );
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(
-      () => reject(new ProviderTimeoutError(timeoutMs)),
-      timeoutMs,
-    );
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function toResponse(payment: PaymentRecord): PaymentResponse {
