@@ -11,6 +11,9 @@ Prisma.
 - Durable processing through a PostgreSQL-backed outbox: work survives crashes and restarts,
   ambiguous provider outcomes are reconciled by lookup instead of being guessed or resubmitted
 - A provider interface with a deterministic simulated provider
+- Signed provider webhooks, stored before they are acknowledged, deduplicated by event ID and
+  applied asynchronously through the same outbox and lifecycle guards, so duplicate, late,
+  concurrent and out-of-order deliveries cannot corrupt a payment
 - A worker that runs inside the API or as its own process, with heartbeats, explicit health
   semantics and Prometheus-format metrics from the operator CLI
 - An append-only audit trail of operator actions, and approximate API-key usage tracking
@@ -117,30 +120,32 @@ The **Used by** column says which processes read a variable: `all` means the API
 worker and the operator CLI; `api` means the HTTP process only. The worker and the CLI do not
 validate API-only settings, so a worker container does not need them.
 
-| Variable                                  | Used by | Default         | Description                                                                            |
-| ----------------------------------------- | ------- | --------------- | -------------------------------------------------------------------------------------- |
-| `DATABASE_URL`                            | all     | required        | PostgreSQL connection string (`postgresql://...`)                                      |
-| `NODE_ENV`                                | all     | `development`   | `development` (readable logs), `test` or `production` (JSON logs)                      |
-| `PAYMENT_SIMULATOR_OUTCOME`               | all     | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`             |
-| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS` | all     | `false`         | `true`: submissions are processed but time out; outcomes come from lookup              |
-| `OUTBOX_POLL_INTERVAL_MS`                 | all     | `1000`          | Idle delay between outbox polls (100-60000)                                            |
-| `OUTBOX_LEASE_SECONDS`                    | all     | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)               |
-| `OUTBOX_MAX_RUNS`                         | all     | `10`            | Runs per job before it is parked as `DEAD` for investigation                           |
-| `OUTBOX_BACKOFF_MAX_SECONDS`              | all     | `300`           | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                               |
-| `RECONCILIATION_DELAY_SECONDS`            | all     | `60`            | Wait before the first lookup of an unknown outcome; also the stale-attempt age         |
-| `PAYGUARD_OPERATOR`                       | CLI     | `<user>@<host>` | Actor recorded in the audit trail for CLI actions (printable ASCII, ≤ 200)             |
-| `PORT`                                    | api     | `3000`          | HTTP port                                                                              |
-| `SWAGGER_ENABLED`                         | api     | `false`         | `true` serves Swagger UI at `/docs`                                                    |
-| `CORS_ALLOWED_ORIGINS`                    | api     | empty           | Comma-separated exact origins; empty sends no CORS headers                             |
-| `OUTBOX_WORKER_ENABLED`                   | api     | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs      |
-| `RATE_LIMIT_IP_PER_MINUTE`                | api     | `300`           | Requests per client IP per minute, all routes except health checks                     |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`   | api     | `60`            | Payment creations and retries per merchant per minute                                  |
-| `TRUSTED_PROXIES`                         | api     | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [Rate limiting](#rate-limiting)) |
-| `HEALTH_QUEUE_BACKLOG_SECONDS`            | api     | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)   |
-| `HEALTH_WORKER_TIMEOUT_SECONDS`           | api     | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)       |
-| `TEST_DATABASE_URL`                       | tests   | required        | Database for `npm run test:e2e`; its name must end with `_test`                        |
-| `POSTGRES_USER` / `_PASSWORD` / `_DB`     | Compose | required        | Credentials for the Compose PostgreSQL container                                       |
-| `POSTGRES_HOST_PORT` / `API_HOST_PORT`    | Compose | `5432`/`3000`   | Host ports published by Compose (bound to 127.0.0.1)                                   |
+| Variable                                  | Used by  | Default         | Description                                                                            |
+| ----------------------------------------- | -------- | --------------- | -------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                            | all      | required        | PostgreSQL connection string (`postgresql://...`)                                      |
+| `NODE_ENV`                                | all      | `development`   | `development` (readable logs), `test` or `production` (JSON logs)                      |
+| `PAYMENT_SIMULATOR_OUTCOME`               | all      | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`             |
+| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS` | all      | `false`         | `true`: submissions are processed but time out; outcomes come from lookup              |
+| `OUTBOX_POLL_INTERVAL_MS`                 | all      | `1000`          | Idle delay between outbox polls (100-60000)                                            |
+| `OUTBOX_LEASE_SECONDS`                    | all      | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)               |
+| `OUTBOX_MAX_RUNS`                         | all      | `10`            | Runs per job before it is parked as `DEAD` for investigation                           |
+| `OUTBOX_BACKOFF_MAX_SECONDS`              | all      | `300`           | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                               |
+| `RECONCILIATION_DELAY_SECONDS`            | all      | `60`            | Wait before the first lookup of an unknown outcome; also the stale-attempt age         |
+| `PAYGUARD_OPERATOR`                       | CLI      | `<user>@<host>` | Actor recorded in the audit trail for CLI actions (printable ASCII, ≤ 200)             |
+| `SIMULATOR_WEBHOOK_SECRET`                | api, CLI | unset           | Webhook signing secret, 32-256 visible ASCII, not an API key; unset disables webhooks  |
+| `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`     | api      | `300`           | Allowed difference between a webhook's signed timestamp and the clock (30-900)         |
+| `PORT`                                    | api      | `3000`          | HTTP port                                                                              |
+| `SWAGGER_ENABLED`                         | api      | `false`         | `true` serves Swagger UI at `/docs`                                                    |
+| `CORS_ALLOWED_ORIGINS`                    | api      | empty           | Comma-separated exact origins; empty sends no CORS headers                             |
+| `OUTBOX_WORKER_ENABLED`                   | api      | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs      |
+| `RATE_LIMIT_IP_PER_MINUTE`                | api      | `300`           | Requests per client IP per minute, all routes except health checks                     |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`   | api      | `60`            | Payment creations and retries per merchant per minute                                  |
+| `TRUSTED_PROXIES`                         | api      | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [Rate limiting](#rate-limiting)) |
+| `HEALTH_QUEUE_BACKLOG_SECONDS`            | api      | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)   |
+| `HEALTH_WORKER_TIMEOUT_SECONDS`           | api      | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)       |
+| `TEST_DATABASE_URL`                       | tests    | required        | Database for `npm run test:e2e`; its name must end with `_test`                        |
+| `POSTGRES_USER` / `_PASSWORD` / `_DB`     | Compose  | required        | Credentials for the Compose PostgreSQL container                                       |
+| `POSTGRES_HOST_PORT` / `API_HOST_PORT`    | Compose  | `5432`/`3000`   | Host ports published by Compose (bound to 127.0.0.1)                                   |
 
 ## Merchants and API keys
 
@@ -479,6 +484,127 @@ To reproduce an outcome, set the variables and restart, e.g.
 in the worker service there). Merchants cannot influence the outcome. Every process that loads
 the provider, the API and the worker, logs a warning at startup that payments are simulated.
 
+### Provider webhooks
+
+A provider notifies PayGuard of outcomes by webhook. PayGuard treats each one as a signed claim
+about an attempt, not as permission to set a payment's state: it authenticates the bytes, stores
+the event, acknowledges it, and applies it later through the outbox, under the same lifecycle
+guards as every other outcome. Only the simulator's endpoint exists.
+
+**Request.** `POST /v1/webhooks/simulator`, `Content-Type: application/json`, at most 64 KiB, not
+compressed, no API key:
+
+```
+X-Simulator-Signature: t=1792843200,v1=5f2c...e81a   (64 lowercase hex characters)
+```
+
+```json
+{
+  "id": "evt_9f2e4c1b7a6d3e5f8a0b2c4d",
+  "type": "payment.succeeded",
+  "createdAt": "2026-10-25T12:00:00.000Z",
+  "data": {
+    "attemptId": "01a16b6d-bf72-73ea-83b1-f39d1c06083f",
+    "providerReference": "sim_7b4affd0040515a3582e3ba9",
+    "amount": 500000,
+    "currency": "NGN"
+  }
+}
+```
+
+| Field                     | Meaning                                                                                        |
+| ------------------------- | ---------------------------------------------------------------------------------------------- |
+| `id`                      | The provider's stable event ID (`evt_` + 8-64 letters or digits); the same on every redelivery |
+| `type`                    | `payment.succeeded`, `payment.declined` or `payment.processing` (informational only)           |
+| `createdAt`               | When the provider created the event (ISO 8601, UTC)                                            |
+| `data.attemptId`          | The idempotency reference PayGuard sent with the submission, i.e. the attempt ID               |
+| `data.providerReference`  | The provider's own reference for the attempt                                                   |
+| `data.amount`, `currency` | What the provider charged; compared with the payment, never used to change it                  |
+
+The event carries no payment ID, merchant ID or status, and any undeclared field is rejected: the
+attempt, its payment and its merchant come from PayGuard's records.
+
+**Signature.** `v1` is the hex HMAC-SHA256, keyed with `SIMULATOR_WEBHOOK_SECRET`, of the signed
+timestamp `t`, a `.`, and the raw body bytes exactly as sent. The body is read as raw bytes before
+any JSON parsing, so verification never depends on how JSON is re-serialized, and only verified
+bytes are parsed. The header format is checked strictly and the digests are compared in constant
+time. A `t` more than `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS` away from the server clock, in either
+direction, is rejected, which bounds how long a captured delivery can be replayed; within that
+window, replays are caught by event-ID deduplication. The secret is used for nothing else and
+must not be a merchant API key. Secrets, signatures and bodies are never logged.
+
+**Responses.** Bodies contain no payment data.
+
+| Status | When                                                                                                  | Provider should |
+| ------ | ----------------------------------------------------------------------------------------------------- | --------------- |
+| `202`  | `{"status":"accepted"}`: stored, and its processing queued in the same transaction                    | stop            |
+| `200`  | `{"status":"duplicate"}`: this event ID was already stored with the same content                      | stop            |
+| `400`  | Signed, but not UTF-8 JSON, not an object, or not a valid event (unsupported type, extra fields, ...) | fix, not retry  |
+| `401`  | Signature header missing, malformed, wrong, or its timestamp outside the tolerance                    | fix, not retry  |
+| `409`  | This event ID was already stored with different content                                               | investigate     |
+| `413`  | Body over 64 KiB                                                                                      | fix, not retry  |
+| `415`  | Not `application/json`, or a compressed body                                                          | fix, not retry  |
+| `429`  | The per-IP rate limit, which applies to this route like any other                                     | retry later     |
+| `503`  | `SIMULATOR_WEBHOOK_SECRET` is not set, or the event could not be stored                               | retry later     |
+
+**Storage and deduplication.** Accepted events are stored in `provider_webhook_events`, unique on
+`(provider, event_id)`, with only their validated fields (never the raw body or signature), a
+SHA-256 hash of their canonical content, the signed delivery time, and counters of duplicate and
+conflicting deliveries. The hash covers meaning, not formatting, so a redelivery with different
+key order or a new signature is still a duplicate. Concurrent deliveries of one event serialize
+on the unique index: one is stored, the others are answered as duplicates. An invalid delivery
+stores nothing. If the event or its job cannot be written, neither is, and the provider gets a
+`503` to retry; an acknowledged event therefore always has its processing queued.
+
+**Processing.** Each stored event gets an `APPLY_WEBHOOK_EVENT` outbox job, claimed, leased,
+fenced, retried and dead-lettered like any other job, by whichever worker runs. The job locks the
+event row, decides, records the result and completes in one transaction, so a redelivered job,
+a second worker or a crash part-way through never applies an event twice: a failed run leaves
+the event `RECEIVED` and the payment untouched.
+
+| Result             | When                                                                           | Effect                                        |
+| ------------------ | ------------------------------------------------------------------------------ | --------------------------------------------- |
+| `APPLIED`          | Terminal event for a `PENDING` attempt whose amount and currency match         | Outcome recorded through the lifecycle guards |
+| `ALREADY_APPLIED`  | The attempt already has this outcome (from its own submission or a lookup)     | None                                          |
+| `NO_ACTION`        | `payment.processing`, in any state                                             | None                                          |
+| `OUTCOME_CONFLICT` | The attempt already has a different outcome or provider reference              | None; logged as an error for investigation    |
+| `DATA_MISMATCH`    | Amount or currency differs from the payment                                    | None; reconciliation lookup queued if pending |
+| `PAYLOAD_CONFLICT` | Its event ID was redelivered with different content before it was processed    | None; reconciliation lookup queued if pending |
+| `UNKNOWN_ATTEMPT`  | No attempt of this provider has that ID (recorded at intake; no job is queued) | None                                          |
+
+- **Out of order and late events cannot regress a payment.** Outcomes are only ever written by
+  the conditional updates in `applyAttemptResolution`, the same ones submissions and lookups use,
+  and they only move an attempt out of `PENDING`. A late `payment.processing` changes nothing;
+  a decline after a recorded success, or a success after a recorded decline, is an
+  `OUTCOME_CONFLICT`. Event timestamps are stored but never used to decide.
+- **Racing writers.** A webhook and a reconciliation lookup (or two contradictory webhooks) that
+  race for one attempt are serialized by the attempt row's update: the first outcome wins, and
+  the webhook is then classified against it. Payment and attempt always agree.
+- **Ambiguous events defer to the provider.** When an event cannot be trusted (`DATA_MISMATCH`,
+  `PAYLOAD_CONFLICT`) and the attempt is still pending and was submitted, a `RECONCILE_ATTEMPT`
+  job is queued and the provider's lookup decides. If the lookup cannot establish the outcome
+  either, the attempt stays `PENDING` under the usual reconciliation backoff and, eventually, an
+  operator. Unsubmitted attempts are left to their own processing job.
+- **Conflicting deliveries.** A delivery that reuses an event ID with different content is
+  rejected with `409`, never stored, and counted on the original event, which is then distrusted
+  if it has not been processed yet.
+- Webhook outcomes are provider facts, not operator actions, so they are not written to the
+  operator audit trail; `provider_webhook_events` is their record.
+
+**Sending simulator webhooks.** The simulator's events are deterministic: the event ID derives
+from the attempt ID and event type, and the reference matches its submissions. The operator CLI
+can sign and deliver one over HTTP, as the provider would. It is refused when
+`NODE_ENV=production`:
+
+```bash
+npm run admin -- simulator:webhook --attempt <attempt-id> [--type payment.declined] [--url http://127.0.0.1:3000]
+```
+
+The type defaults to the configured `PAYMENT_SIMULATOR_OUTCOME`, and the event's `createdAt` to
+the attempt's submission time, so running the command again redelivers the same event (a
+duplicate). With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, a webhook resolves a `PENDING`
+payment before its delayed lookup runs, which then finds nothing left to do.
+
 ### Rate limiting
 
 | Limit                                   | Key       | Default | Applies to                                                      |
@@ -557,8 +683,9 @@ request. `merchant:suspend` blocks all of a merchant's keys at once while you in
 ```bash
 # Job counts by type and status, dead and stalled jobs, lease recoveries, attempts by status and
 # failure code, oldest unresolved attempt, lookup runs, retries, settle-time p50/p95 over the last
-# hour, the last error category of unfinished jobs, every known worker (active, silent or stopped),
-# and the dead jobs with their payment and attempt.
+# hour, the last error category of unfinished jobs, webhook events by status and result with
+# duplicate and conflicting deliveries, every known worker (active, silent or stopped), and the
+# dead jobs with their payment and attempt.
 npm run admin -- ops:status
 
 # Put a DEAD job back in the queue with a fresh run budget (after fixing the cause). Audited.
@@ -577,6 +704,14 @@ provider calls. Provider error messages and payloads are never logged or stored.
   jobs in [Processing and recovery](#processing-and-recovery)). Check the logs for its `jobId`
   before requeueing. The stale sweep queues a lookup for its attempt, which resubmits only if the
   provider never received it.
+- **A dead `APPLY_WEBHOOK_EVENT` job** failed internally repeatedly; its event is still `RECEIVED`
+  and nothing was applied. Fix the cause and requeue it. Its attempt is still covered by its own
+  processing and reconciliation jobs meanwhile.
+- **A webhook with `OUTCOME_CONFLICT`, `DATA_MISMATCH` or `PAYLOAD_CONFLICT`** means the provider
+  said something that contradicts PayGuard's records, so nothing was changed. Compare with the
+  provider by attempt ID (the event row has the attempt ID, event ID and provider reference). A
+  success reported for an attempt recorded as failed needs particular care: the merchant may
+  retry that payment.
 
 ### Health checks
 
@@ -607,27 +742,31 @@ npm run admin -- ops:metrics   # Prometheus text exposition format, on stdout
 whole system. There is no `/metrics` HTTP endpoint; to scrape it, run the command on a schedule
 (for example a cron job writing to the node_exporter textfile collector). Every metric is a gauge,
 and label values come only from fixed enums (`type`, `status`, `category`, `failure_code`,
-`quantile`), never from IDs, merchants or free text, so the series count is bounded. Values
+`quantile`, `result`), never from IDs, event IDs, merchants or free text (nothing a webhook sender
+controls becomes a label), so the series count is bounded. Values
 describe the rows currently retained, so outbox counts and sums can drop after
 `maintenance:prune`; alert on levels and short-window increases rather than on lifetime totals.
 
-| Metric                                                    | Labels                     | Meaning                                                       |
-| --------------------------------------------------------- | -------------------------- | ------------------------------------------------------------- |
-| `payguard_outbox_jobs`                                    | `type`, `status`           | Jobs by type and status                                       |
-| `payguard_outbox_dead_jobs`                               |                            | Jobs parked as `DEAD`                                         |
-| `payguard_outbox_expired_leases`                          |                            | `PROCESSING` jobs whose lease has expired                     |
-| `payguard_outbox_oldest_due_job_age_seconds`              |                            | How long the oldest due job has waited                        |
-| `payguard_outbox_lease_recoveries`                        |                            | Takeovers of expired leases, summed over retained jobs        |
-| `payguard_outbox_unfinished_jobs_by_last_error`           | `category`                 | Unfinished jobs by sanitized last error                       |
-| `payguard_reconciliation_lookup_runs`                     |                            | Lookup runs, summed over retained reconciliation jobs         |
-| `payguard_payment_attempts`                               | `status`, `failure_code`   | Attempts by status and failure code (`none` when unset)       |
-| `payguard_payment_attempts_unresolved`                    |                            | Attempts still `PENDING`                                      |
-| `payguard_payment_attempts_oldest_unresolved_age_seconds` |                            | Age of the oldest `PENDING` attempt                           |
-| `payguard_payment_retries`                                |                            | Accepted retry requests                                       |
-| `payguard_payment_attempt_settle_seconds`                 | `quantile` (`0.5`, `0.95`) | Creation-to-outcome time of attempts settled in the last hour |
-| `payguard_workers_active`                                 |                            | Workers with a heartbeat in the last 30 s                     |
-| `payguard_worker_last_heartbeat_age_seconds`              |                            | Newest heartbeat age (`-1`: no worker has ever reported)      |
-| `payguard_worker_last_job_finished_age_seconds`           |                            | Time since any worker last finished a job (`-1`: never)       |
+| Metric                                                    | Labels                     | Meaning                                                              |
+| --------------------------------------------------------- | -------------------------- | -------------------------------------------------------------------- |
+| `payguard_outbox_jobs`                                    | `type`, `status`           | Jobs by type and status                                              |
+| `payguard_outbox_dead_jobs`                               |                            | Jobs parked as `DEAD`                                                |
+| `payguard_outbox_expired_leases`                          |                            | `PROCESSING` jobs whose lease has expired                            |
+| `payguard_outbox_oldest_due_job_age_seconds`              |                            | How long the oldest due job has waited                               |
+| `payguard_outbox_lease_recoveries`                        |                            | Takeovers of expired leases, summed over retained jobs               |
+| `payguard_outbox_unfinished_jobs_by_last_error`           | `category`                 | Unfinished jobs by sanitized last error                              |
+| `payguard_reconciliation_lookup_runs`                     |                            | Lookup runs, summed over retained reconciliation jobs                |
+| `payguard_payment_attempts`                               | `status`, `failure_code`   | Attempts by status and failure code (`none` when unset)              |
+| `payguard_payment_attempts_unresolved`                    |                            | Attempts still `PENDING`                                             |
+| `payguard_payment_attempts_oldest_unresolved_age_seconds` |                            | Age of the oldest `PENDING` attempt                                  |
+| `payguard_payment_retries`                                |                            | Accepted retry requests                                              |
+| `payguard_payment_attempt_settle_seconds`                 | `quantile` (`0.5`, `0.95`) | Creation-to-outcome time of attempts settled in the last hour        |
+| `payguard_workers_active`                                 |                            | Workers with a heartbeat in the last 30 s                            |
+| `payguard_worker_last_heartbeat_age_seconds`              |                            | Newest heartbeat age (`-1`: no worker has ever reported)             |
+| `payguard_worker_last_job_finished_age_seconds`           |                            | Time since any worker last finished a job (`-1`: never)              |
+| `payguard_webhook_events`                                 | `status`, `result`         | Stored provider events by status and result (`none` until processed) |
+| `payguard_webhook_duplicate_deliveries`                   |                            | Redeliveries of stored events, acknowledged as duplicates            |
+| `payguard_webhook_conflicting_deliveries`                 |                            | Deliveries that reused an event ID with other content (`409`)        |
 
 Request rates and latencies are not exported; derive them from the access log (one JSON line per
 request with status and duration) or from the proxy in front of the API.
@@ -637,17 +776,20 @@ request with status and duration) or from the proxy in front of the API.
 These are starting points, not tuned values; nothing in PayGuard sends alerts itself. Adjust them
 to observed traffic.
 
-| Condition                                                                               | Suggested threshold  | Why                                                     |
-| --------------------------------------------------------------------------------------- | -------------------- | ------------------------------------------------------- |
-| `payguard_workers_active == 0`                                                          | for 2 minutes        | Nothing is processing payments                          |
-| `payguard_outbox_dead_jobs > 0`                                                         | immediately          | Every dead job needs an operator decision               |
-| `payguard_outbox_oldest_due_job_age_seconds`                                            | > 120 for 5 minutes  | Workers are down, overloaded or failing                 |
-| `payguard_payment_attempts_oldest_unresolved_age_seconds`                               | > 900                | Outcomes are unknown beyond the automatic lookup window |
-| `payguard_outbox_expired_leases > 0`                                                    | for 5 minutes        | Workers are dying or hanging mid-job                    |
-| Increase in `payguard_outbox_lease_recoveries`                                          | > 5 in 15 minutes    | Possible poison job or crash-looping worker             |
-| `payguard_payment_attempts{status="FAILED",failure_code="PROVIDER_UNAVAILABLE"}` rising | sustained            | Provider outage                                         |
-| `payguard_payment_attempt_settle_seconds{quantile="0.95"}`                              | > 30                 | Processing is slow                                      |
-| `GET /health` returns 503                                                               | 2 consecutive probes | Instance cannot reach PostgreSQL                        |
+| Condition                                                                                       | Suggested threshold  | Why                                                                  |
+| ----------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------- |
+| `payguard_workers_active == 0`                                                                  | for 2 minutes        | Nothing is processing payments                                       |
+| `payguard_outbox_dead_jobs > 0`                                                                 | immediately          | Every dead job needs an operator decision                            |
+| `payguard_outbox_oldest_due_job_age_seconds`                                                    | > 120 for 5 minutes  | Workers are down, overloaded or failing                              |
+| `payguard_payment_attempts_oldest_unresolved_age_seconds`                                       | > 900                | Outcomes are unknown beyond the automatic lookup window              |
+| `payguard_outbox_expired_leases > 0`                                                            | for 5 minutes        | Workers are dying or hanging mid-job                                 |
+| Increase in `payguard_outbox_lease_recoveries`                                                  | > 5 in 15 minutes    | Possible poison job or crash-looping worker                          |
+| `payguard_payment_attempts{status="FAILED",failure_code="PROVIDER_UNAVAILABLE"}` rising         | sustained            | Provider outage                                                      |
+| `payguard_payment_attempt_settle_seconds{quantile="0.95"}`                                      | > 30                 | Processing is slow                                                   |
+| `GET /health` returns 503                                                                       | 2 consecutive probes | Instance cannot reach PostgreSQL                                     |
+| `payguard_webhook_events{result=~"OUTCOME_CONFLICT\|DATA_MISMATCH\|PAYLOAD_CONFLICT"}` increase | > 0                  | The provider contradicts PayGuard's records; investigate each        |
+| Increase in `payguard_webhook_conflicting_deliveries`                                           | > 0                  | Event IDs reused with other content: provider fault or leaked secret |
+| `payguard_webhook_events{status="RECEIVED"}`                                                    | > 0 for 10 minutes   | Stored events are not being processed                                |
 
 ### Audit trail
 
@@ -677,6 +819,7 @@ Nothing is deleted automatically. The defaults keep everything:
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | Payments, attempts, idempotency keys, retry requests     | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment. |
 | Audit events                                             | Indefinitely, and the table rejects deletes                                                                              |
+| Provider webhook events                                  | Indefinitely: deduplication depends on them, so deleting one would let a replayed delivery be accepted again             |
 | Merchants and API keys                                   | Indefinitely; merchants are suspended and keys revoked, never deleted                                                    |
 | `COMPLETED` outbox jobs of attempts with a final outcome | Prunable on demand                                                                                                       |
 | Worker heartbeat rows                                    | Prunable on demand                                                                                                       |
@@ -697,11 +840,11 @@ explicit boundaries, started through three entry points that compose different m
 module owns its controllers, services and persistence code, and other modules use it only through
 the providers it exports.
 
-| Entry point         | Root module    | Contains                                                                      |
-| ------------------- | -------------- | ----------------------------------------------------------------------------- |
-| `dist/main.js`      | `AppModule`    | HTTP API, guards, health; the worker too unless `OUTBOX_WORKER_ENABLED=false` |
-| `dist/worker.js`    | `WorkerModule` | Outbox worker, job processor and payment provider only; no HTTP server        |
-| `dist/cli/admin.js` | `AdminModule`  | Merchant, key, outbox and audit services for the operator CLI                 |
+| Entry point         | Root module    | Contains                                                                                      |
+| ------------------- | -------------- | --------------------------------------------------------------------------------------------- |
+| `dist/main.js`      | `AppModule`    | HTTP API, webhook intake, guards, health; the worker too unless `OUTBOX_WORKER_ENABLED=false` |
+| `dist/worker.js`    | `WorkerModule` | Outbox worker, job and webhook processors, payment provider; no HTTP server                   |
+| `dist/cli/admin.js` | `AdminModule`  | Merchant, key, outbox and audit services, simulator webhook sender                            |
 
 ```
 src/
@@ -715,9 +858,12 @@ src/
 ├── merchants/              # Merchant and key services, /v1/merchants and /v1/api-keys
 ├── payments/               # /v1/payments and retries, lifecycle, idempotency, currencies
 │   ├── processing/         # Outbox worker, process/reconcile job handlers, in-process starter
-│   └── providers/          # PaymentProvider port, the simulated provider and its module
+│   └── providers/          # PaymentProvider port, the simulated provider and its webhooks
+├── webhooks/               # /v1/webhooks intake: raw body, signature, event schema, inbox, and
+│                           # the processor and policy the worker uses to apply stored events
 ├── outbox/                 # Outbox job store: enqueue, claim, fencing, heartbeats, stats, pruning
-├── cli/                    # Operator CLI (admin.ts entry point, admin-cli.ts commands, metrics)
+├── cli/                    # Operator CLI (admin.ts entry point, admin-cli.ts commands, metrics,
+│                           # simulator webhook sender)
 ├── config/                 # Core and API environment schemas, validation, config modules
 ├── common/http/            # Error format, exception filter, request IDs, validation
 ├── common/logging/         # Structured logger, request context, access log
@@ -766,8 +912,12 @@ token; the payment domain depends only on that interface.
   }
   ```
 
-  Unexpected errors become a generic 500 with the stack trace logged server-side. `path` never
-  includes the query string.
+  Unexpected errors become a generic 500 with the stack trace logged server-side. Bodies the
+  parser rejects keep their client status (`413` for over 100 KiB of JSON, `415` for unsupported
+  encodings) with a generic message. `path` never includes the query string.
+
+- **Request bodies.** Every route parses JSON except `/v1/webhooks/*`, which receives raw bytes
+  (limit 64 KiB) because its signature covers the exact bytes sent.
 
 - **HTTP security.** Helmet sets its default headers (CSP, HSTS, `nosniff`, frame options) and
   removes `X-Powered-By`. CORS is off unless `CORS_ALLOWED_ORIGINS` lists exact origins: secret
@@ -809,6 +959,10 @@ token; the payment domain depends only on that interface.
   - Metrics: the exposition format and that labels come only from enums.
   - Rate limiting: the token bucket (with an injected clock), both guards, and client keys
     (IPv4, IPv4-mapped and IPv6 /64).
+  - Webhooks: signing and verification (exact bytes, tampering, wrong secret, timestamp
+    tolerance at and beyond its edges, a dozen malformed headers), the event schema and its
+    content fingerprint, every processing decision, and the simulator's deterministic events.
+  - Errors: body-parser rejections keep their status without echoing their message.
 - **Integration and HTTP tests** (`test/**/*.e2e-spec.ts`) run against **real PostgreSQL**:
   - Merchants and keys: provisioning (including concurrent duplicates), revocation, expiry,
     suspension, the CLI, and checks that no key reaches logs or responses.
@@ -834,6 +988,19 @@ token; the payment domain depends only on that interface.
     shutdown of the real worker loop, and the standalone worker module processing a payment.
   - Health with PostgreSQL unreachable: readiness `503` without leaking connection details, while
     liveness stays `200`.
+  - Webhook intake: valid, wrong, missing, malformed and re-encoded signatures, stale and future
+    timestamps, a merchant API key in place of a signature, re-serialized bodies, malformed JSON
+    and invalid UTF-8, schema violations, oversized, compressed and non-JSON bodies (none of which
+    store or queue anything), duplicate and concurrent deliveries, event-ID reuse with other
+    content, a storage failure answered with `503`, the event and its job being written together
+    or not at all, unknown attempts, a missing secret failing closed, and nothing sensitive in
+    the logs.
+  - Webhook processing: success and decline, a decline after a success and a success after a
+    decline (both unchanged), out-of-order processing notices, two contradictory events at once,
+    another merchant's payment untouched, amount and currency mismatches and conflicting payloads
+    deferred to a provider lookup (including one that cannot decide), webhooks racing
+    reconciliation, a stalled worker resuming after a takeover, a failure rolled back and
+    retried, lease-expiry recovery, the standalone worker, ops output, and the CLI sender.
 - Tests swap the provider through `createTestApp({ provider })`. The `ScriptedProvider` test
   double keeps a ledger of what it "processed", can lose answers, fail or hold a call open, and
   counts submissions and lookups. Tests drive the worker directly (`processDueJobs()`), and move
@@ -875,8 +1042,9 @@ Each CI step calls the same npm scripts you run locally.
     attempted) or unknown, where anything not clearly one of the first three is unknown;
   - timeouts shorter than `OUTBOX_LEASE_SECONDS` and the stop grace period;
   - credentials from a secret store, and no raw provider error or payload in logs;
-  - webhook handling (signature verification, deduplication, the same conditional outcome
-    writes) if the provider pushes results;
+  - its own webhook endpoint and verifier, following the provider's documented signature scheme,
+    event IDs and event types, plugged into the existing intake, deduplication and processing;
+    and confirmation that its events echo the attempt ID and the charged amount and currency;
   - PCI DSS scope review before any card data could pass through the system.
 - **No exactly-once guarantee; at most one charge per attempt depends on the provider.** The guarantees in
   [Processing and recovery](#processing-and-recovery) assume the provider deduplicates by attempt
@@ -887,9 +1055,17 @@ Each CI step calls the same npm scripts you run locally.
 - **The in-process worker shares the API process** (the default outside Compose). A heavy backlog
   then competes with HTTP traffic; run the standalone worker in production (see
   [Worker deployment](#worker-deployment)).
-- **No push notifications.** Clients poll `GET /v1/payments/:id` for outcomes; there are no
-  webhooks.
-- **Retention is manual.** Payments, attempts, idempotency keys and audit events grow without
+- **No notifications to merchants.** Provider webhooks come in, but nothing goes out: merchants
+  poll `GET /v1/payments/:id` for outcomes.
+- **Webhook secrets cannot be rotated without a gap.** One secret is verified at a time, so
+  changing it must coincide with the sender's change; deliveries rejected meanwhile are retried
+  by the sender. The secret is shared with the operator CLI's simulator sender.
+- **Webhook timestamps rely on clocks.** Server and sender clocks must agree within
+  `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`; deduplication still covers replays inside that window.
+- **Webhook conflicts need a person.** `OUTCOME_CONFLICT`, `DATA_MISMATCH` and `PAYLOAD_CONFLICT`
+  results are recorded and logged, not resolved: a final outcome is never changed automatically,
+  even when the provider later reports a different one.
+- **Retention is manual.** Payments, attempts, idempotency keys, audit and webhook events grow without
   bound by design; only completed outbox jobs and worker rows can be pruned, and only when an
   operator runs `maintenance:prune`. There is no archiving.
 - **Rate limits are per process**, reset on restart, and depend on `TRUSTED_PROXIES` listing
@@ -928,6 +1104,10 @@ Each CI step calls the same npm scripts you run locally.
 | `TRUSTED_PROXIES must be comma-separated IP addresses ...`   | Use IPs, CIDR ranges with a prefix of at least 1, or `loopback`/`linklocal`/`uniquelocal`. `0.0.0.0/0` is rejected on purpose.                                                                                                                                    |
 | `TRUST_PROXY_HOPS` has no effect                             | It is not a PayGuard setting; use `TRUSTED_PROXIES`.                                                                                                                                                                                                              |
 | `maintenance:prune` refuses a value                          | Retention must be at least 7 days and the batch size 1-10000.                                                                                                                                                                                                     |
+| Webhooks answer `503 Webhooks are not configured`            | Set `SIMULATOR_WEBHOOK_SECRET` for the API (Compose passes it through from your shell or `.env`).                                                                                                                                                                 |
+| Webhooks answer `401 Invalid webhook signature`              | The server log names the reason: `signature_missing`, `signature_malformed`, `signature_mismatch`, `signature_timestamp_too_old` or `signature_timestamp_in_future`. Sign the exact bytes you send with the same secret, and check both clocks.                   |
+| Webhooks answer `409`                                        | The event ID was stored earlier with different content. A redelivery must carry the same event (formatting may differ); a new event needs a new ID.                                                                                                               |
+| `simulator:webhook` says it is disabled                      | It refuses to run with `NODE_ENV=production`. In a Compose container, run it with `docker compose exec -e NODE_ENV=development api node dist/cli/admin.js simulator:webhook ...` on a non-production stack.                                                       |
 | `409 Payment cannot be retried: <reason>`                    | Only `FAILED` payments with fewer than 3 attempts can be retried; a `PENDING` payment is still being processed or reconciled.                                                                                                                                     |
 | `Refusing to run integration tests against "..."`            | `TEST_DATABASE_URL` must point at a database whose name ends with `_test`.                                                                                                                                                                                        |
 | `TEST_DATABASE_URL must be set to run integration tests`     | Add `TEST_DATABASE_URL` to `.env` (see `.env.example`).                                                                                                                                                                                                           |
