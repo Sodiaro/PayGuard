@@ -3,6 +3,31 @@ name: payguard
 # Credentials have no defaults: a missing .env fails loudly instead of using a guessable password.
 x-database-url: &database-url postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
 
+# Settings shared by the API and the worker.
+x-core-environment: &core-environment
+  NODE_ENV: production
+  DATABASE_URL: *database-url
+  PAYMENT_SIMULATOR_OUTCOME: ${PAYMENT_SIMULATOR_OUTCOME:-SUCCEEDED}
+  PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: ${PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS:-false}
+  OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
+  OUTBOX_LEASE_SECONDS: ${OUTBOX_LEASE_SECONDS:-60}
+  OUTBOX_MAX_RUNS: ${OUTBOX_MAX_RUNS:-10}
+  OUTBOX_BACKOFF_MAX_SECONDS: ${OUTBOX_BACKOFF_MAX_SECONDS:-300}
+  RECONCILIATION_DELAY_SECONDS: ${RECONCILIATION_DELAY_SECONDS:-60}
+
+# The application never writes to its filesystem and needs no Linux capabilities.
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  # Long enough for the batch in flight to finish: provider calls time out after 10 s.
+  stop_grace_period: 30s
+
 services:
   postgres:
     image: postgres:18-alpine
@@ -35,26 +60,22 @@ services:
         condition: service_healthy
 
   api:
+    <<: *hardening
     build:
       context: .
       target: runtime
     environment:
-      NODE_ENV: production
+      <<: *core-environment
       PORT: 3000
-      DATABASE_URL: *database-url
+      # Processing runs in the worker service below.
+      OUTBOX_WORKER_ENABLED: 'false'
       SWAGGER_ENABLED: ${SWAGGER_ENABLED:-false}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
-      PAYMENT_SIMULATOR_OUTCOME: ${PAYMENT_SIMULATOR_OUTCOME:-SUCCEEDED}
-      PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: ${PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS:-false}
-      OUTBOX_WORKER_ENABLED: ${OUTBOX_WORKER_ENABLED:-true}
-      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
-      OUTBOX_LEASE_SECONDS: ${OUTBOX_LEASE_SECONDS:-60}
-      OUTBOX_MAX_RUNS: ${OUTBOX_MAX_RUNS:-10}
-      OUTBOX_BACKOFF_MAX_SECONDS: ${OUTBOX_BACKOFF_MAX_SECONDS:-300}
-      RECONCILIATION_DELAY_SECONDS: ${RECONCILIATION_DELAY_SECONDS:-60}
       RATE_LIMIT_IP_PER_MINUTE: ${RATE_LIMIT_IP_PER_MINUTE:-300}
       RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: ${RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE:-60}
-      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-0}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      HEALTH_QUEUE_BACKLOG_SECONDS: ${HEALTH_QUEUE_BACKLOG_SECONDS:-120}
+      HEALTH_WORKER_TIMEOUT_SECONDS: ${HEALTH_WORKER_TIMEOUT_SECONDS:-30}
     ports:
       - '127.0.0.1:${API_HOST_PORT:-3000}:3000'
     depends_on:
@@ -72,6 +93,19 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  worker:
+    <<: *hardening
+    build:
+      context: .
+      target: runtime
+    command: ['node', 'dist/worker.js']
+    environment: *core-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres-data:

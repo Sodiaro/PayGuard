@@ -15,6 +15,7 @@
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main.js",
+    "start:worker": "node dist/worker.js",
     "admin": "nest build && node dist/cli/admin.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
