@@ -24,7 +24,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
     const statusCode =
       exception instanceof HttpException
         ? exception.getStatus()
-        : HttpStatus.INTERNAL_SERVER_ERROR;
+        : (exposedClientErrorStatus(exception) ??
+          HttpStatus.INTERNAL_SERVER_ERROR);
     const requestId = String(response.getHeader(REQUEST_ID_HEADER) ?? '');
     // Query strings are dropped from both the response and the log: they are where leaked credentials turn up.
     const path = request.originalUrl.split('?')[0];
@@ -54,7 +55,9 @@ export class HttpExceptionFilter implements ExceptionFilter {
 
   private clientMessage(exception: unknown, statusCode: number): string {
     if (!(exception instanceof HttpException)) {
-      return 'An unexpected error occurred';
+      return statusCode < 500
+        ? (STATUS_CODES[statusCode] ?? 'Error')
+        : 'An unexpected error occurred';
     }
 
     const payload = exception.getResponse();
@@ -71,4 +74,21 @@ export class HttpExceptionFilter implements ExceptionFilter {
     }
     return STATUS_CODES[statusCode] ?? 'Error';
   }
+}
+
+// Body parsers reject oversized, aborted or wrongly encoded bodies with http-errors objects (not
+// HttpExceptions) that mark themselves safe to expose. Their client status is kept instead of
+// being reported as a server error; their messages are not passed through.
+function exposedClientErrorStatus(exception: unknown): number | null {
+  if (typeof exception !== 'object' || exception === null) return null;
+  const { status, expose } = exception as {
+    status?: unknown;
+    expose?: unknown;
+  };
+  return expose === true &&
+    typeof status === 'number' &&
+    status >= 400 &&
+    status < 500
+    ? status
+    : null;
 }

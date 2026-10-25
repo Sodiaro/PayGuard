@@ -53,6 +53,7 @@ describe('HttpExceptionFilter', () => {
     logError = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
+    logError.mockClear();
   });
 
   it('renders an HttpException with the standard envelope', () => {
@@ -87,6 +88,28 @@ describe('HttpExceptionFilter', () => {
       message: 'Validation failed',
       details,
     });
+  });
+
+  it('keeps the client status of body-parser errors without echoing their message', () => {
+    const tooLarge = Object.assign(new Error('request entity too large'), {
+      status: 413,
+      expose: true,
+      type: 'entity.too.large',
+    });
+    filter.catch(tooLarge, hostFor(captured));
+
+    expect(captured.status).toBe(HttpStatus.PAYLOAD_TOO_LARGE);
+    expect(captured.body?.message).toBe('Payload Too Large');
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it('does not trust a status on errors that are not marked safe to expose', () => {
+    filter.catch(
+      Object.assign(new Error('upstream said 404'), { status: 404 }),
+      hostFor(captured),
+    );
+
+    expect(captured.status).toBe(HttpStatus.INTERNAL_SERVER_ERROR);
   });
 
   it('hides unexpected errors behind a generic 500 and logs them', () => {

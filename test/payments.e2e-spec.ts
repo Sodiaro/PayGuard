@@ -235,6 +235,27 @@ describe('Payments API (PostgreSQL)', () => {
         jobs: 0,
       });
     });
+
+    it('rejects an oversized body with 413, not a server error', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/v1/payments')
+        .set('Authorization', `Bearer ${acme.apiKey}`)
+        .set('Idempotency-Key', 'key-large')
+        .set('Content-Type', 'application/json')
+        .send(JSON.stringify({ ...ORDER, reference: 'x'.repeat(200 * 1024) }))
+        .expect(413);
+
+      expect(response.body).toMatchObject({
+        statusCode: 413,
+        message: 'Payload Too Large',
+        path: '/v1/payments',
+      });
+      await expect(counts()).resolves.toEqual({
+        payments: 0,
+        attempts: 0,
+        jobs: 0,
+      });
+    });
   });
 
   describe('provider outcomes', () => {
