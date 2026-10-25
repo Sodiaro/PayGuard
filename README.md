@@ -11,8 +11,12 @@ Prisma.
 - Durable processing through a PostgreSQL-backed outbox: work survives crashes and restarts,
   ambiguous provider outcomes are reconciled by lookup instead of being guessed or resubmitted
 - A provider interface with a deterministic simulated provider
-- Per-IP and per-merchant rate limiting, Helmet security headers, an explicit CORS allowlist, and
-  structured JSON logs with request correlation and credential redaction
+- A worker that runs inside the API or as its own process, with heartbeats, explicit health
+  semantics and Prometheus-format metrics from the operator CLI
+- An append-only audit trail of operator actions, and approximate API-key usage tracking
+- Per-IP and per-merchant rate limiting with address-based proxy trust, Helmet security headers,
+  an explicit CORS allowlist, and structured JSON logs with request correlation and credential
+  redaction
 
 > **PayGuard is a simulated payment system, not a live payment gateway.** No real provider is
 > connected, no card data is accepted or stored, and no money moves. A `SUCCEEDED` payment means
@@ -46,7 +50,8 @@ npm run db:migrate:deploy
 # 5. Provision a merchant; the API key is printed once.
 npm run admin -- merchant:create --name "Acme Ltd"
 
-# 6. Run the API in watch mode.
+# 6. Run the API in watch mode. It also runs the payment worker unless OUTBOX_WORKER_ENABLED=false,
+#    in which case run `npm run build && npm run start:worker` in a second terminal.
 npm run start:dev
 ```
 
@@ -73,10 +78,13 @@ docker compose up --build
 docker compose exec api node dist/cli/admin.js merchant:create --name "Acme Ltd"
 ```
 
-This starts PostgreSQL, runs a one-off `migrate` job (`prisma migrate deploy`), and then starts the
-API from the production image on `127.0.0.1:${API_HOST_PORT}`. In the container, run the admin CLI
-with `node dist/cli/admin.js` (there is no npm or TypeScript in the runtime image). Stop the stack
-with `docker compose down`; add `-v` to delete the database volume as well.
+This starts PostgreSQL and runs a one-off `migrate` job (`prisma migrate deploy`). It then starts
+two services from the same production image: `api` (HTTP only, `OUTBOX_WORKER_ENABLED=false`) on
+`127.0.0.1:${API_HOST_PORT}`, and `worker` (`node dist/worker.js`, no HTTP port). Both run as the
+unprivileged `node` user with a read-only root filesystem (only `/tmp` is writable), all Linux
+capabilities dropped, `no-new-privileges`, and a 30 s stop grace period. In a container, run the
+admin CLI with `node dist/cli/admin.js` (there is no npm or TypeScript in the runtime image). Stop
+the stack with `docker compose down`; add `-v` to delete the database volume as well.
 
 ## Commands
 
@@ -85,6 +93,7 @@ with `docker compose down`; add `-v` to delete the database volume as well.
 | `npm run start:dev`         | Start the API with file watching                                    |
 | `npm run build`             | Compile to `dist/`                                                  |
 | `npm run start:prod`        | Run the compiled app (`node dist/main.js`)                          |
+| `npm run start:worker`      | Run the compiled standalone worker (`node dist/worker.js`)          |
 | `npm run admin -- <cmd>`    | Build, then run the operator CLI (see [Operations](#operations))    |
 | `npm test`                  | Unit tests (no database needed)                                     |
 | `npm run test:cov`          | Unit tests with a coverage report in `coverage/`                    |
@@ -104,27 +113,34 @@ All configuration comes from environment variables. In local development they ar
 `.env`; variables already set in the environment take precedence. The app validates them at
 startup and exits with an error that names each invalid variable without printing its value.
 
-| Variable                                  | Required | Default       | Description                                                                    |
-| ----------------------------------------- | -------- | ------------- | ------------------------------------------------------------------------------ |
-| `DATABASE_URL`                            | yes      | none          | PostgreSQL connection string (`postgresql://...`)                              |
-| `NODE_ENV`                                | no       | `development` | `development` (readable logs), `test` or `production` (JSON logs)              |
-| `PORT`                                    | no       | `3000`        | HTTP port                                                                      |
-| `SWAGGER_ENABLED`                         | no       | `false`       | `true` serves Swagger UI at `/docs`                                            |
-| `CORS_ALLOWED_ORIGINS`                    | no       | empty         | Comma-separated exact origins; empty sends no CORS headers                     |
-| `PAYMENT_SIMULATOR_OUTCOME`               | no       | `SUCCEEDED`   | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`     |
-| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS` | no       | `false`       | `true`: submissions are processed but time out; outcomes come from lookup      |
-| `OUTBOX_WORKER_ENABLED`                   | no       | `true`        | Run the background worker in this process                                      |
-| `OUTBOX_POLL_INTERVAL_MS`                 | no       | `1000`        | Idle delay between outbox polls (100-60000)                                    |
-| `OUTBOX_LEASE_SECONDS`                    | no       | `60`          | How long a claimed job is owned before another worker may take it (≥ 30)       |
-| `OUTBOX_MAX_RUNS`                         | no       | `10`          | Runs per job before it is parked as `DEAD` for investigation                   |
-| `OUTBOX_BACKOFF_MAX_SECONDS`              | no       | `300`         | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                       |
-| `RECONCILIATION_DELAY_SECONDS`            | no       | `60`          | Wait before the first lookup of an unknown outcome; also the stale-attempt age |
-| `RATE_LIMIT_IP_PER_MINUTE`                | no       | `300`         | Requests per client IP per minute, all routes except health checks             |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`   | no       | `60`          | Payment creations and retries per merchant per minute                          |
-| `TRUST_PROXY_HOPS`                        | no       | `0`           | Reverse proxies in front of the API, used to find the client IP                |
-| `TEST_DATABASE_URL`                       | tests    | none          | Database for `npm run test:e2e`; its name must end with `_test`                |
-| `POSTGRES_USER` / `_PASSWORD` / `_DB`     | Compose  | none          | Credentials for the Compose PostgreSQL container                               |
-| `POSTGRES_HOST_PORT` / `API_HOST_PORT`    | no       | `5432`/`3000` | Host ports published by Compose (bound to 127.0.0.1)                           |
+The **Used by** column says which processes read a variable: `all` means the API, the standalone
+worker and the operator CLI; `api` means the HTTP process only. The worker and the CLI do not
+validate API-only settings, so a worker container does not need them.
+
+| Variable                                  | Used by | Default         | Description                                                                            |
+| ----------------------------------------- | ------- | --------------- | -------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                            | all     | required        | PostgreSQL connection string (`postgresql://...`)                                      |
+| `NODE_ENV`                                | all     | `development`   | `development` (readable logs), `test` or `production` (JSON logs)                      |
+| `PAYMENT_SIMULATOR_OUTCOME`               | all     | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`             |
+| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS` | all     | `false`         | `true`: submissions are processed but time out; outcomes come from lookup              |
+| `OUTBOX_POLL_INTERVAL_MS`                 | all     | `1000`          | Idle delay between outbox polls (100-60000)                                            |
+| `OUTBOX_LEASE_SECONDS`                    | all     | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)               |
+| `OUTBOX_MAX_RUNS`                         | all     | `10`            | Runs per job before it is parked as `DEAD` for investigation                           |
+| `OUTBOX_BACKOFF_MAX_SECONDS`              | all     | `300`           | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                               |
+| `RECONCILIATION_DELAY_SECONDS`            | all     | `60`            | Wait before the first lookup of an unknown outcome; also the stale-attempt age         |
+| `PAYGUARD_OPERATOR`                       | CLI     | `<user>@<host>` | Actor recorded in the audit trail for CLI actions (printable ASCII, ≤ 200)             |
+| `PORT`                                    | api     | `3000`          | HTTP port                                                                              |
+| `SWAGGER_ENABLED`                         | api     | `false`         | `true` serves Swagger UI at `/docs`                                                    |
+| `CORS_ALLOWED_ORIGINS`                    | api     | empty           | Comma-separated exact origins; empty sends no CORS headers                             |
+| `OUTBOX_WORKER_ENABLED`                   | api     | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs      |
+| `RATE_LIMIT_IP_PER_MINUTE`                | api     | `300`           | Requests per client IP per minute, all routes except health checks                     |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`   | api     | `60`            | Payment creations and retries per merchant per minute                                  |
+| `TRUSTED_PROXIES`                         | api     | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [Rate limiting](#rate-limiting)) |
+| `HEALTH_QUEUE_BACKLOG_SECONDS`            | api     | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)   |
+| `HEALTH_WORKER_TIMEOUT_SECONDS`           | api     | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)       |
+| `TEST_DATABASE_URL`                       | tests   | required        | Database for `npm run test:e2e`; its name must end with `_test`                        |
+| `POSTGRES_USER` / `_PASSWORD` / `_DB`     | Compose | required        | Credentials for the Compose PostgreSQL container                                       |
+| `POSTGRES_HOST_PORT` / `API_HOST_PORT`    | Compose | `5432`/`3000`   | Host ports published by Compose (bound to 127.0.0.1)                                   |
 
 ## Merchants and API keys
 
@@ -133,7 +149,7 @@ startup and exits with an error that names each invalid variable without printin
 | Table               | Purpose and notable constraints                                                                                                                                                                                        |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `merchants`         | UUIDv7 `id`, unique `slug`, `name`, `status` (`ACTIVE`/`SUSPENDED`), timestamps. The unique slug is the provisioning idempotency key: a retried or concurrent `merchant:create` fails instead of creating a duplicate. |
-| `merchant_api_keys` | UUIDv7 `id`, `merchant_id` (indexed, `ON DELETE RESTRICT`), unique `prefix`, `secret_hash` (`bytea`), optional `label` and `expires_at`, `revoked_at`, `created_at`.                                                   |
+| `merchant_api_keys` | UUIDv7 `id`, `merchant_id` (indexed, `ON DELETE RESTRICT`), unique `prefix`, `secret_hash` (`bytea`), optional `label` and `expires_at`, `revoked_at`, `last_used_at`, `created_at`.                                   |
 
 - **Several keys per merchant.** Each key is revoked or expires on its own, which makes zero-downtime
   rotation possible.
@@ -168,6 +184,11 @@ type lookup prefix    secret: 32 random bytes, base64url
    prefix go to the server log only.
 6. The plaintext key exists only in memory during issuance and in the CLI output. It is never
    stored, logged or returned again.
+7. **Usage is recorded approximately.** A successful authentication sets `last_used_at`, but each
+   API process writes it at most once per key every 15 minutes, and only when the stored value is
+   older than that. So the value is accurate to about 15 minutes, costs at most one small `UPDATE`
+   per key per window, and is never written on rejected requests. A failed write is logged and
+   does not fail the request. It is shown by `key:list` and `GET /v1/api-keys`.
 
 ### Authentication in the application
 
@@ -337,7 +358,8 @@ exact in JSON numbers.
 ### Processing and recovery
 
 The database is the source of truth for work still to do. Every attempt is processed through a
-transactional **outbox** (`outbox_jobs`), drained by a worker that runs inside each API process.
+transactional **outbox** (`outbox_jobs`), drained by one or more workers (see
+[Worker deployment](#worker-deployment)).
 
 ```
 POST /v1/payments ──► one transaction: payment + attempt #1 (PENDING) + PROCESS_ATTEMPT job ──► 202
@@ -379,6 +401,11 @@ POST /v1/payments ──► one transaction: payment + attempt #1 (PENDING) + PR
   it is never silently dropped. If it was a lookup, the attempt and payment stay `PENDING`: the
   outcome is unknown, so it is not reported as failed. Dead jobs are reported by `/health`
   (`degraded`) and by `ops:status`, and can be requeued by an operator.
+- **Poison jobs:** a claim counts as a run even if the worker then crashes or hangs before
+  rescheduling. A job that keeps killing or stalling its workers is claimed again after each lease
+  expiry; once it has been claimed more than `OUTBOX_MAX_RUNS` times it is parked as `DEAD`
+  (`lastError: LEASE_EXPIRED`) without being handled again. Each such takeover is counted in
+  `lease_recoveries`.
 - **Stale sweep:** every 30 s the worker queues a lookup for any `PENDING` attempt older than
   `RECONCILIATION_DELAY_SECONDS` that has no live job (for example after its processing job
   died). Attempts that already have a lookup job, including a dead one, are left visible rather
@@ -387,10 +414,9 @@ POST /v1/payments ──► one transaction: payment + attempt #1 (PENDING) + PR
   constraint), a job for an attempt that already has an outcome completes without calling the
   provider, and outcome writes are conditional on the attempt still being `PENDING`. When
   reconciliation and a late result race, exactly one is applied.
-- **Lifecycle:** the worker starts with the application (`OUTBOX_WORKER_ENABLED=true`). On
-  shutdown (SIGTERM) it stops polling and waits for the batch in flight, before the database pool
-  closes. A process killed outright leaves its claimed jobs to be recovered when their leases
-  expire. Instances can run with the worker disabled to serve HTTP only.
+- **Shutdown:** on SIGTERM a worker stops polling, waits for the batch in flight, marks itself
+  stopped, and only then is the database pool closed. A process killed outright leaves its claimed
+  jobs to be recovered when their leases expire.
 
 **What is and is not guaranteed.** The system does not claim exactly-once external processing.
 Each mechanism covers a specific failure:
@@ -405,6 +431,29 @@ Each mechanism covers a specific failure:
 Together these give at-most-one charge per attempt only if the provider honours its idempotency
 key and answers lookups consistently once a submission's timeout has passed. The simulator
 behaves that way; a real provider must be verified to.
+
+### Worker deployment
+
+The same worker code runs in one of two places:
+
+| Mode                 | How                                                                                                                  | Use when                                       |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| In-process (default) | `OUTBOX_WORKER_ENABLED=true`: each API process also polls the outbox                                                 | Local development, single-instance deployments |
+| Standalone           | `node dist/worker.js` (`npm run start:worker`) on dedicated processes, with `OUTBOX_WORKER_ENABLED=false` on the API | Production: Docker Compose runs it this way    |
+
+- **Why standalone in production:** a backlog or slow provider then cannot take CPU, event-loop
+  time or database connections from HTTP traffic. Workers and API instances scale and restart
+  independently, and a crashing worker does not take the API down. The worker process has no HTTP
+  server, loads no HTTP, auth or rate-limit code, and validates only the shared settings.
+- **Why the in-process default stays:** it is one process to run, and correctness does not depend
+  on the choice. Claiming, leases and fencing work the same with any number of workers in any mix
+  of processes, so both modes can even run at once during a migration.
+- **Heartbeats:** every worker writes a row in `outbox_workers` (`<host>:<pid>:<random>`) when it
+  starts, about every 10 s, and when it stops. `/health` and `ops:status` read these rows, so they
+  report workers on every instance, not only the one answering.
+- **Graceful stop:** give a worker more time than its slowest batch. Provider calls time out after
+  10 s; Compose uses `stop_grace_period: 30s`. Anything still unfinished when the process is killed
+  is recovered through lease expiry.
 
 ### Simulator
 
@@ -426,8 +475,9 @@ cannot reproduce "never received" except in `UNAVAILABLE` mode.
 
 To reproduce an outcome, set the variables and restart, e.g.
 `PAYMENT_SIMULATOR_OUTCOME=DECLINED npm run start:dev`, or in Compose
-`PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true docker compose up -d api`. Merchants cannot influence
-the outcome. The API logs a warning at startup that payments are simulated.
+`PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true docker compose up -d worker` (provider calls happen
+in the worker service there). Merchants cannot influence the outcome. Every process that loads
+the provider, the API and the worker, logs a warning at startup that payments are simulated.
 
 ### Rate limiting
 
@@ -442,12 +492,29 @@ the outcome. The API logs a warning at startup that payments are simulated.
   database lookup.
 - A `429` is returned before any idempotency processing, so nothing is created. Retrying later
   with the same `Idempotency-Key` is safe. Replays count toward the limit.
+- **IPv6 clients are grouped by /64.** A single host usually controls a whole /64, so limiting
+  individual IPv6 addresses would let it rotate around the limit. IPv4 addresses (including
+  IPv4-mapped IPv6) are limited individually.
 - **Process-local:** counters live in each API process's memory, so `N` instances allow `N` times
-  the configured limit, and a restart resets them. For distributed protection, enforce limits at
-  the load balancer/API gateway or move the buckets to shared storage.
-- **Behind a proxy**, set `TRUST_PROXY_HOPS` to the number of proxies. With `0`, every request
-  appears to come from the proxy and shares one bucket. With a value that's too high, clients can
-  spoof `X-Forwarded-For`.
+  the configured limit, and a restart resets them. These limits protect one process from abuse;
+  they are not a global quota. For a cluster-wide limit, enforce it at the load balancer or API
+  gateway, or move the buckets to a shared store (for example a PostgreSQL table or Redis, which
+  this project deliberately does not use).
+
+**Client IP behind a proxy.** By default the TCP peer address is the client and
+`X-Forwarded-For` is ignored, so it cannot be spoofed. Behind a reverse proxy or load balancer,
+list the proxy addresses in `TRUSTED_PROXIES` (comma-separated IPs, CIDR ranges, or `loopback`,
+`linklocal`, `uniquelocal`):
+
+```bash
+TRUSTED_PROXIES=10.0.0.0/8          # proxies on the private network
+TRUSTED_PROXIES=loopback            # a proxy on the same host
+```
+
+The client IP is then the right-most `X-Forwarded-For` entry that is not a trusted proxy, so a
+value a client prepends itself is skipped. Trust is decided by the address of the peer, never by
+a hop count: a client that connects directly is never trusted, whatever header it sends. List
+only real proxies; `0.0.0.0/0`, `::/0` and any other `/0` range are rejected at startup.
 
 ## Operations
 
@@ -478,8 +545,9 @@ New keys are printed once, on stdout only. Copy them straight into the merchant'
 avoid running the CLI anywhere its output is captured into shared logs.
 
 **Rotating a key without downtime:** `key:create` → deploy the new key to the merchant's systems →
-confirm traffic uses it → `key:revoke` the old key. If it is unclear when every consumer has
-switched, give the new key time to roll out first and revoke the old one afterwards.
+confirm with `key:list` that the new key shows a `lastUsed` time and the old key's stops advancing
+→ `key:revoke` the old key. `lastUsed` is accurate to about 15 minutes, so wait at least that long
+after the last expected use before treating a key as idle.
 
 **Responding to a leaked key:** `key:revoke` it immediately; it stops working on the next
 request. `merchant:suspend` blocks all of a merchant's keys at once while you investigate.
@@ -487,54 +555,175 @@ request. `merchant:suspend` blocks all of a merchant's keys at once while you in
 ### Payment processing
 
 ```bash
-# Queue and attempt counts, dead and stalled jobs, oldest unresolved attempt, lookup runs,
-# and the last error category of unfinished jobs; lists dead jobs with their payment and attempt.
+# Job counts by type and status, dead and stalled jobs, lease recoveries, attempts by status and
+# failure code, oldest unresolved attempt, lookup runs, retries, settle-time p50/p95 over the last
+# hour, the last error category of unfinished jobs, every known worker (active, silent or stopped),
+# and the dead jobs with their payment and attempt.
 npm run admin -- ops:status
 
-# Put a DEAD job back in the queue with a fresh run budget (after fixing the cause).
+# Put a DEAD job back in the queue with a fresh run budget (after fixing the cause). Audited.
 npm run admin -- outbox:requeue --job <job-id>
 ```
 
-All figures come from the database, so they are correct across any number of API instances.
-Worker log lines carry `jobId`, `jobType`, `paymentId`, `attemptId`, the originating `requestId`
-(or `job:<id>` for swept work) and a sanitized `category`. Provider error messages and payloads
-are never logged or stored.
+All figures come from the database, so they are correct across any number of API and worker
+processes. Worker log lines carry `jobId`, `jobType`, `paymentId`, `attemptId`, the originating
+`requestId` (or `job:<id>` for swept work), a sanitized `category`, and `providerDurationMs` for
+provider calls. Provider error messages and payloads are never logged or stored.
 
-- **`/health` reports `degraded`** (still HTTP 200, because this instance can serve traffic) with
-  one or more reasons. `backlog`: due jobs have waited over 2 minutes, so workers are down or
-  overloaded. `stalled_jobs`: leases expired over 2 minutes ago and nobody reclaimed them.
-  `dead_jobs`: work needs investigation. Liveness (`/health/live`) never depends on the outbox.
 - **A dead `RECONCILE_ATTEMPT` job** means the provider could not give a definite outcome within
   the automatic window. The payment stays `PENDING`. Confirm the attempt's state with the provider
   (by attempt ID), then requeue the job so the outcome is recorded through the normal guarded path.
-- **A dead `PROCESS_ATTEMPT` job** failed internally repeatedly. Check the logs for its `jobId`. The
-  stale sweep queues a lookup for its attempt, which resubmits only if the provider never received
-  it.
+- **A dead `PROCESS_ATTEMPT` job** failed internally repeatedly, or crashed its workers (see poison
+  jobs in [Processing and recovery](#processing-and-recovery)). Check the logs for its `jobId`
+  before requeueing. The stale sweep queues a lookup for its attempt, which resubmits only if the
+  provider never received it.
+
+### Health checks
+
+Both endpoints are public, unauthenticated and not rate-limited. Responses carry status and reason
+codes only, never counts, errors or connection details.
+
+| Check     | Endpoint           | Fails or degrades when                                                                                                                                                                      | Result               |
+| --------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| Liveness  | `GET /health/live` | The process cannot answer HTTP at all. Never checks the database or the queue.                                                                                                              | 200 or no answer     |
+| Readiness | `GET /health`      | `database`: PostgreSQL does not answer a ping.                                                                                                                                              | `down`, HTTP 503     |
+| Queue     | `GET /health`      | `queue`: `backlog` (a due job has waited longer than `HEALTH_QUEUE_BACKLOG_SECONDS`), `stalled_jobs` (a lease expired that long ago and nobody reclaimed it), `dead_jobs` (any `DEAD` job). | `degraded`, HTTP 200 |
+| Workers   | `GET /health`      | `workers`: `no_active_worker` (no worker on any instance heartbeated within `HEALTH_WORKER_TIMEOUT_SECONDS`).                                                                               | `degraded`, HTTP 200 |
+
+If the queue or worker query itself fails, that check reports `unavailable`. Queue and worker
+problems keep HTTP 200 deliberately: this instance can still accept payments (they are stored and
+wait in the outbox), so taking it out of the load balancer would turn a processing delay into an
+outage. Use liveness for restarts, readiness for routing, and alert on `degraded` separately. The
+standalone worker has no HTTP endpoint; its health is the `workers` check and the metrics below,
+plus the container's exit status.
+
+### Metrics
+
+```bash
+npm run admin -- ops:metrics   # Prometheus text exposition format, on stdout
+```
+
+`ops:metrics` prints a snapshot computed from the database, so any one invocation describes the
+whole system. There is no `/metrics` HTTP endpoint; to scrape it, run the command on a schedule
+(for example a cron job writing to the node_exporter textfile collector). Every metric is a gauge,
+and label values come only from fixed enums (`type`, `status`, `category`, `failure_code`,
+`quantile`), never from IDs, merchants or free text, so the series count is bounded. Values
+describe the rows currently retained, so outbox counts and sums can drop after
+`maintenance:prune`; alert on levels and short-window increases rather than on lifetime totals.
+
+| Metric                                                    | Labels                     | Meaning                                                       |
+| --------------------------------------------------------- | -------------------------- | ------------------------------------------------------------- |
+| `payguard_outbox_jobs`                                    | `type`, `status`           | Jobs by type and status                                       |
+| `payguard_outbox_dead_jobs`                               |                            | Jobs parked as `DEAD`                                         |
+| `payguard_outbox_expired_leases`                          |                            | `PROCESSING` jobs whose lease has expired                     |
+| `payguard_outbox_oldest_due_job_age_seconds`              |                            | How long the oldest due job has waited                        |
+| `payguard_outbox_lease_recoveries`                        |                            | Takeovers of expired leases, summed over retained jobs        |
+| `payguard_outbox_unfinished_jobs_by_last_error`           | `category`                 | Unfinished jobs by sanitized last error                       |
+| `payguard_reconciliation_lookup_runs`                     |                            | Lookup runs, summed over retained reconciliation jobs         |
+| `payguard_payment_attempts`                               | `status`, `failure_code`   | Attempts by status and failure code (`none` when unset)       |
+| `payguard_payment_attempts_unresolved`                    |                            | Attempts still `PENDING`                                      |
+| `payguard_payment_attempts_oldest_unresolved_age_seconds` |                            | Age of the oldest `PENDING` attempt                           |
+| `payguard_payment_retries`                                |                            | Accepted retry requests                                       |
+| `payguard_payment_attempt_settle_seconds`                 | `quantile` (`0.5`, `0.95`) | Creation-to-outcome time of attempts settled in the last hour |
+| `payguard_workers_active`                                 |                            | Workers with a heartbeat in the last 30 s                     |
+| `payguard_worker_last_heartbeat_age_seconds`              |                            | Newest heartbeat age (`-1`: no worker has ever reported)      |
+| `payguard_worker_last_job_finished_age_seconds`           |                            | Time since any worker last finished a job (`-1`: never)       |
+
+Request rates and latencies are not exported; derive them from the access log (one JSON line per
+request with status and duration) or from the proxy in front of the API.
+
+### Alerting recommendations
+
+These are starting points, not tuned values; nothing in PayGuard sends alerts itself. Adjust them
+to observed traffic.
+
+| Condition                                                                               | Suggested threshold  | Why                                                     |
+| --------------------------------------------------------------------------------------- | -------------------- | ------------------------------------------------------- |
+| `payguard_workers_active == 0`                                                          | for 2 minutes        | Nothing is processing payments                          |
+| `payguard_outbox_dead_jobs > 0`                                                         | immediately          | Every dead job needs an operator decision               |
+| `payguard_outbox_oldest_due_job_age_seconds`                                            | > 120 for 5 minutes  | Workers are down, overloaded or failing                 |
+| `payguard_payment_attempts_oldest_unresolved_age_seconds`                               | > 900                | Outcomes are unknown beyond the automatic lookup window |
+| `payguard_outbox_expired_leases > 0`                                                    | for 5 minutes        | Workers are dying or hanging mid-job                    |
+| Increase in `payguard_outbox_lease_recoveries`                                          | > 5 in 15 minutes    | Possible poison job or crash-looping worker             |
+| `payguard_payment_attempts{status="FAILED",failure_code="PROVIDER_UNAVAILABLE"}` rising | sustained            | Provider outage                                         |
+| `payguard_payment_attempt_settle_seconds{quantile="0.95"}`                              | > 30                 | Processing is slow                                      |
+| `GET /health` returns 503                                                               | 2 consecutive probes | Instance cannot reach PostgreSQL                        |
+
+### Audit trail
+
+Every operator action that changes state writes a row to `operator_audit_events`, in the same
+transaction as the change: `merchant.created`, `merchant.suspended`, `merchant.reactivated`,
+`api_key.issued`, `api_key.revoked`, `outbox_job.requeued` and `maintenance.pruned`. Repeating an
+action that changes nothing (suspending a suspended merchant, revoking a revoked key) writes no
+event. Details hold identifiers, slugs, key prefixes and labels; never secrets.
+
+```bash
+npm run admin -- audit:list [--limit 50]   # newest first, default 20, at most 200
+```
+
+- **Actor:** `PAYGUARD_OPERATOR`, or `<os user>@<host>` when unset. It is self-declared, not
+  authenticated: anyone who can run the CLI can set it. It identifies who acted only as reliably as
+  access to the CLI host and database is controlled.
+- **Append-only, not tamper-proof:** a database trigger rejects every `UPDATE` and `DELETE` on the
+  table, so application code cannot rewrite history. A database owner can still drop the trigger.
+  For tamper evidence, ship events to an external, write-once store.
+- Events are kept indefinitely; `maintenance:prune` never touches them.
+
+### Data retention
+
+Nothing is deleted automatically. The defaults keep everything:
+
+| Data                                                     | Retention                                                                                                                |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Payments, attempts, idempotency keys, retry requests     | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment. |
+| Audit events                                             | Indefinitely, and the table rejects deletes                                                                              |
+| Merchants and API keys                                   | Indefinitely; merchants are suspended and keys revoked, never deleted                                                    |
+| `COMPLETED` outbox jobs of attempts with a final outcome | Prunable on demand                                                                                                       |
+| Worker heartbeat rows                                    | Prunable on demand                                                                                                       |
+| `DEAD` jobs and jobs of `PENDING` attempts               | Never pruned: they are the evidence for unresolved work                                                                  |
+
+```bash
+npm run admin -- maintenance:prune --completed-jobs-days 30 [--workers-days 30] [--batch-size 1000]
+```
+
+The job and worker retention must be at least 7 days, deletes run in batches (default 1000 rows)
+so no statement holds locks for long, and each run writes a `maintenance.pruned` audit event with
+the counts. Run it manually or from a scheduler; it is idempotent.
 
 ## Architecture
 
-PayGuard is a **modular monolith**: one deployable NestJS application made of feature modules
-with explicit boundaries. Each module owns its controllers, services and persistence code, and
-other modules use it only through the providers it exports.
+PayGuard is a **modular monolith**: one codebase and one image made of feature modules with
+explicit boundaries, started through three entry points that compose different modules. Each
+module owns its controllers, services and persistence code, and other modules use it only through
+the providers it exports.
+
+| Entry point         | Root module    | Contains                                                                      |
+| ------------------- | -------------- | ----------------------------------------------------------------------------- |
+| `dist/main.js`      | `AppModule`    | HTTP API, guards, health; the worker too unless `OUTBOX_WORKER_ENABLED=false` |
+| `dist/worker.js`    | `WorkerModule` | Outbox worker, job processor and payment provider only; no HTTP server        |
+| `dist/cli/admin.js` | `AdminModule`  | Merchant, key, outbox and audit services for the operator CLI                 |
 
 ```
 src/
-├── main.ts                 # Entry point: logger, HTTP setup, Swagger toggle, shutdown hooks
-├── app.module.ts           # Root module: config + infrastructure + feature modules
+├── main.ts                 # API entry point: logger, HTTP setup, Swagger toggle, shutdown hooks
+├── app.module.ts           # API root module: config + infrastructure + feature modules
 ├── app.setup.ts            # HTTP pipeline shared by main.ts and integration tests
-├── auth/                   # Key format, authenticator, global guard, @Public/@CurrentMerchant
+├── worker.ts               # Standalone worker entry point (application context, no HTTP)
+├── worker.module.ts        # Worker root module: core config + payment processing
+├── audit/                  # Operator audit trail: event writer, actor resolution, recent events
+├── auth/                   # Key format, authenticator, usage tracking, global guard, decorators
 ├── merchants/              # Merchant and key services, /v1/merchants and /v1/api-keys
 ├── payments/               # /v1/payments and retries, lifecycle, idempotency, currencies
-│   ├── processing/         # Outbox worker and the process/reconcile job handlers
-│   └── providers/          # PaymentProvider port and the simulated provider
-├── outbox/                 # Outbox job store: enqueue, claim, lease fencing, backoff, stats
-├── cli/                    # Operator CLI (admin.ts entry point, admin-cli.ts commands)
-├── config/                 # Environment schema, validation and ConfigModule
+│   ├── processing/         # Outbox worker, process/reconcile job handlers, in-process starter
+│   └── providers/          # PaymentProvider port, the simulated provider and its module
+├── outbox/                 # Outbox job store: enqueue, claim, fencing, heartbeats, stats, pruning
+├── cli/                    # Operator CLI (admin.ts entry point, admin-cli.ts commands, metrics)
+├── config/                 # Core and API environment schemas, validation, config modules
 ├── common/http/            # Error format, exception filter, request IDs, validation
 ├── common/logging/         # Structured logger, request context, access log
 ├── common/rate-limit/      # Token-bucket limiter and the per-IP / per-merchant guards
 ├── database/               # PrismaService (pg driver adapter) and DatabaseModule
-├── health/                 # /health (readiness) and /health/live (liveness)
+├── health/                 # /health (database, queue, workers) and /health/live
 └── generated/prisma/       # Generated Prisma client (gitignored; created by npm install)
 prisma/
 ├── schema.prisma
@@ -550,9 +739,10 @@ token; the payment domain depends only on that interface.
 - **Layers.** Controllers handle HTTP only: routing, DTO validation and status codes. Services
   hold the logic and throw domain errors (e.g. `MerchantNotFoundError`) that controllers and the
   CLI translate. Persistence goes through `PrismaService`.
-- **Configuration.** Read config through `ConfigService<EnvironmentVariables, true>`, never
-  through `process.env`. To add a variable, declare it in `src/config/environment.ts` and
-  `.env.example`.
+- **Configuration.** Read config through `ConfigService<CoreEnvironment, true>` (code shared with
+  the worker and CLI) or `ConfigService<ApiEnvironment, true>` (HTTP-only code), never through
+  `process.env`. To add a variable, declare it on the narrowest class in
+  `src/config/environment.ts` and in `.env.example`.
 - **Versioning.** Business endpoints are served under `/v1/...`. Operational endpoints opt out
   with `VERSION_NEUTRAL`.
 - **Validation.** A global `ValidationPipe` uses `whitelist` and `forbidNonWhitelisted`, so
@@ -589,9 +779,7 @@ token; the payment domain depends only on that interface.
   Sensitive keys (`authorization`, `cookie`, `password`, `secret`, `token`, ...) are masked, and
   any string shaped like a PayGuard key is replaced with `pgsk_[REDACTED]` in messages, values and
   stack traces. Successful health checks are not access-logged.
-- **Health.** `/health/live` checks only the process. `/health` also pings PostgreSQL, returning
-  503 when it is unreachable with the real error in the server log only, and reports outbox
-  problems as `degraded` (see [Payment processing](#payment-processing)).
+- **Health.** See [Health checks](#health-checks).
 
 ### Platform notes
 
@@ -608,14 +796,19 @@ token; the payment domain depends only on that interface.
 
 - **Unit tests** (`src/**/*.spec.ts`), with no database:
   - API keys: generation, parsing, comparison, and the guard's behaviour on every rejection path.
-  - Logging and configuration: log redaction and environment validation.
+  - Logging and configuration: log redaction, and validation of the core and API settings,
+    including which proxy entries are accepted.
+  - Key usage tracking: the per-process throttle, its memory bound, and that a failed write never
+    fails authentication.
   - Payments: payment and attempt transitions, retry eligibility, provider-result mapping,
     request validation through the real `ValidationPipe`, idempotency keys and fingerprints, the
     simulator (including lookups and ambiguous submissions), and controller status-code mapping.
-  - Processing: backoff, worker polling through failures, and graceful shutdown waiting for the
-    batch in flight.
-  - Health: degraded outbox reporting.
-  - Rate limiting: the token bucket (with an injected clock) and both guards.
+  - Processing: backoff, worker polling through failures, heartbeats, graceful shutdown waiting
+    for the batch in flight, and the in-process starter honouring `OUTBOX_WORKER_ENABLED`.
+  - Health: queue and worker reasons, and `unavailable` when their queries fail.
+  - Metrics: the exposition format and that labels come only from enums.
+  - Rate limiting: the token bucket (with an injected clock), both guards, and client keys
+    (IPv4, IPv4-mapped and IPv6 /64).
 - **Integration and HTTP tests** (`test/**/*.e2e-spec.ts`) run against **real PostgreSQL**:
   - Merchants and keys: provisioning (including concurrent duplicates), revocation, expiry,
     suspension, the CLI, and checks that no key reaches logs or responses.
@@ -632,7 +825,15 @@ token; the payment domain depends only on that interface.
     the same and with different keys, and cross-merchant `404`s.
   - Isolation and integrity: cross-merchant `404`s, late-result protection, and the database
     constraints themselves.
-  - Rate limiting: `429` responses, and the per-IP limit applying before authentication.
+  - Rate limiting: `429` responses, the per-IP limit applying before authentication, a spoofed
+    `X-Forwarded-For` being ignored without trusted proxies, and, with `TRUSTED_PROXIES`, per-client
+    limits, IPv6 /64 grouping and client-prepended entries being skipped.
+  - Operations: a poison job parked as `DEAD` after `OUTBOX_MAX_RUNS` claims, the audit trail for
+    every CLI action (and none for no-op changes), the append-only trigger, key usage recording,
+    retention keeping unresolved and dead work, worker heartbeats in health and metrics, graceful
+    shutdown of the real worker loop, and the standalone worker module processing a payment.
+  - Health with PostgreSQL unreachable: readiness `503` without leaking connection details, while
+    liveness stays `200`.
 - Tests swap the provider through `createTestApp({ provider })`. The `ScriptedProvider` test
   double keeps a ledger of what it "processed", can lose answers, fail or hold a call open, and
   counts submissions and lookups. Tests drive the worker directly (`processDueJobs()`), and move
@@ -666,28 +867,46 @@ Each CI step calls the same npm scripts you run locally.
 ## Known limitations
 
 - **Simulated payments only.** There is no real provider integration, card handling, capture,
-  refund or payout.
-- **Exactly-once processing depends on the provider.** The guarantees in
+  refund or payout. A real `PaymentProvider` would need at least:
+  - an idempotency key per submission (the attempt ID) that the provider honours across retries;
+  - a lookup by that key which, once a submission's timeout has passed, answers consistently and
+    distinguishes "never received" from "still processing";
+  - a mapping of every provider response to `succeeded`, `declined`, `unavailable` (nothing was
+    attempted) or unknown, where anything not clearly one of the first three is unknown;
+  - timeouts shorter than `OUTBOX_LEASE_SECONDS` and the stop grace period;
+  - credentials from a secret store, and no raw provider error or payload in logs;
+  - webhook handling (signature verification, deduplication, the same conditional outcome
+    writes) if the provider pushes results;
+  - PCI DSS scope review before any card data could pass through the system.
+- **No exactly-once guarantee; at most one charge per attempt depends on the provider.** The guarantees in
   [Processing and recovery](#processing-and-recovery) assume the provider deduplicates by attempt
   ID and answers lookups consistently. The simulator does by construction; a real provider must be
   verified.
 - **Automatic reconciliation is bounded.** After `OUTBOX_MAX_RUNS` inconclusive lookups the
   payment stays `PENDING` and needs an operator. The window is about 13 minutes with the defaults.
-- **The worker shares the API process.** A heavy backlog competes with HTTP traffic. Run
-  dedicated worker instances by disabling the worker on API-only instances
-  (`OUTBOX_WORKER_ENABLED=false`).
+- **The in-process worker shares the API process** (the default outside Compose). A heavy backlog
+  then competes with HTTP traffic; run the standalone worker in production (see
+  [Worker deployment](#worker-deployment)).
 - **No push notifications.** Clients poll `GET /v1/payments/:id` for outcomes; there are no
   webhooks.
-- **Outbox rows are retained indefinitely**; completed jobs need periodic archiving in long-running
-  deployments.
-- **Rate limits are per process**, reset on restart, and depend on `TRUST_PROXY_HOPS` being
-  correct (see [Rate limiting](#rate-limiting)).
+- **Retention is manual.** Payments, attempts, idempotency keys and audit events grow without
+  bound by design; only completed outbox jobs and worker rows can be pruned, and only when an
+  operator runs `maintenance:prune`. There is no archiving.
+- **Rate limits are per process**, reset on restart, and depend on `TRUSTED_PROXIES` listing
+  exactly the real proxies (see [Rate limiting](#rate-limiting)).
 - **Idempotency keys never expire**, and a replay returns the current payment state rather than a
   stored copy of the first response.
-- **Key usage is not recorded** (no `last_used_at`), so there is no automatic way to tell when a
-  rotated-out key has stopped being used.
-- **No audit trail** for administrative actions; the CLI relies on whoever can reach the database.
-  Treat database access as administrative access.
+- **Key usage is approximate** (to about 15 minutes per API process), and nothing flags keys that
+  have been unused for a long time.
+- **The audit actor is self-declared and the trail is not tamper-proof.** The CLI authenticates
+  nobody: whoever can reach the database is an administrator, and a database owner can disable
+  the append-only trigger.
+- **No built-in metrics endpoint or alerting.** Metrics are a CLI snapshot for an external
+  scraper; the thresholds in [Alerting recommendations](#alerting-recommendations) are untested
+  suggestions.
+- **The standalone worker has no health endpoint.** Its liveness is the process itself plus the
+  heartbeat-based `workers` check; a worker that is alive but wedged inside one batch shows up as
+  a stale heartbeat, not a failed probe.
 - **Expiry is enforced, but nothing alerts before a key expires.**
 - **HTTPS is assumed to terminate in front of the API.** HSTS is sent, but the app itself serves
   plain HTTP.
@@ -696,24 +915,29 @@ Each CI step calls the same npm scripts you run locally.
 
 ## Troubleshooting
 
-| Symptom                                                      | Fix                                                                                                                                                                                                         |
-| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `401 Missing API key`                                        | Send `Authorization: Bearer <key>`. Keys in query strings are ignored by design.                                                                                                                            |
-| `401 Invalid API key` with a key you just created            | Check for truncation or extra whitespace, then `key:list` for its status and `merchant:list` for suspension. The server log names the rejection reason.                                                     |
-| `400` with `field: "Idempotency-Key"`                        | Send an `Idempotency-Key` header of 1-255 visible ASCII characters (no spaces).                                                                                                                             |
-| `409 Idempotency-Key has already been used...`               | The key belongs to an earlier operation with a different request. Use a new key for a new operation, or resend the original request to read the result.                                                     |
-| `429 Rate limit exceeded`                                    | Wait `Retry-After` seconds. If every client is limited together behind a proxy, set `TRUST_PROXY_HOPS`.                                                                                                     |
-| A payment stays `PENDING`                                    | Check `ops:status`: a `backlog` means no worker is running (`OUTBOX_WORKER_ENABLED`), a dead reconcile job means the provider never gave a definite answer (see [Payment processing](#payment-processing)). |
-| `409 Payment cannot be retried: <reason>`                    | Only `FAILED` payments with fewer than 3 attempts can be retried; a `PENDING` payment is still being processed or reconciled.                                                                               |
-| `Refusing to run integration tests against "..."`            | `TEST_DATABASE_URL` must point at a database whose name ends with `_test`.                                                                                                                                  |
-| `TEST_DATABASE_URL must be set to run integration tests`     | Add `TEST_DATABASE_URL` to `.env` (see `.env.example`).                                                                                                                                                     |
-| `database "payguard_test" does not exist`                    | The init script runs only on a fresh volume. Run `docker compose exec postgres createdb -U payguard payguard_test`, or reset with `docker compose down -v`.                                                 |
-| `Property 'merchant' does not exist on type 'PrismaService'` | The generated client is stale. Run `npm run prisma:generate`.                                                                                                                                               |
-| `Bind for 127.0.0.1:5432 failed: port is already allocated`  | Another PostgreSQL is running. Set `POSTGRES_HOST_PORT` (e.g. `5434`) in `.env` and update the port in both database URLs.                                                                                  |
-| `EADDRINUSE` on start                                        | Change `PORT` (local) or `API_HOST_PORT` (Compose) in `.env`.                                                                                                                                               |
-| `Invalid environment configuration: ...`                     | The listed variables are missing or malformed. Compare `.env` with `.env.example`.                                                                                                                          |
-| `/health` returns 503 with `Database is unreachable`         | Check that PostgreSQL is running and that `DATABASE_URL` matches the Compose credentials. The server log has the real error.                                                                                |
-| Database authentication fails although the password is right | URL-encode special characters in the password inside `DATABASE_URL` (e.g. `@` → `%40`).                                                                                                                     |
-| `ExperimentalWarning: VM Modules is an experimental feature` | Expected: Jest's ESM mode prints this. It is harmless.                                                                                                                                                      |
-| Prisma suggests updating to `8.0.0-rc.*`                     | Ignore it. Prisma publishes release candidates under its `latest` tag, and this project pins the stable 7.10.1.                                                                                             |
-| Prettier reports every file as changed on Windows            | Line endings: `.gitattributes` enforces LF. Re-checkout, or set `git config core.autocrlf false`.                                                                                                           |
+| Symptom                                                      | Fix                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `401 Missing API key`                                        | Send `Authorization: Bearer <key>`. Keys in query strings are ignored by design.                                                                                                                                                                                  |
+| `401 Invalid API key` with a key you just created            | Check for truncation or extra whitespace, then `key:list` for its status and `merchant:list` for suspension. The server log names the rejection reason.                                                                                                           |
+| `400` with `field: "Idempotency-Key"`                        | Send an `Idempotency-Key` header of 1-255 visible ASCII characters (no spaces).                                                                                                                                                                                   |
+| `409 Idempotency-Key has already been used...`               | The key belongs to an earlier operation with a different request. Use a new key for a new operation, or resend the original request to read the result.                                                                                                           |
+| `429 Rate limit exceeded`                                    | Wait `Retry-After` seconds. If every client is limited together behind a proxy, list the proxy's address in `TRUSTED_PROXIES`.                                                                                                                                    |
+| A payment stays `PENDING`                                    | Check `ops:status`: no active worker or a growing backlog means no worker is running (start `worker`, or set `OUTBOX_WORKER_ENABLED=true`); a dead reconcile job means the provider never gave a definite answer (see [Payment processing](#payment-processing)). |
+| `/health` shows `workers` with `no_active_worker`            | No worker has sent a heartbeat within `HEALTH_WORKER_TIMEOUT_SECONDS`. With the API's worker disabled, check that the `worker` service is running and can reach PostgreSQL (`docker compose logs worker`).                                                        |
+| `/health` shows `queue` with `dead_jobs`                     | Run `ops:status` for the dead jobs, then follow [Payment processing](#payment-processing).                                                                                                                                                                        |
+| `TRUSTED_PROXIES must be comma-separated IP addresses ...`   | Use IPs, CIDR ranges with a prefix of at least 1, or `loopback`/`linklocal`/`uniquelocal`. `0.0.0.0/0` is rejected on purpose.                                                                                                                                    |
+| `TRUST_PROXY_HOPS` has no effect                             | It is not a PayGuard setting; use `TRUSTED_PROXIES`.                                                                                                                                                                                                              |
+| `maintenance:prune` refuses a value                          | Retention must be at least 7 days and the batch size 1-10000.                                                                                                                                                                                                     |
+| `409 Payment cannot be retried: <reason>`                    | Only `FAILED` payments with fewer than 3 attempts can be retried; a `PENDING` payment is still being processed or reconciled.                                                                                                                                     |
+| `Refusing to run integration tests against "..."`            | `TEST_DATABASE_URL` must point at a database whose name ends with `_test`.                                                                                                                                                                                        |
+| `TEST_DATABASE_URL must be set to run integration tests`     | Add `TEST_DATABASE_URL` to `.env` (see `.env.example`).                                                                                                                                                                                                           |
+| `database "payguard_test" does not exist`                    | The init script runs only on a fresh volume. Run `docker compose exec postgres createdb -U payguard payguard_test`, or reset with `docker compose down -v`.                                                                                                       |
+| `Property 'merchant' does not exist on type 'PrismaService'` | The generated client is stale. Run `npm run prisma:generate`.                                                                                                                                                                                                     |
+| `Bind for 127.0.0.1:5432 failed: port is already allocated`  | Another PostgreSQL is running. Set `POSTGRES_HOST_PORT` (e.g. `5434`) in `.env` and update the port in both database URLs.                                                                                                                                        |
+| `EADDRINUSE` on start                                        | Change `PORT` (local) or `API_HOST_PORT` (Compose) in `.env`.                                                                                                                                                                                                     |
+| `Invalid environment configuration: ...`                     | The listed variables are missing or malformed. Compare `.env` with `.env.example`.                                                                                                                                                                                |
+| `/health` returns 503 with `Database is unreachable`         | Check that PostgreSQL is running and that `DATABASE_URL` matches the Compose credentials. The server log has the real error.                                                                                                                                      |
+| Database authentication fails although the password is right | URL-encode special characters in the password inside `DATABASE_URL` (e.g. `@` → `%40`).                                                                                                                                                                           |
+| `ExperimentalWarning: VM Modules is an experimental feature` | Expected: Jest's ESM mode prints this. It is harmless.                                                                                                                                                                                                            |
+| Prisma suggests updating to `8.0.0-rc.*`                     | Ignore it. Prisma publishes release candidates under its `latest` tag, and this project pins the stable 7.10.1.                                                                                                                                                   |
+| Prettier reports every file as changed on Windows            | Line endings: `.gitattributes` enforces LF. Re-checkout, or set `git config core.autocrlf false`.                                                                                                                                                                 |
