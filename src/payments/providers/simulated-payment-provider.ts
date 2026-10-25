@@ -68,6 +68,6 @@ export class SimulatedPaymentProvider implements PaymentProvider {
   }
 }
 
-function referenceFor(attemptId: string): string {
+export function referenceFor(attemptId: string): string {
   return `sim_${createHash('sha256').update(attemptId).digest('hex').slice(0, 24)}`;
 }

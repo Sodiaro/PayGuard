@@ -39,6 +39,13 @@ function CommaSeparated(): PropertyDecorator {
   );
 }
 
+// Compose passes unset variables through as empty strings.
+function EmptyAsUnset(): PropertyDecorator {
+  return Transform(({ value }: { value: unknown }) =>
+    value === '' ? undefined : value,
+  );
+}
+
 const PROXY_KEYWORDS = new Set(['loopback', 'linklocal', 'uniquelocal']);
 
 export function isTrustedProxyEntry(entry: string): boolean {
@@ -134,6 +141,18 @@ export class CoreEnvironment {
     message: 'PAYGUARD_OPERATOR must be 1-200 printable ASCII characters',
   })
   PAYGUARD_OPERATOR?: string;
+
+  // Shared secret for simulator webhook signatures: the API verifies with it, the operator CLI's
+  // simulator command signs with it. Unset disables the webhook endpoint. It must be a dedicated
+  // secret, never a merchant API key.
+  @Expose()
+  @EmptyAsUnset()
+  @IsOptional()
+  @Matches(/^(?!pgsk_)[\x21-\x7E]{32,256}$/, {
+    message:
+      'SIMULATOR_WEBHOOK_SECRET must be 32-256 visible ASCII characters and must not be an API key',
+  })
+  SIMULATOR_WEBHOOK_SECRET?: string;
 }
 
 // Settings of the HTTP API process only.
@@ -206,6 +225,15 @@ export class ApiEnvironment extends CoreEnvironment {
   @Min(20)
   @Max(3600)
   HEALTH_WORKER_TIMEOUT_SECONDS: number = 30;
+
+  // How far a webhook's signed timestamp may be from this server's clock, in either direction.
+  // Bounds how long a captured delivery can be replayed; deduplication covers replays within it.
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(30)
+  @Max(900)
+  WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: number = 300;
 }
 
 export function validateCoreEnvironment(

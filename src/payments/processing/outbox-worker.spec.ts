@@ -19,6 +19,7 @@ const job: ClaimedJob = {
   runCount: 1,
   leaseToken: 'lease-1',
   requestId: null,
+  webhookEventId: null,
   reclaimed: false,
 };
 

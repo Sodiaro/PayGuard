@@ -9,6 +9,8 @@ import {
   OutboxJobType,
   PaymentAttemptStatus,
   PaymentFailureCode,
+  ProviderWebhookEventResult,
+  ProviderWebhookEventStatus,
 } from '../generated/prisma/enums.js';
 import { recordAuditEvent } from '../audit/operator-audit.js';
 import { backoffSeconds } from './backoff.js';
@@ -21,6 +23,7 @@ export interface ClaimedJob {
   runCount: number;
   leaseToken: string;
   requestId: string | null;
+  webhookEventId: string | null;
   // The previous claim's lease expired without the job finishing, i.e. a worker died or stalled.
   reclaimed: boolean;
 }
@@ -31,6 +34,7 @@ export interface EnqueueJob {
   attemptId: string;
   delaySeconds?: number;
   requestId?: string | null;
+  webhookEventId?: string;
 }
 
 export type RescheduleOutcome = 'rescheduled' | 'dead' | 'lease_lost';
@@ -54,6 +58,13 @@ export interface OutboxStats {
   // Attempt creation to final outcome, over attempts completed in the last hour.
   settleSecondsP50: number | null;
   settleSecondsP95: number | null;
+  webhookEvents: {
+    status: ProviderWebhookEventStatus;
+    result: ProviderWebhookEventResult | null;
+    count: number;
+  }[];
+  webhookDuplicateDeliveries: number;
+  webhookConflictingDeliveries: number;
 }
 
 type Db = Prisma.TransactionClient;
@@ -77,7 +88,8 @@ export class OutboxStore {
     });
   }
 
-  // A no-op when the attempt already has a job of this type: re-enqueueing never duplicates work.
+  // A no-op when the attempt already has a job of this type (or, for webhook jobs, the event
+  // already has one): re-enqueueing never duplicates work.
   async enqueue(db: Db, job: EnqueueJob): Promise<void> {
     await db.outboxJob.createMany({
       data: {
@@ -86,6 +98,7 @@ export class OutboxStore {
         attemptId: job.attemptId,
         availableAt: new Date(Date.now() + (job.delaySeconds ?? 0) * 1000),
         requestId: job.requestId ?? null,
+        webhookEventId: job.webhookEventId ?? null,
       },
       skipDuplicates: true,
     });
@@ -103,6 +116,7 @@ export class OutboxStore {
         run_count: number;
         lease_token: string;
         request_id: string | null;
+        webhook_event_id: string | null;
         reclaimed: boolean;
       }[]
     >`
@@ -131,7 +145,7 @@ export class OutboxStore {
       FROM due
       WHERE job.id = due.id
       RETURNING job.id, job.type, job.payment_id, job.attempt_id, job.run_count,
-                job.lease_token, job.request_id,
+                job.lease_token, job.request_id, job.webhook_event_id,
                 due.previous_status = 'PROCESSING' AS reclaimed`;
 
     return rows.map((row) => ({
@@ -142,6 +156,7 @@ export class OutboxStore {
       runCount: row.run_count,
       leaseToken: row.lease_token,
       requestId: row.request_id,
+      webhookEventId: row.webhook_event_id,
       reclaimed: row.reclaimed,
     }));
   }
@@ -394,40 +409,47 @@ export class OutboxStore {
   }
 
   async stats(): Promise<OutboxStats> {
-    const [jobs, pendingErrors, attempts, [timing]] = await Promise.all([
-      this.prisma.outboxJob.groupBy({
-        by: ['type', 'status'],
-        _count: { _all: true },
-        orderBy: [{ type: 'asc' }, { status: 'asc' }],
-      }),
-      this.prisma.outboxJob.groupBy({
-        by: ['lastError'],
-        where: {
-          status: { not: OutboxJobStatus.COMPLETED },
-          lastError: { not: null },
-        },
-        _count: { _all: true },
-        orderBy: { lastError: 'asc' },
-      }),
-      this.prisma.paymentAttempt.groupBy({
-        by: ['status', 'failureCode'],
-        _count: { _all: true },
-        orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
-      }),
-      this.prisma.$queryRaw<
-        {
-          dead_jobs: number;
-          expired_leases: number;
-          oldest_due_job_age_seconds: number | null;
-          reconciliation_lookups: number;
-          lease_recoveries: number;
-          unresolved_attempts: number;
-          oldest_unresolved_attempt_age_seconds: number | null;
-          payment_retries: number;
-          settle_p50_seconds: number | null;
-          settle_p95_seconds: number | null;
-        }[]
-      >`
+    const [jobs, pendingErrors, attempts, webhookEvents, [timing]] =
+      await Promise.all([
+        this.prisma.outboxJob.groupBy({
+          by: ['type', 'status'],
+          _count: { _all: true },
+          orderBy: [{ type: 'asc' }, { status: 'asc' }],
+        }),
+        this.prisma.outboxJob.groupBy({
+          by: ['lastError'],
+          where: {
+            status: { not: OutboxJobStatus.COMPLETED },
+            lastError: { not: null },
+          },
+          _count: { _all: true },
+          orderBy: { lastError: 'asc' },
+        }),
+        this.prisma.paymentAttempt.groupBy({
+          by: ['status', 'failureCode'],
+          _count: { _all: true },
+          orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
+        }),
+        this.prisma.providerWebhookEvent.groupBy({
+          by: ['status', 'result'],
+          _count: { _all: true },
+          _sum: { duplicateDeliveries: true, conflictingDeliveries: true },
+          orderBy: [{ status: 'asc' }, { result: 'asc' }],
+        }),
+        this.prisma.$queryRaw<
+          {
+            dead_jobs: number;
+            expired_leases: number;
+            oldest_due_job_age_seconds: number | null;
+            reconciliation_lookups: number;
+            lease_recoveries: number;
+            unresolved_attempts: number;
+            oldest_unresolved_attempt_age_seconds: number | null;
+            payment_retries: number;
+            settle_p50_seconds: number | null;
+            settle_p95_seconds: number | null;
+          }[]
+        >`
         SELECT
           (SELECT count(*)::int FROM outbox_jobs WHERE status = 'DEAD') AS dead_jobs,
           (SELECT coalesce(sum(lease_recoveries), 0)::int FROM outbox_jobs) AS lease_recoveries,
@@ -449,7 +471,7 @@ export class OutboxStore {
           (SELECT count(*)::int FROM payment_attempts WHERE status = 'PENDING') AS unresolved_attempts,
           (SELECT floor(extract(epoch FROM now() - min(created_at)))::int FROM payment_attempts
             WHERE status = 'PENDING') AS oldest_unresolved_attempt_age_seconds`,
-    ]);
+      ]);
 
     return {
       jobs: jobs.map((row) => ({
@@ -477,6 +499,21 @@ export class OutboxStore {
       paymentRetries: timing.payment_retries,
       settleSecondsP50: timing.settle_p50_seconds,
       settleSecondsP95: timing.settle_p95_seconds,
+      webhookEvents: webhookEvents.map((row) => ({
+        status: row.status,
+        result: row.result,
+        count: row._count._all,
+      })),
+      webhookDuplicateDeliveries: sum(
+        webhookEvents.map((row) => row._sum.duplicateDeliveries),
+      ),
+      webhookConflictingDeliveries: sum(
+        webhookEvents.map((row) => row._sum.conflictingDeliveries),
+      ),
     };
   }
+}
+
+function sum(values: (number | null)[]): number {
+  return values.reduce<number>((total, value) => total + (value ?? 0), 0);
 }

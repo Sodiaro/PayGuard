@@ -10,6 +10,7 @@ import {
 } from '../../generated/prisma/enums.js';
 import type { ClaimedJob } from '../../outbox/outbox-store.js';
 import { OutboxStore } from '../../outbox/outbox-store.js';
+import { ProviderWebhookProcessor } from '../../webhooks/provider-webhook-processor.js';
 import { applyAttemptResolution } from '../attempt-outcomes.js';
 import {
   resolveAttempt,
@@ -44,6 +45,7 @@ export class AttemptJobProcessor {
     private readonly prisma: PrismaService,
     private readonly outbox: OutboxStore,
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
+    private readonly webhooks: ProviderWebhookProcessor,
     config: ConfigService<CoreEnvironment, true>,
   ) {
     this.reconciliationDelaySeconds = config.get(
@@ -89,6 +91,12 @@ export class AttemptJobProcessor {
   }
 
   private async dispatch(job: ClaimedJob): Promise<void> {
+    // Webhook events must be classified even when the attempt already has an outcome.
+    if (job.type === OutboxJobType.APPLY_WEBHOOK_EVENT) {
+      await this.webhooks.process(job);
+      return;
+    }
+
     const attempt = await this.prisma.paymentAttempt.findFirst({
       where: { id: job.attemptId, status: PaymentAttemptStatus.PENDING },
       select: {

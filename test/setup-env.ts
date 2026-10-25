@@ -9,3 +9,7 @@ process.env.DATABASE_URL = requireTestDatabaseUrl();
 
 // Tests drive the outbox worker explicitly (processDueJobs) instead of racing a background loop.
 process.env.OUTBOX_WORKER_ENABLED = 'false';
+
+// A dedicated secret, so tests never depend on (or reveal) one configured in .env.
+process.env.SIMULATOR_WEBHOOK_SECRET =
+  'payguard-e2e-only-webhook-secret-5f0c2a9e7d41';

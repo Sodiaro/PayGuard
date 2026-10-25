@@ -9,6 +9,10 @@ import { requestIdMiddleware } from './common/http/request-id.middleware.js';
 import { createValidationPipe } from './common/http/validation.js';
 import { requestLoggingMiddleware } from './common/logging/request-logging.middleware.js';
 import { ApiEnvironment } from './config/environment.js';
+import {
+  WEBHOOK_PATH_PREFIX,
+  webhookRawBody,
+} from './webhooks/webhook-raw-body.js';
 
 // Shared by main.ts and the e2e tests so tests run the exact HTTP pipeline clients hit.
 export function configureApp(app: INestApplication): void {
@@ -27,6 +31,8 @@ export function configureApp(app: INestApplication): void {
   app.use(helmet());
   app.use(requestIdMiddleware);
   app.use(requestLoggingMiddleware);
+  // Must be registered before app.init(), which installs the JSON parser behind it.
+  app.use(WEBHOOK_PATH_PREFIX, webhookRawBody());
 
   const allowedOrigins = config.get('CORS_ALLOWED_ORIGINS', { infer: true });
   if (allowedOrigins.length > 0) {

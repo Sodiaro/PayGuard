@@ -8,6 +8,7 @@ import { MerchantsModule } from './merchants/merchants.module.js';
 import { InProcessWorkerStarter } from './payments/processing/in-process-worker.js';
 import { PaymentProcessingModule } from './payments/processing/payment-processing.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
+import { WebhooksModule } from './webhooks/webhooks.module.js';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { PaymentsModule } from './payments/payments.module.js';
     MerchantsModule,
     PaymentsModule,
     PaymentProcessingModule,
+    WebhooksModule,
   ],
   providers: [InProcessWorkerStarter],
 })

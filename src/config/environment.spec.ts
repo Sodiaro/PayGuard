@@ -35,7 +35,20 @@ describe('validateApiEnvironment', () => {
       TRUSTED_PROXIES: [],
       HEALTH_QUEUE_BACKLOG_SECONDS: 120,
       HEALTH_WORKER_TIMEOUT_SECONDS: 30,
+      WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: 300,
     });
+  });
+
+  it('accepts a webhook secret and treats an empty one as unset', () => {
+    const secret = 'whsec-0123456789abcdef0123456789abcdef';
+    expect(
+      validateApiEnvironment({ DATABASE_URL, SIMULATOR_WEBHOOK_SECRET: secret })
+        .SIMULATOR_WEBHOOK_SECRET,
+    ).toBe(secret);
+    expect(
+      validateApiEnvironment({ DATABASE_URL, SIMULATOR_WEBHOOK_SECRET: '' })
+        .SIMULATOR_WEBHOOK_SECRET,
+    ).toBeUndefined();
   });
 
   it('converts string values and drops undeclared variables', () => {
@@ -58,6 +71,7 @@ describe('validateApiEnvironment', () => {
       TRUSTED_PROXIES: '10.0.0.0/8, 2001:db8::/32 ,loopback',
       HEALTH_QUEUE_BACKLOG_SECONDS: '300',
       HEALTH_WORKER_TIMEOUT_SECONDS: '60',
+      WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: '120',
       PAYGUARD_OPERATOR: 'alice (on-call)',
       PATH: '/usr/bin',
     });
@@ -85,6 +99,7 @@ describe('validateApiEnvironment', () => {
       TRUSTED_PROXIES: ['10.0.0.0/8', '2001:db8::/32', 'loopback'],
       HEALTH_QUEUE_BACKLOG_SECONDS: 300,
       HEALTH_WORKER_TIMEOUT_SECONDS: 60,
+      WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: 120,
     });
   });
 
@@ -106,6 +121,14 @@ describe('validateApiEnvironment', () => {
     ['TRUSTED_PROXIES', '10.0.0.1/33'],
     ['TRUSTED_PROXIES', 'true'],
     ['PAYGUARD_OPERATOR', 'tab\there'],
+    ['SIMULATOR_WEBHOOK_SECRET', 'too-short'],
+    ['SIMULATOR_WEBHOOK_SECRET', 'contains a space 0123456789abcdef0123'],
+    [
+      'SIMULATOR_WEBHOOK_SECRET',
+      'pgsk_0123456789abcdef_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    ],
+    ['WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS', '0'],
+    ['WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS', '3600'],
   ])('rejects %s=%s', (name, value) => {
     expect(() =>
       validateApiEnvironment({ DATABASE_URL, [name]: value }),
@@ -148,6 +171,12 @@ describe('validateApiEnvironment', () => {
         NODE_ENV: 'x',
       }),
     ).toThrow(expect.not.stringContaining('s3cret-value'));
+    expect(() =>
+      validateApiEnvironment({
+        DATABASE_URL,
+        SIMULATOR_WEBHOOK_SECRET: 'short-secret-value',
+      }),
+    ).toThrow(expect.not.stringContaining('short-secret-value'));
   });
 });
 

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { DatabaseModule } from '../../database/database.module.js';
 import { OutboxModule } from '../../outbox/outbox.module.js';
+import { ProviderWebhookProcessor } from '../../webhooks/provider-webhook-processor.js';
 import { PaymentProviderModule } from '../providers/payment-provider.module.js';
 import { AttemptJobProcessor } from './attempt-job-processor.js';
 import { OutboxWorker } from './outbox-worker.js';
@@ -9,7 +10,7 @@ import { OutboxWorker } from './outbox-worker.js';
 // components, and starting the worker is left to the host process.
 @Module({
   imports: [DatabaseModule, OutboxModule, PaymentProviderModule],
-  providers: [AttemptJobProcessor, OutboxWorker],
+  providers: [AttemptJobProcessor, ProviderWebhookProcessor, OutboxWorker],
   exports: [OutboxWorker],
 })
 export class PaymentProcessingModule {}
