@@ -3,6 +3,7 @@ import { PrismaService } from '../database/prisma.service.js';
 import { MerchantStatus } from '../generated/prisma/enums.js';
 import { hashSecret, parseApiKey, secretMatches } from './api-key.js';
 import type { AuthenticatedMerchant } from './authenticated-merchant.js';
+import { KeyUsageTracker } from './key-usage-tracker.js';
 
 export type ApiKeyRejectionReason =
   | 'malformed'
@@ -24,7 +25,10 @@ const UNKNOWN_KEY_HASH = hashSecret('unknown-key-placeholder');
 
 @Injectable()
 export class ApiKeyAuthenticator {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly usage: KeyUsageTracker,
+  ) {}
 
   async authenticate(
     presentedKey: string,
@@ -63,6 +67,7 @@ export class ApiKeyAuthenticator {
       return reject('merchant_suspended');
     }
 
+    await this.usage.recordUse(key.id);
     return {
       authenticated: true,
       merchant: { merchantId: key.merchant.id, apiKeyId: key.id },

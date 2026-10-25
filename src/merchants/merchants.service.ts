@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { recordAuditEvent, SYSTEM_ACTOR } from '../audit/operator-audit.js';
 import { PrismaService } from '../database/prisma.service.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { MerchantStatus } from '../generated/prisma/enums.js';
@@ -53,6 +54,7 @@ export class MerchantsService {
   // hits the unique slug, rolls back, and never issues a second key.
   async provision(
     input: ProvisionMerchantInput,
+    actor = SYSTEM_ACTOR,
   ): Promise<{ merchant: MerchantProfile; apiKey: IssuedApiKey }> {
     const name = normalizeMerchantName(input.name);
     const slug = validateSlug(input.slug ?? slugFromName(name));
@@ -68,6 +70,13 @@ export class MerchantsService {
           input.firstKey,
           tx,
         );
+        await recordAuditEvent(tx, {
+          actor,
+          action: 'merchant.created',
+          targetType: 'merchant',
+          targetId: merchant.id,
+          details: { slug, apiKeyId: apiKey.id, apiKeyPrefix: apiKey.prefix },
+        });
         return { merchant, apiKey };
       });
     } catch (error) {
@@ -104,24 +113,59 @@ export class MerchantsService {
     });
   }
 
+  // Idempotent: only an actual change is written and audited, even when calls race.
   async setStatus(
     reference: string,
     status: MerchantStatus,
+    actor = SYSTEM_ACTOR,
   ): Promise<MerchantProfile> {
     const merchant = await this.resolve(reference);
-    if (merchant.status === status) return merchant;
-    return this.prisma.merchant.update({
-      where: { id: merchant.id },
-      data: { status },
-      select: PROFILE_FIELDS,
+    return this.prisma.$transaction(async (tx) => {
+      const changed = await tx.merchant.updateMany({
+        where: { id: merchant.id, status: { not: status } },
+        data: { status },
+      });
+      if (changed.count === 1) {
+        await recordAuditEvent(tx, {
+          actor,
+          action:
+            status === MerchantStatus.SUSPENDED
+              ? 'merchant.suspended'
+              : 'merchant.reactivated',
+          targetType: 'merchant',
+          targetId: merchant.id,
+          details: { slug: merchant.slug },
+        });
+      }
+      return tx.merchant.findUniqueOrThrow({
+        where: { id: merchant.id },
+        select: PROFILE_FIELDS,
+      });
     });
   }
 
   async issueKey(
     reference: string,
     options: IssueApiKeyOptions,
+    actor = SYSTEM_ACTOR,
   ): Promise<{ merchant: MerchantProfile; apiKey: IssuedApiKey }> {
     const merchant = await this.resolve(reference);
-    return { merchant, apiKey: await this.apiKeys.issue(merchant.id, options) };
+    const apiKey = await this.prisma.$transaction(async (tx) => {
+      const issued = await this.apiKeys.issue(merchant.id, options, tx);
+      await recordAuditEvent(tx, {
+        actor,
+        action: 'api_key.issued',
+        targetType: 'api_key',
+        targetId: issued.id,
+        details: {
+          merchantId: merchant.id,
+          prefix: issued.prefix,
+          label: issued.label,
+          expiresAt: issued.expiresAt?.toISOString() ?? null,
+        },
+      });
+      return issued;
+    });
+    return { merchant, apiKey };
   }
 }

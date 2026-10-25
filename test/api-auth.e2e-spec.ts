@@ -178,6 +178,7 @@ describe('API-key authentication over HTTP (PostgreSQL)', () => {
       expect(Object.keys(keys[0]).sort()).toEqual(
         [
           'createdAt',
+          'lastUsedAt',
           'expiresAt',
           'id',
           'label',

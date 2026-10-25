@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { recordAuditEvent, SYSTEM_ACTOR } from '../audit/operator-audit.js';
 import { displayPrefix, generateApiKey } from '../auth/api-key.js';
 import { PrismaService } from '../database/prisma.service.js';
 import type { Prisma } from '../generated/prisma/client.js';
@@ -19,6 +20,7 @@ export interface ApiKeySummary {
   status: ApiKeyStatus;
   expiresAt: Date | null;
   revokedAt: Date | null;
+  lastUsedAt: Date | null;
   createdAt: Date;
 }
 
@@ -39,6 +41,7 @@ const SUMMARY_FIELDS = {
   label: true,
   expiresAt: true,
   revokedAt: true,
+  lastUsedAt: true,
   createdAt: true,
 } satisfies Prisma.MerchantApiKeySelect;
 
@@ -72,19 +75,37 @@ export class ApiKeysService {
     return { ...toSummary(row), plaintext: key.plaintext };
   }
 
-  // Idempotent: revoking an already revoked key keeps the original revocation time.
-  async revoke(reference: string): Promise<ApiKeySummary> {
+  // Idempotent: revoking an already revoked key keeps the original revocation time and writes no
+  // second audit record.
+  async revoke(
+    reference: string,
+    actor = SYSTEM_ACTOR,
+  ): Promise<ApiKeySummary> {
     const where = keyWhere(reference);
-    await this.prisma.merchantApiKey.updateMany({
-      where: { ...where, revokedAt: null },
-      data: { revokedAt: new Date() },
+    return this.prisma.$transaction(async (tx) => {
+      const revoked = await tx.merchantApiKey.updateMany({
+        where: { ...where, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      const row = await tx.merchantApiKey.findFirst({
+        where,
+        select: SUMMARY_FIELDS,
+      });
+      if (!row) throw new ApiKeyNotFoundError(reference);
+      if (revoked.count === 1) {
+        await recordAuditEvent(tx, {
+          actor,
+          action: 'api_key.revoked',
+          targetType: 'api_key',
+          targetId: row.id,
+          details: {
+            merchantId: row.merchantId,
+            prefix: displayPrefix(row.prefix),
+          },
+        });
+      }
+      return toSummary(row);
     });
-    const row = await this.prisma.merchantApiKey.findFirst({
-      where,
-      select: SUMMARY_FIELDS,
-    });
-    if (!row) throw new ApiKeyNotFoundError(reference);
-    return toSummary(row);
   }
 
   async listForMerchant(merchantId: string): Promise<ApiKeySummary[]> {

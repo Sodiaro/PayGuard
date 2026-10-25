@@ -48,11 +48,37 @@ export class ApiKeyResponse {
   @ApiProperty({ type: Date, nullable: true })
   revokedAt: Date | null;
 
+  @ApiProperty({
+    type: Date,
+    nullable: true,
+    description:
+      'Approximate: updated at most once every 15 minutes per API instance',
+  })
+  lastUsedAt: Date | null;
+
   @ApiProperty()
   createdAt: Date;
 
   static from(key: ApiKeySummary): ApiKeyResponse {
-    const { id, prefix, label, status, expiresAt, revokedAt, createdAt } = key;
-    return { id, prefix, label, status, expiresAt, revokedAt, createdAt };
+    const {
+      id,
+      prefix,
+      label,
+      status,
+      expiresAt,
+      revokedAt,
+      lastUsedAt,
+      createdAt,
+    } = key;
+    return {
+      id,
+      prefix,
+      label,
+      status,
+      expiresAt,
+      revokedAt,
+      lastUsedAt,
+      createdAt,
+    };
   }
 }
