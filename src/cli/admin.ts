@@ -1,5 +1,9 @@
+import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
+import { OperatorAuditLog } from '../audit/operator-audit-log.js';
+import { resolveOperator } from '../audit/operator-audit.js';
 import { AppLogger } from '../common/logging/app-logger.js';
+import type { CoreEnvironment } from '../config/environment.js';
 import { ApiKeysService } from '../merchants/api-keys.service.js';
 import { MerchantsService } from '../merchants/merchants.service.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
@@ -10,6 +14,7 @@ import { runAdminCli } from './admin-cli.js';
 const app = await NestFactory.createApplicationContext(AdminModule, {
   logger: new AppLogger({ json: false, logLevels: ['error', 'warn'] }),
 });
+const config = app.get<ConfigService<CoreEnvironment, true>>(ConfigService);
 
 try {
   process.exitCode = await runAdminCli(
@@ -18,6 +23,8 @@ try {
       merchants: app.get(MerchantsService),
       apiKeys: app.get(ApiKeysService),
       outbox: app.get(OutboxStore),
+      audit: app.get(OperatorAuditLog),
+      actor: resolveOperator(config.get('PAYGUARD_OPERATOR', { infer: true })),
     },
     {
       out: (line) => process.stdout.write(`${line}\n`),

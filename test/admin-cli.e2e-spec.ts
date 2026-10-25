@@ -10,6 +10,7 @@ import type { INestApplication } from '@nestjs/common';
 import { ApiKeyAuthenticator } from '../src/auth/api-key-authenticator.service.js';
 import { runAdminCli } from '../src/cli/admin-cli.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
+import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../src/merchants/merchants.service.js';
 import { OutboxStore } from '../src/outbox/outbox-store.js';
@@ -47,6 +48,8 @@ describe('Admin CLI (PostgreSQL)', () => {
         merchants: app.get(MerchantsService),
         apiKeys: app.get(ApiKeysService),
         outbox: app.get(OutboxStore),
+        audit: new OperatorAuditLog(prismaOf(app)),
+        actor: 'test-operator',
       },
       { out: (line) => out.push(line), err: (line) => err.push(line) },
     );

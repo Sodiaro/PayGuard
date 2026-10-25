@@ -1,4 +1,5 @@
 import { parseArgs } from 'node:util';
+import type { OperatorAuditLog } from '../audit/operator-audit-log.js';
 import { MerchantStatus } from '../generated/prisma/enums.js';
 import type {
   ApiKeysService,
@@ -16,13 +17,22 @@ import type {
   MerchantsService,
 } from '../merchants/merchants.service.js';
 import type { OutboxStats, OutboxStore } from '../outbox/outbox-store.js';
+import { renderPrometheusMetrics } from './ops-metrics.js';
 
 const DEAD_JOBS_SHOWN = 20;
+const WORKERS_SHOWN = 20;
+// Matches the default HEALTH_WORKER_TIMEOUT_SECONDS used by /health.
+const WORKER_ACTIVE_SECONDS = 30;
+// Below this, a typo in a prune command could remove history that support still needs.
+const MIN_RETENTION_DAYS = 7;
 
 export interface AdminCliDependencies {
   merchants: MerchantsService;
   apiKeys: ApiKeysService;
   outbox: OutboxStore;
+  audit: OperatorAuditLog;
+  // Recorded on every state-changing command (see resolveOperator).
+  actor: string;
 }
 
 export interface AdminCliOutput {
@@ -32,7 +42,7 @@ export interface AdminCliOutput {
 
 export const ADMIN_USAGE = `Usage: payguard-admin <command> [options]
 
-Commands:
+Merchants and keys:
   merchant:create     --name <name> [--slug <slug>] [--key-label <label>] [--key-expires-at <ISO date>]
   merchant:list
   merchant:suspend    --merchant <id|slug>
@@ -40,8 +50,13 @@ Commands:
   key:create          --merchant <id|slug> [--label <label>] [--expires-at <ISO date>]
   key:list            --merchant <id|slug>
   key:revoke          --key <id|prefix>
+
+Operations:
   ops:status
-  outbox:requeue      --job <id>`;
+  ops:metrics
+  outbox:requeue      --job <id>
+  audit:list          [--limit <1-200>]
+  maintenance:prune   --completed-jobs-days <n> [--workers-days <n>] [--batch-size <n>]   (n >= ${MIN_RETENTION_DAYS})`;
 
 class UsageError extends Error {}
 
@@ -52,9 +67,13 @@ const OPTIONS = {
   key: { type: 'string' },
   job: { type: 'string' },
   label: { type: 'string' },
+  limit: { type: 'string' },
   'key-label': { type: 'string' },
   'expires-at': { type: 'string' },
   'key-expires-at': { type: 'string' },
+  'completed-jobs-days': { type: 'string' },
+  'workers-days': { type: 'string' },
+  'batch-size': { type: 'string' },
   help: { type: 'boolean', short: 'h' },
 } as const;
 
@@ -113,19 +132,22 @@ export async function runAdminCli(
 async function execute(
   command: string,
   options: Options,
-  { merchants, apiKeys, outbox }: AdminCliDependencies,
+  { merchants, apiKeys, outbox, audit, actor }: AdminCliDependencies,
   io: AdminCliOutput,
 ): Promise<void> {
   switch (command) {
     case 'merchant:create': {
-      const { merchant, apiKey } = await merchants.provision({
-        name: required(options, 'name'),
-        slug: options.slug,
-        firstKey: {
-          label: options['key-label'],
-          expiresAt: optionalDate(options['key-expires-at']),
+      const { merchant, apiKey } = await merchants.provision(
+        {
+          name: required(options, 'name'),
+          slug: options.slug,
+          firstKey: {
+            label: options['key-label'],
+            expiresAt: optionalDate(options['key-expires-at']),
+          },
         },
-      });
+        actor,
+      );
       io.out('Merchant created');
       printMerchant(merchant, io);
       printIssuedKey(apiKey, io);
@@ -148,6 +170,7 @@ async function execute(
       const merchant = await merchants.setStatus(
         required(options, 'merchant'),
         status,
+        actor,
       );
       io.out(`Merchant ${merchant.slug} is now ${merchant.status}`);
       return;
@@ -159,6 +182,7 @@ async function execute(
           label: options.label,
           expiresAt: optionalDate(options['expires-at']),
         },
+        actor,
       );
       io.out(`API key issued for ${merchant.slug}`);
       printIssuedKey(apiKey, io);
@@ -172,7 +196,7 @@ async function execute(
       return;
     }
     case 'key:revoke': {
-      const key = await apiKeys.revoke(required(options, 'key'));
+      const key = await apiKeys.revoke(required(options, 'key'), actor);
       io.out(
         `API key ${key.prefix} revoked at ${key.revokedAt?.toISOString()}`,
       );
@@ -180,6 +204,7 @@ async function execute(
     }
     case 'ops:status': {
       printOutboxStats(await outbox.stats(), io);
+      await printWorkers(outbox, io);
       const dead = await outbox.listDead(DEAD_JOBS_SHOWN);
       if (dead.length > 0) {
         io.out('');
@@ -194,12 +219,65 @@ async function execute(
       }
       return;
     }
+    case 'ops:metrics': {
+      const [stats, workers] = await Promise.all([
+        outbox.stats(),
+        outbox.workerSnapshot(WORKER_ACTIVE_SECONDS),
+      ]);
+      io.out(renderPrometheusMetrics(stats, workers).trimEnd());
+      return;
+    }
     case 'outbox:requeue': {
       const jobId = required(options, 'job');
-      if (!(await outbox.requeueDead(jobId))) {
+      if (!(await outbox.requeueDead(jobId, actor))) {
         throw new UsageError(`No DEAD outbox job with id ${jobId}`);
       }
       io.out(`Outbox job ${jobId} requeued`);
+      return;
+    }
+    case 'audit:list': {
+      const limit = integerOption(options, 'limit', 20, 1, 200);
+      for (const event of await audit.recent(limit)) {
+        io.out(
+          `${event.createdAt.toISOString()}  ${event.actor}  ${event.action}  ${event.targetType}=${event.targetId}  ${JSON.stringify(event.details)}`,
+        );
+      }
+      return;
+    }
+    case 'maintenance:prune': {
+      const jobDays = integerOption(
+        options,
+        'completed-jobs-days',
+        undefined,
+        MIN_RETENTION_DAYS,
+        36_500,
+      );
+      const workerDays = integerOption(
+        options,
+        'workers-days',
+        jobDays,
+        MIN_RETENTION_DAYS,
+        36_500,
+      );
+      const batchSize = integerOption(options, 'batch-size', 1000, 1, 10_000);
+
+      const deletedJobs = await outbox.pruneCompletedJobs(jobDays, batchSize);
+      const deletedWorkers = await outbox.pruneWorkers(workerDays);
+      await audit.record({
+        actor,
+        action: 'maintenance.pruned',
+        targetType: 'outbox',
+        targetId: 'outbox_jobs',
+        details: {
+          completedJobsOlderThanDays: jobDays,
+          workersOlderThanDays: workerDays,
+          deletedJobs,
+          deletedWorkers,
+        },
+      });
+      io.out(
+        `Deleted ${deletedJobs} completed outbox jobs older than ${jobDays} days and ${deletedWorkers} worker records older than ${workerDays} days`,
+      );
       return;
     }
     default:
@@ -214,6 +292,7 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
   }
   io.out(`Dead jobs:                      ${stats.deadJobs}`);
   io.out(`Expired leases:                 ${stats.expiredLeases}`);
+  io.out(`Lease recoveries:               ${stats.leaseRecoveries}`);
   io.out(
     `Oldest due job age (s):         ${stats.oldestDueJobAgeSeconds ?? '-'}`,
   );
@@ -221,6 +300,10 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
   io.out(`Unresolved attempts:            ${stats.unresolvedAttempts}`);
   io.out(
     `Oldest unresolved attempt (s):  ${stats.oldestUnresolvedAttemptAgeSeconds ?? '-'}`,
+  );
+  io.out(`Payment retries:                ${stats.paymentRetries}`);
+  io.out(
+    `Settle time p50/p95, 1h (s):    ${formatSeconds(stats.settleSecondsP50)} / ${formatSeconds(stats.settleSecondsP95)}`,
   );
   if (stats.pendingErrors.length > 0) {
     io.out('Last error of unfinished jobs:');
@@ -230,12 +313,67 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
   }
 }
 
+async function printWorkers(
+  outbox: OutboxStore,
+  io: AdminCliOutput,
+): Promise<void> {
+  const workers = await outbox.listWorkers(WORKERS_SHOWN);
+  io.out('');
+  io.out(
+    `Workers (active = heartbeat within ${WORKER_ACTIVE_SECONDS}s, newest first):`,
+  );
+  if (workers.length === 0) io.out('  none recorded');
+  for (const worker of workers) {
+    const heartbeatAge = secondsSince(worker.heartbeatAt);
+    const state = worker.stoppedAt
+      ? 'stopped'
+      : heartbeatAge <= WORKER_ACTIVE_SECONDS
+        ? 'active'
+        : 'silent';
+    const lastJob = worker.lastJobFinishedAt
+      ? `${secondsSince(worker.lastJobFinishedAt)}s ago`
+      : 'never';
+    io.out(
+      `  ${worker.id}  ${state.padEnd(7)}  heartbeat ${heartbeatAge}s ago  last job ${lastJob}  jobs=${worker.jobsFinished}`,
+    );
+  }
+}
+
+function secondsSince(date: Date): number {
+  return Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+}
+
+function formatSeconds(value: number | null): string {
+  return value === null ? '-' : value.toFixed(2);
+}
+
 function required(
   options: Options,
   name: 'name' | 'merchant' | 'key' | 'job',
 ): string {
   const value = options[name];
   if (!value) throw new UsageError(`Missing required option --${name}`);
+  return value;
+}
+
+function integerOption(
+  options: Options,
+  name: 'limit' | 'completed-jobs-days' | 'workers-days' | 'batch-size',
+  fallback: number | undefined,
+  min: number,
+  max: number,
+): number {
+  const raw = options[name];
+  if (raw === undefined) {
+    if (fallback === undefined) {
+      throw new UsageError(`Missing required option --${name}`);
+    }
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || value < min || value > max) {
+    throw new UsageError(`--${name} must be an integer from ${min} to ${max}`);
+  }
   return value;
 }
 
@@ -265,6 +403,7 @@ function printKeySummary(key: ApiKeySummary, io: AdminCliOutput): void {
     `status=${key.status}`,
     key.label && `label=${key.label}`,
     key.expiresAt && `expires=${key.expiresAt.toISOString()}`,
+    `lastUsed=${key.lastUsedAt?.toISOString() ?? 'never'}`,
   ].filter(Boolean);
   io.out(`  key ${key.id}  ${key.prefix}  ${details.join('  ')}`);
 }
