@@ -97,6 +97,7 @@ model Payment {
   attempts      PaymentAttempt[]
   retryRequests PaymentRetryRequest[]
   outboxJobs    OutboxJob[]
+  events        PaymentEvent[]
 
   // The idempotency guarantee: one payment per (merchant, key), enforced by the database.
   @@unique([merchantId, idempotencyKey])
@@ -123,6 +124,7 @@ model PaymentAttempt {
   payment      Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   retryRequest PaymentRetryRequest?
   outboxJobs   OutboxJob[]
+  events       PaymentEvent[]
 
   @@unique([paymentId, attemptNumber])
   @@map("payment_attempts")
@@ -285,11 +287,58 @@ model ProviderWebhookEvent {
   conflictingDeliveries Int                         @default(0) @map("conflicting_deliveries")
   lastConflictAt        DateTime?                   @map("last_conflict_at") @db.Timestamptz(3)
 
-  outboxJob OutboxJob?
+  outboxJob     OutboxJob?
+  paymentEvents PaymentEvent[]
 
   // Deduplication: a provider event is stored once, however often it is delivered.
   @@unique([provider, eventId])
   @@index([attemptId])
   @@index([receivedAt])
   @@map("provider_webhook_events")
+}
+
+// Who or what produced a payment event: the merchant's request, an answer from the provider (to
+// a submission, a lookup or by webhook), the worker's own decisions, or an operator.
+enum PaymentEventSource {
+  MERCHANT
+  PROVIDER_RESPONSE
+  PROVIDER_LOOKUP
+  PROVIDER_WEBHOOK
+  WORKER
+  OPERATOR
+
+  @@map("payment_event_source")
+}
+
+// Append-only lifecycle history of a payment: each state change and each decision about it
+// (deferral, dead-lettering, distrusted evidence, conflicting provider answers), written in the
+// transaction that makes it. Event types are listed in src/payments/payment-events.ts.
+model PaymentEvent {
+  id                  String                @id @default(uuid(7)) @db.Uuid
+  paymentId           String                @map("payment_id") @db.Uuid
+  attemptId           String?               @map("attempt_id") @db.Uuid
+  type                String                @db.VarChar(64)
+  source              PaymentEventSource
+  paymentStatusBefore PaymentStatus?        @map("payment_status_before")
+  paymentStatusAfter  PaymentStatus?        @map("payment_status_after")
+  attemptStatusBefore PaymentAttemptStatus? @map("attempt_status_before")
+  attemptStatusAfter  PaymentAttemptStatus? @map("attempt_status_after")
+  // Set only for operator events; self-declared, see src/audit/operator-audit.ts.
+  actor               String?               @db.VarChar(200)
+  requestId           String?               @map("request_id") @db.VarChar(128)
+  // No foreign key: completed jobs may be pruned, their history may not.
+  outboxJobId         String?               @map("outbox_job_id") @db.Uuid
+  webhookEventId      String?               @map("webhook_event_id") @db.Uuid
+  details             Json                  @default("{}")
+  // Wall-clock time of the write, not of the transaction start, so events order as they happened.
+  createdAt           DateTime              @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(3)
+
+  payment      Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt      PaymentAttempt?       @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  webhookEvent ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
+
+  @@index([paymentId, createdAt])
+  @@index([attemptId])
+  @@index([type, createdAt])
+  @@map("payment_events")
 }
