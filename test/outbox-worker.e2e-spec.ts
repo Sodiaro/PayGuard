@@ -7,9 +7,11 @@ import {
   it,
 } from '@jest/globals';
 import type { INestApplication } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import request from 'supertest';
 import type { App } from 'supertest/types.js';
 import { runAdminCli } from '../src/cli/admin-cli.js';
+import { SimulatedWebhookSender } from '../src/cli/simulated-webhook-sender.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
 import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
@@ -250,6 +252,10 @@ describe('Outbox and worker (PostgreSQL)', () => {
           apiKeys: app.get(ApiKeysService),
           outbox: store,
           audit: new OperatorAuditLog(prismaOf(app)),
+          simulator: new SimulatedWebhookSender(
+            prismaOf(app),
+            app.get(ConfigService),
+          ),
           actor: 'test-operator',
         },
         { out: (line) => out.push(line), err: (line) => out.push(line) },

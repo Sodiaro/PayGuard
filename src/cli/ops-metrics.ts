@@ -101,6 +101,24 @@ export function renderPrometheusMetrics(
     ],
   );
   gauge(
+    'payguard_webhook_events',
+    'Retained provider webhook events by status and processing result.',
+    stats.webhookEvents.map((row) => ({
+      labels: { status: row.status, result: row.result ?? 'none' },
+      value: row.count,
+    })),
+  );
+  gauge(
+    'payguard_webhook_duplicate_deliveries',
+    'Repeated deliveries of stored webhook events, ignored as duplicates.',
+    single(stats.webhookDuplicateDeliveries),
+  );
+  gauge(
+    'payguard_webhook_conflicting_deliveries',
+    'Deliveries that reused a stored event ID with different content, rejected.',
+    single(stats.webhookConflictingDeliveries),
+  );
+  gauge(
     'payguard_workers_active',
     'Workers with a recent heartbeat.',
     single(workers.activeWorkers),

@@ -9,6 +9,7 @@ import { MerchantsService } from '../merchants/merchants.service.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import { AdminModule } from './admin.module.js';
 import { runAdminCli } from './admin-cli.js';
+import { SimulatedWebhookSender } from './simulated-webhook-sender.js';
 
 // Operator-only entry point: runs with direct database access, so it is not exposed over HTTP.
 const app = await NestFactory.createApplicationContext(AdminModule, {
@@ -24,6 +25,7 @@ try {
       apiKeys: app.get(ApiKeysService),
       outbox: app.get(OutboxStore),
       audit: app.get(OperatorAuditLog),
+      simulator: app.get(SimulatedWebhookSender),
       actor: resolveOperator(config.get('PAYGUARD_OPERATOR', { infer: true })),
     },
     {

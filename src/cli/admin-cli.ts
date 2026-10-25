@@ -18,6 +18,10 @@ import type {
 } from '../merchants/merchants.service.js';
 import type { OutboxStats, OutboxStore } from '../outbox/outbox-store.js';
 import { renderPrometheusMetrics } from './ops-metrics.js';
+import {
+  SimulatorWebhookError,
+  type SimulatedWebhookSender,
+} from './simulated-webhook-sender.js';
 
 const DEAD_JOBS_SHOWN = 20;
 const WORKERS_SHOWN = 20;
@@ -25,12 +29,14 @@ const WORKERS_SHOWN = 20;
 const WORKER_ACTIVE_SECONDS = 30;
 // Below this, a typo in a prune command could remove history that support still needs.
 const MIN_RETENTION_DAYS = 7;
+const DEFAULT_SIMULATOR_TARGET = 'http://127.0.0.1:3000';
 
 export interface AdminCliDependencies {
   merchants: MerchantsService;
   apiKeys: ApiKeysService;
   outbox: OutboxStore;
   audit: OperatorAuditLog;
+  simulator: SimulatedWebhookSender;
   // Recorded on every state-changing command (see resolveOperator).
   actor: string;
 }
@@ -56,7 +62,10 @@ Operations:
   ops:metrics
   outbox:requeue      --job <id>
   audit:list          [--limit <1-200>]
-  maintenance:prune   --completed-jobs-days <n> [--workers-days <n>] [--batch-size <n>]   (n >= ${MIN_RETENTION_DAYS})`;
+  maintenance:prune   --completed-jobs-days <n> [--workers-days <n>] [--batch-size <n>]   (n >= ${MIN_RETENTION_DAYS})
+
+Simulator (refused when NODE_ENV=production):
+  simulator:webhook   --attempt <id> [--type payment.succeeded|payment.declined|payment.processing] [--url <API base URL>]`;
 
 class UsageError extends Error {}
 
@@ -74,6 +83,9 @@ const OPTIONS = {
   'completed-jobs-days': { type: 'string' },
   'workers-days': { type: 'string' },
   'batch-size': { type: 'string' },
+  attempt: { type: 'string' },
+  type: { type: 'string' },
+  url: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
 } as const;
 
@@ -120,7 +132,8 @@ export async function runAdminCli(
       error instanceof InvalidMerchantInputError ||
       error instanceof MerchantAlreadyExistsError ||
       error instanceof MerchantNotFoundError ||
-      error instanceof ApiKeyNotFoundError
+      error instanceof ApiKeyNotFoundError ||
+      error instanceof SimulatorWebhookError
     ) {
       io.err(`Error: ${error.message}`);
       return 1;
@@ -132,7 +145,7 @@ export async function runAdminCli(
 async function execute(
   command: string,
   options: Options,
-  { merchants, apiKeys, outbox, audit, actor }: AdminCliDependencies,
+  { merchants, apiKeys, outbox, audit, simulator, actor }: AdminCliDependencies,
   io: AdminCliOutput,
 ): Promise<void> {
   switch (command) {
@@ -280,6 +293,17 @@ async function execute(
       );
       return;
     }
+    case 'simulator:webhook': {
+      const delivery = await simulator.send({
+        attemptId: required(options, 'attempt'),
+        type: options.type,
+        baseUrl: options.url ?? DEFAULT_SIMULATOR_TARGET,
+      });
+      const line = `Delivered ${delivery.eventId} (${delivery.type}): HTTP ${delivery.statusCode} ${delivery.receipt}`;
+      if (delivery.statusCode >= 300) throw new SimulatorWebhookError(line);
+      io.out(line);
+      return;
+    }
     default:
       throw new UsageError(`Unknown command: ${command}`);
   }
@@ -288,7 +312,7 @@ async function execute(
 function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
   io.out('Outbox jobs:');
   for (const row of stats.jobs) {
-    io.out(`  ${row.type.padEnd(18)} ${row.status.padEnd(11)} ${row.count}`);
+    io.out(`  ${row.type.padEnd(20)} ${row.status.padEnd(11)} ${row.count}`);
   }
   io.out(`Dead jobs:                      ${stats.deadJobs}`);
   io.out(`Expired leases:                 ${stats.expiredLeases}`);
@@ -311,6 +335,17 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
       io.out(`  ${row.lastError.padEnd(22)} ${row.count}`);
     }
   }
+  io.out('Provider webhook events:');
+  if (stats.webhookEvents.length === 0) io.out('  none received');
+  for (const row of stats.webhookEvents) {
+    io.out(
+      `  ${row.status.padEnd(10)} ${(row.result ?? '-').padEnd(17)} ${row.count}`,
+    );
+  }
+  io.out(`Duplicate webhook deliveries:   ${stats.webhookDuplicateDeliveries}`);
+  io.out(
+    `Conflicting webhook deliveries: ${stats.webhookConflictingDeliveries}`,
+  );
 }
 
 async function printWorkers(
@@ -349,7 +384,7 @@ function formatSeconds(value: number | null): string {
 
 function required(
   options: Options,
-  name: 'name' | 'merchant' | 'key' | 'job',
+  name: 'name' | 'merchant' | 'key' | 'job' | 'attempt',
 ): string {
   const value = options[name];
   if (!value) throw new UsageError(`Missing required option --${name}`);

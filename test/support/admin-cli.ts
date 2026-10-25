@@ -1,6 +1,8 @@
 import type { INestApplication } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { OperatorAuditLog } from '../../src/audit/operator-audit-log.js';
 import { runAdminCli } from '../../src/cli/admin-cli.js';
+import { SimulatedWebhookSender } from '../../src/cli/simulated-webhook-sender.js';
 import { PrismaService } from '../../src/database/prisma.service.js';
 import { ApiKeysService } from '../../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../../src/merchants/merchants.service.js';
@@ -18,6 +20,10 @@ export async function runCli(app: INestApplication, ...argv: string[]) {
       apiKeys: app.get(ApiKeysService),
       outbox: app.get(OutboxStore),
       audit: new OperatorAuditLog(app.get(PrismaService)),
+      simulator: new SimulatedWebhookSender(
+        app.get(PrismaService),
+        app.get(ConfigService),
+      ),
       actor: TEST_OPERATOR,
     },
     { out: (line) => out.push(line), err: (line) => err.push(line) },

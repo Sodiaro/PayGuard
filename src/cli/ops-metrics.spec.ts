@@ -5,6 +5,8 @@ import {
   OutboxJobType,
   PaymentAttemptStatus,
   PaymentFailureCode,
+  ProviderWebhookEventResult,
+  ProviderWebhookEventStatus,
 } from '../generated/prisma/enums.js';
 import type { OutboxStats } from '../outbox/outbox-store.js';
 import { renderPrometheusMetrics } from './ops-metrics.js';
@@ -43,6 +45,16 @@ const stats: OutboxStats = {
   paymentRetries: 2,
   settleSecondsP50: 0.42,
   settleSecondsP95: 1.9,
+  webhookEvents: [
+    {
+      status: ProviderWebhookEventStatus.PROCESSED,
+      result: ProviderWebhookEventResult.APPLIED,
+      count: 7,
+    },
+    { status: ProviderWebhookEventStatus.RECEIVED, result: null, count: 1 },
+  ],
+  webhookDuplicateDeliveries: 3,
+  webhookConflictingDeliveries: 1,
 };
 
 describe('renderPrometheusMetrics', () => {
@@ -73,6 +85,13 @@ describe('renderPrometheusMetrics', () => {
       'payguard_worker_last_job_finished_age_seconds -1',
     );
     expect(output).toContain('payguard_workers_active 2');
+    expect(output).toContain(
+      'payguard_webhook_events{status="PROCESSED",result="APPLIED"} 7',
+    );
+    expect(output).toContain(
+      'payguard_webhook_events{status="RECEIVED",result="none"} 1',
+    );
+    expect(output).toContain('payguard_webhook_conflicting_deliveries 1');
   });
 
   it('uses only bounded labels, never identifiers', () => {
@@ -80,7 +99,14 @@ describe('renderPrometheusMetrics', () => {
       [...output.matchAll(/([a-z_]+)="/g)].map((match) => match[1]),
     );
     expect(labelNames).toEqual(
-      new Set(['type', 'status', 'category', 'failure_code', 'quantile']),
+      new Set([
+        'type',
+        'status',
+        'category',
+        'failure_code',
+        'quantile',
+        'result',
+      ]),
     );
     expect(output).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/);
   });

@@ -7,8 +7,10 @@ import {
   it,
 } from '@jest/globals';
 import type { INestApplication } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ApiKeyAuthenticator } from '../src/auth/api-key-authenticator.service.js';
 import { runAdminCli } from '../src/cli/admin-cli.js';
+import { SimulatedWebhookSender } from '../src/cli/simulated-webhook-sender.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
 import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
@@ -49,6 +51,10 @@ describe('Admin CLI (PostgreSQL)', () => {
         apiKeys: app.get(ApiKeysService),
         outbox: app.get(OutboxStore),
         audit: new OperatorAuditLog(prismaOf(app)),
+        simulator: new SimulatedWebhookSender(
+          prismaOf(app),
+          app.get(ConfigService),
+        ),
         actor: 'test-operator',
       },
       { out: (line) => out.push(line), err: (line) => err.push(line) },
