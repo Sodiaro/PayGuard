@@ -3,12 +3,17 @@ import { PrismaService } from '../database/prisma.service.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import {
   OutboxJobType,
+  PaymentEventSource,
   ProviderWebhookEventResult,
   ProviderWebhookEventStatus,
 } from '../generated/prisma/enums.js';
 import type { ClaimedJob } from '../outbox/outbox-store.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import { applyAttemptResolution } from '../payments/attempt-outcomes.js';
+import {
+  PaymentEventType,
+  recordPaymentEvent,
+} from '../payments/payment-events.js';
 import {
   decideWebhookEvent,
   type StoredWebhookEvent,
@@ -86,36 +91,65 @@ export class ProviderWebhookProcessor {
     job: ClaimedJob,
     event: StoredWebhookEvent & { attemptId: string },
   ): Promise<ProviderWebhookEventResult> {
-    const attempt = await this.findAttempt(tx, event.attemptId);
-    const decision = decideWebhookEvent(event, attempt);
-
-    if (decision.action === 'record') {
-      if (decision.reconcile) {
-        await this.outbox.enqueue(tx, {
-          type: OutboxJobType.RECONCILE_ATTEMPT,
-          paymentId: job.paymentId,
-          attemptId: job.attemptId,
-          requestId: job.requestId,
-        });
-      }
-      return decision.result;
-    }
-
-    if (
-      await applyAttemptResolution(tx, event.attemptId, decision.resolution)
-    ) {
-      return ProviderWebhookEventResult.APPLIED;
-    }
-    // Another writer (reconciliation, the submission's own answer) resolved the attempt between
-    // the read and the guarded update; classify against what it recorded.
-    const settled = decideWebhookEvent(
+    const webhookEventId = job.webhookEventId!;
+    let decision = decideWebhookEvent(
       event,
       await this.findAttempt(tx, event.attemptId),
     );
-    if (settled.action === 'apply') {
-      throw new Error(`Attempt ${event.attemptId} is pending but not writable`);
+
+    if (decision.action === 'apply') {
+      const applied = await applyAttemptResolution(
+        tx,
+        event.attemptId,
+        decision.resolution,
+        {
+          source: PaymentEventSource.PROVIDER_WEBHOOK,
+          outboxJobId: job.id,
+          webhookEventId,
+        },
+      );
+      if (applied) return ProviderWebhookEventResult.APPLIED;
+      // Another writer (reconciliation, the submission's own answer) resolved the attempt between
+      // the read and the guarded update; classify against what it recorded.
+      decision = decideWebhookEvent(
+        event,
+        await this.findAttempt(tx, event.attemptId),
+      );
+      if (decision.action === 'apply') {
+        throw new Error(
+          `Attempt ${event.attemptId} is pending but not writable`,
+        );
+      }
     }
-    return settled.result;
+
+    const lookupJobCreated =
+      decision.reconcile &&
+      (await this.outbox.enqueue(tx, {
+        type: OutboxJobType.RECONCILE_ATTEMPT,
+        paymentId: job.paymentId,
+        attemptId: job.attemptId,
+        requestId: job.requestId,
+      }));
+    if (NEEDS_ATTENTION.has(decision.result)) {
+      await recordPaymentEvent(tx, {
+        paymentId: job.paymentId,
+        attemptId: job.attemptId,
+        type: PaymentEventType.WEBHOOK_NOT_APPLIED,
+        source: PaymentEventSource.PROVIDER_WEBHOOK,
+        outboxJobId: job.id,
+        webhookEventId,
+        details: {
+          result: decision.result,
+          // "existing": a lookup job was already there, in whatever state (see payment:inspect).
+          lookupJob: !decision.reconcile
+            ? 'none'
+            : lookupJobCreated
+              ? 'created'
+              : 'existing',
+        },
+      });
+    }
+    return decision.result;
   }
 
   private findAttempt(

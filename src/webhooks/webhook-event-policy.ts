@@ -3,6 +3,7 @@ import {
   ProviderWebhookEventResult,
   type PaymentFailureCode,
 } from '../generated/prisma/enums.js';
+import { matchesRecordedOutcome } from '../payments/attempt-outcomes.js';
 import {
   resolveAttempt,
   type AttemptResolution,
@@ -71,7 +72,7 @@ export function decideWebhookEvent(
     return { action: 'apply', resolution };
   }
   return record(
-    sameOutcome(attempt, resolution)
+    matchesRecordedOutcome(attempt, resolution)
       ? ProviderWebhookEventResult.ALREADY_APPLIED
       : ProviderWebhookEventResult.OUTCOME_CONFLICT,
     false,
@@ -95,18 +96,6 @@ function resolutionFor(event: StoredWebhookEvent): AttemptResolution | null {
     default:
       return null;
   }
-}
-
-function sameOutcome(
-  attempt: WebhookTargetAttempt,
-  resolution: AttemptResolution,
-): boolean {
-  return (
-    attempt.status === resolution.attemptStatus &&
-    attempt.failureCode === resolution.failureCode &&
-    (attempt.providerReference === null ||
-      attempt.providerReference === resolution.providerReference)
-  );
 }
 
 function record(

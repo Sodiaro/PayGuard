@@ -3,15 +3,21 @@ import { ConfigService } from '@nestjs/config';
 import { requestContext } from '../../common/logging/request-context.js';
 import type { CoreEnvironment } from '../../config/environment.js';
 import { PrismaService } from '../../database/prisma.service.js';
+import type { Prisma } from '../../generated/prisma/client.js';
 import {
   OutboxErrorCategory,
   OutboxJobType,
   PaymentAttemptStatus,
+  PaymentEventSource,
 } from '../../generated/prisma/enums.js';
 import type { ClaimedJob } from '../../outbox/outbox-store.js';
 import { OutboxStore } from '../../outbox/outbox-store.js';
 import { ProviderWebhookProcessor } from '../../webhooks/provider-webhook-processor.js';
-import { applyAttemptResolution } from '../attempt-outcomes.js';
+import {
+  applyAttemptResolution,
+  matchesRecordedOutcome,
+} from '../attempt-outcomes.js';
+import { PaymentEventType, recordPaymentEvent } from '../payment-events.js';
 import {
   resolveAttempt,
   type AttemptResolution,
@@ -135,15 +141,27 @@ export class AttemptJobProcessor {
       await this.handOverToReconciliation(job, 0);
       return;
     }
-    const marked = await this.prisma.paymentAttempt.updateMany({
-      where: {
-        id: attempt.id,
-        status: PaymentAttemptStatus.PENDING,
-        submittedAt: null,
-      },
-      data: { submittedAt: new Date() },
+    const marked = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.paymentAttempt.updateMany({
+        where: {
+          id: attempt.id,
+          status: PaymentAttemptStatus.PENDING,
+          submittedAt: null,
+        },
+        data: { submittedAt: new Date() },
+      });
+      if (updated.count === 1) {
+        await recordPaymentEvent(tx, {
+          paymentId: job.paymentId,
+          attemptId: attempt.id,
+          type: PaymentEventType.ATTEMPT_SUBMITTED,
+          source: PaymentEventSource.WORKER,
+          outboxJobId: job.id,
+        });
+      }
+      return updated.count === 1;
     });
-    if (marked.count === 0) {
+    if (!marked) {
       await this.handOverToReconciliation(job, 0);
       return;
     }
@@ -185,6 +203,7 @@ export class AttemptJobProcessor {
             outcome: 'succeeded',
             providerReference: lookup.providerReference,
           }),
+          PaymentEventSource.PROVIDER_LOOKUP,
         );
         return;
       case 'declined':
@@ -194,6 +213,7 @@ export class AttemptJobProcessor {
             outcome: 'declined',
             providerReference: lookup.providerReference,
           }),
+          PaymentEventSource.PROVIDER_LOOKUP,
         );
         return;
       case 'processing':
@@ -240,38 +260,101 @@ export class AttemptJobProcessor {
       await onUnknownOutcome(category);
       return;
     }
-    await this.recordAndComplete(job, resolution, elapsedMs(startedAt));
+    await this.recordAndComplete(
+      job,
+      resolution,
+      PaymentEventSource.PROVIDER_RESPONSE,
+      elapsedMs(startedAt),
+    );
   }
 
   private async recordAndComplete(
     job: ClaimedJob,
     resolution: AttemptResolution,
+    source: PaymentEventSource,
     providerDurationMs?: number,
   ): Promise<void> {
-    const { applied, completed } = await this.prisma.$transaction(
-      async (tx) => ({
-        applied: await applyAttemptResolution(tx, job.attemptId, resolution),
-        completed: await this.outbox.complete(tx, job),
-      }),
-    );
-
-    this.logger.log(
-      applied
-        ? 'Attempt outcome recorded'
-        : 'Attempt already had an outcome; result ignored',
-      {
-        ...jobFields(job),
-        attemptStatus: resolution.attemptStatus,
-        failureCode: resolution.failureCode,
-        providerDurationMs,
+    const { applied, contradicted, completed } = await this.prisma.$transaction(
+      async (tx) => {
+        const applied = await applyAttemptResolution(
+          tx,
+          job.attemptId,
+          resolution,
+          { source, outboxJobId: job.id },
+        );
+        const contradicted =
+          !applied &&
+          (await this.recordIfContradicted(tx, job, resolution, source));
+        return {
+          applied,
+          contradicted,
+          completed: await this.outbox.complete(tx, job),
+        };
       },
     );
+
+    const fields = {
+      ...jobFields(job),
+      attemptStatus: resolution.attemptStatus,
+      failureCode: resolution.failureCode,
+      providerDurationMs,
+    };
+    if (contradicted) {
+      this.logger.error(
+        'Provider answer contradicts the recorded outcome; nothing was changed',
+        fields,
+      );
+    } else {
+      this.logger.log(
+        applied
+          ? 'Attempt outcome recorded'
+          : 'Attempt already had this outcome; answer ignored',
+        fields,
+      );
+    }
     if (!completed) {
       this.logger.warn(
         'Outbox job lease was lost before completion',
         jobFields(job),
       );
     }
+  }
+
+  // The attempt already has an outcome. An answer that agrees is a harmless duplicate; one that
+  // disagrees means the provider contradicts itself (or a webhook), which is recorded for
+  // investigation and never applied.
+  private async recordIfContradicted(
+    tx: Prisma.TransactionClient,
+    job: ClaimedJob,
+    resolution: AttemptResolution,
+    source: PaymentEventSource,
+  ): Promise<boolean> {
+    const recorded = await tx.paymentAttempt.findUniqueOrThrow({
+      where: { id: job.attemptId },
+      select: { status: true, failureCode: true, providerReference: true },
+    });
+    if (matchesRecordedOutcome(recorded, resolution)) return false;
+
+    await recordPaymentEvent(tx, {
+      paymentId: job.paymentId,
+      attemptId: job.attemptId,
+      type: PaymentEventType.RESULT_CONFLICT,
+      source,
+      outboxJobId: job.id,
+      details: {
+        reported: {
+          status: resolution.attemptStatus,
+          failureCode: resolution.failureCode,
+          providerReference: resolution.providerReference,
+        },
+        recorded: {
+          status: recorded.status,
+          failureCode: recorded.failureCode,
+          providerReference: recorded.providerReference,
+        },
+      },
+    });
+    return true;
   }
 
   private async handOverToReconciliation(
@@ -287,7 +370,21 @@ export class AttemptJobProcessor {
         delaySeconds,
         requestId: job.requestId,
       });
-      await this.outbox.complete(tx, job);
+      // A worker fenced out of this job made no decision; whoever owns it now records its own.
+      if (!(await this.outbox.complete(tx, job))) return;
+      await recordPaymentEvent(tx, {
+        paymentId: job.paymentId,
+        attemptId: job.attemptId,
+        type: PaymentEventType.OUTCOME_UNKNOWN,
+        source: PaymentEventSource.WORKER,
+        outboxJobId: job.id,
+        details: {
+          // Without a category: redelivered work for an attempt that may already be submitted.
+          reason: category ? 'no_definite_answer' : 'possibly_submitted',
+          category: category ?? null,
+          lookupDelaySeconds: delaySeconds,
+        },
+      });
     });
     this.logger.log('Attempt handed to reconciliation', {
       ...jobFields(job),
@@ -296,11 +393,41 @@ export class AttemptJobProcessor {
     });
   }
 
+  // Rescheduling and its history entry commit together. Only decisions about the payment are
+  // recorded: a lookup that could not decide, and any job given up on. Internal retries of other
+  // jobs are in the job's own run count and last error.
   private async retryLater(
     job: ClaimedJob,
     category: OutboxErrorCategory,
   ): Promise<void> {
-    const outcome = await this.outbox.reschedule(this.prisma, job, category);
+    const outcome = await this.prisma.$transaction(async (tx) => {
+      const result = await this.outbox.reschedule(tx, job, category);
+      const details = { jobType: job.type, category, runCount: job.runCount };
+      if (result === 'dead') {
+        await recordPaymentEvent(tx, {
+          paymentId: job.paymentId,
+          attemptId: job.attemptId,
+          type: PaymentEventType.JOB_DEAD,
+          source: PaymentEventSource.WORKER,
+          outboxJobId: job.id,
+          webhookEventId: job.webhookEventId,
+          details,
+        });
+      } else if (
+        result === 'rescheduled' &&
+        job.type === OutboxJobType.RECONCILE_ATTEMPT
+      ) {
+        await recordPaymentEvent(tx, {
+          paymentId: job.paymentId,
+          attemptId: job.attemptId,
+          type: PaymentEventType.RECONCILIATION_DEFERRED,
+          source: PaymentEventSource.WORKER,
+          outboxJobId: job.id,
+          details,
+        });
+      }
+      return result;
+    });
     const fields = { ...jobFields(job), category, runCount: job.runCount };
     if (outcome === 'dead') {
       this.logger.error(

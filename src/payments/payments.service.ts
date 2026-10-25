@@ -2,9 +2,15 @@ import { Inject, Injectable } from '@nestjs/common';
 import { requestContext } from '../common/logging/request-context.js';
 import { PrismaService } from '../database/prisma.service.js';
 import { Prisma } from '../generated/prisma/client.js';
-import { OutboxJobType, PaymentStatus } from '../generated/prisma/enums.js';
+import {
+  OutboxJobType,
+  PaymentAttemptStatus,
+  PaymentEventSource,
+  PaymentStatus,
+} from '../generated/prisma/enums.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import { applyAttemptResolution } from './attempt-outcomes.js';
+import { PaymentEventType, recordPaymentEvent } from './payment-events.js';
 import {
   fingerprintPaymentRequest,
   fingerprintRetryRequest,
@@ -89,6 +95,15 @@ export class PaymentsService {
           attemptId: payment.attempts[0].id,
           requestId: currentRequestId(),
         });
+        await recordPaymentEvent(tx, {
+          paymentId: payment.id,
+          attemptId: payment.attempts[0].id,
+          type: PaymentEventType.PAYMENT_CREATED,
+          source: PaymentEventSource.MERCHANT,
+          paymentStatusAfter: PaymentStatus.PENDING,
+          attemptStatusAfter: PaymentAttemptStatus.PENDING,
+          details: { attemptNumber: 1 },
+        });
         return payment.id;
       });
     } catch (error) {
@@ -160,7 +175,7 @@ export class PaymentsService {
         if (reopened.count !== 1)
           throw new PaymentStateConflictError(paymentId);
 
-        await tx.paymentRetryRequest.create({
+        const retryRequest = await tx.paymentRetryRequest.create({
           data: {
             merchantId,
             idempotencyKey,
@@ -174,6 +189,20 @@ export class PaymentsService {
           paymentId,
           attemptId: attempt.id,
           requestId: currentRequestId(),
+        });
+        await recordPaymentEvent(tx, {
+          paymentId,
+          attemptId: attempt.id,
+          type: PaymentEventType.RETRY_ACCEPTED,
+          source: PaymentEventSource.MERCHANT,
+          paymentStatusBefore: PaymentStatus.FAILED,
+          paymentStatusAfter: PaymentStatus.PENDING,
+          attemptStatusAfter: PaymentAttemptStatus.PENDING,
+          details: {
+            attemptNumber: attempt.attemptNumber,
+            retryRequestId: retryRequest.id,
+            previousFailureCode: payment.attempts.at(-1)!.failureCode,
+          },
         });
         return null;
       });
@@ -203,13 +232,16 @@ export class PaymentsService {
     return payment && toResponse(payment);
   }
 
-  // Returns false when the attempt already has an outcome; see applyAttemptResolution.
+  // A definite provider answer arriving outside the worker. Returns false when the attempt
+  // already has an outcome; see applyAttemptResolution.
   async recordAttemptOutcome(
     attemptId: string,
     result: ProviderPaymentResult,
   ): Promise<boolean> {
     return this.prisma.$transaction((tx) =>
-      applyAttemptResolution(tx, attemptId, resolveAttempt(result)),
+      applyAttemptResolution(tx, attemptId, resolveAttempt(result), {
+        source: PaymentEventSource.PROVIDER_RESPONSE,
+      }),
     );
   }
 

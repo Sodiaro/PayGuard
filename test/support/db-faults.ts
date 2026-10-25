@@ -4,7 +4,11 @@ import type { PrismaService } from '../../src/database/prisma.service.js';
 // transaction leaves nothing behind and that the worker treats it as an internal error.
 export async function failWritesTo(
   prisma: PrismaService,
-  table: 'outbox_jobs' | 'payment_attempts' | 'provider_webhook_events',
+  table:
+    | 'outbox_jobs'
+    | 'payment_attempts'
+    | 'provider_webhook_events'
+    | 'payment_events',
   operation: 'INSERT' | 'UPDATE',
 ): Promise<() => Promise<void>> {
   const name = `test_fail_${table}_${operation.toLowerCase()}`;
