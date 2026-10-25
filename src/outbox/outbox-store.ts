@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { EnvironmentVariables } from '../config/environment.js';
+import type { CoreEnvironment } from '../config/environment.js';
 import { PrismaService } from '../database/prisma.service.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import {
@@ -8,7 +8,9 @@ import {
   OutboxJobStatus,
   OutboxJobType,
   PaymentAttemptStatus,
+  PaymentFailureCode,
 } from '../generated/prisma/enums.js';
+import { recordAuditEvent } from '../audit/operator-audit.js';
 import { backoffSeconds } from './backoff.js';
 
 export interface ClaimedJob {
@@ -36,12 +38,22 @@ export type RescheduleOutcome = 'rescheduled' | 'dead' | 'lease_lost';
 export interface OutboxStats {
   jobs: { type: OutboxJobType; status: OutboxJobStatus; count: number }[];
   pendingErrors: { lastError: OutboxErrorCategory; count: number }[];
+  attempts: {
+    status: PaymentAttemptStatus;
+    failureCode: PaymentFailureCode | null;
+    count: number;
+  }[];
   deadJobs: number;
   expiredLeases: number;
   oldestDueJobAgeSeconds: number | null;
   reconciliationLookups: number;
+  leaseRecoveries: number;
   unresolvedAttempts: number;
   oldestUnresolvedAttemptAgeSeconds: number | null;
+  paymentRetries: number;
+  // Attempt creation to final outcome, over attempts completed in the last hour.
+  settleSecondsP50: number | null;
+  settleSecondsP95: number | null;
 }
 
 type Db = Prisma.TransactionClient;
@@ -56,7 +68,7 @@ export class OutboxStore {
 
   constructor(
     private readonly prisma: PrismaService,
-    config: ConfigService<EnvironmentVariables, true>,
+    config: ConfigService<CoreEnvironment, true>,
   ) {
     this.leaseSeconds = config.get('OUTBOX_LEASE_SECONDS', { infer: true });
     this.maxRuns = config.get('OUTBOX_MAX_RUNS', { infer: true });
@@ -109,6 +121,8 @@ export class OutboxStore {
           lease_token = gen_random_uuid(),
           locked_until = now() + ${this.leaseSeconds} * interval '1 second',
           run_count = job.run_count + 1,
+          lease_recoveries = job.lease_recoveries
+            + CASE WHEN due.previous_status = 'PROCESSING' THEN 1 ELSE 0 END,
           last_error = CASE
             WHEN due.previous_status = 'PROCESSING' THEN 'LEASE_EXPIRED'::outbox_error_category
             ELSE job.last_error
@@ -148,6 +162,12 @@ export class OutboxStore {
       },
     });
     return result.count === 1;
+  }
+
+  // A job claimed more often than it may run has crashed or stalled every worker that took it,
+  // without ever reaching its own reschedule. Such jobs must stop here instead of cycling forever.
+  hasExhaustedRuns(job: ClaimedJob): boolean {
+    return job.runCount > this.maxRuns;
   }
 
   // Puts the job back with backoff, or marks it DEAD once it has used its runs. DEAD jobs stay in
@@ -235,16 +255,125 @@ export class OutboxStore {
     };
   }
 
-  async requeueDead(jobId: string): Promise<boolean> {
-    const result = await this.prisma.outboxJob.updateMany({
-      where: { id: jobId, status: OutboxJobStatus.DEAD },
-      data: {
-        status: OutboxJobStatus.QUEUED,
-        runCount: 0,
-        availableAt: new Date(),
-      },
+  async requeueDead(jobId: string, actor: string): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const job = await tx.outboxJob.findFirst({
+        where: { id: jobId, status: OutboxJobStatus.DEAD },
+        select: {
+          type: true,
+          attemptId: true,
+          runCount: true,
+          lastError: true,
+        },
+      });
+      if (!job) return false;
+      await tx.outboxJob.update({
+        where: { id: jobId },
+        data: {
+          status: OutboxJobStatus.QUEUED,
+          runCount: 0,
+          availableAt: new Date(),
+        },
+      });
+      await recordAuditEvent(tx, {
+        actor,
+        action: 'outbox_job.requeued',
+        targetType: 'outbox_job',
+        targetId: jobId,
+        details: {
+          jobType: job.type,
+          attemptId: job.attemptId,
+          previousRunCount: job.runCount,
+          lastError: job.lastError,
+        },
+      });
+      return true;
     });
-    return result.count === 1;
+  }
+
+  async recordWorkerHeartbeat(
+    workerId: string,
+    progress: { jobsFinished: number; lastJobFinishedAt: Date | null },
+  ): Promise<void> {
+    const now = new Date();
+    await this.prisma.outboxWorker.upsert({
+      where: { id: workerId },
+      create: { id: workerId, heartbeatAt: now, ...progress },
+      update: { heartbeatAt: now, stoppedAt: null, ...progress },
+    });
+  }
+
+  async markWorkerStopped(workerId: string): Promise<void> {
+    await this.prisma.outboxWorker.updateMany({
+      where: { id: workerId },
+      data: { stoppedAt: new Date() },
+    });
+  }
+
+  async workerSnapshot(timeoutSeconds: number): Promise<{
+    activeWorkers: number;
+    lastHeartbeatAgeSeconds: number | null;
+    lastJobFinishedAgeSeconds: number | null;
+  }> {
+    const [row] = await this.prisma.$queryRaw<
+      {
+        active_workers: number;
+        last_heartbeat_age_seconds: number | null;
+        last_job_finished_age_seconds: number | null;
+      }[]
+    >`
+      SELECT
+        count(*) FILTER (
+          WHERE stopped_at IS NULL
+            AND heartbeat_at > now() - ${timeoutSeconds} * interval '1 second'
+        )::int AS active_workers,
+        floor(extract(epoch FROM now() - max(heartbeat_at)))::int AS last_heartbeat_age_seconds,
+        floor(extract(epoch FROM now() - max(last_job_finished_at)))::int
+          AS last_job_finished_age_seconds
+      FROM outbox_workers`;
+    return {
+      activeWorkers: row.active_workers,
+      lastHeartbeatAgeSeconds: row.last_heartbeat_age_seconds,
+      lastJobFinishedAgeSeconds: row.last_job_finished_age_seconds,
+    };
+  }
+
+  async listWorkers(limit: number) {
+    return this.prisma.outboxWorker.findMany({
+      orderBy: { heartbeatAt: 'desc' },
+      take: limit,
+    });
+  }
+
+  // Deletes COMPLETED jobs whose attempt has a final outcome, in small batches so no statement
+  // holds locks for long. Jobs of unresolved attempts are kept: their history explains how the
+  // attempt got where it is. Returns the number of rows deleted.
+  async pruneCompletedJobs(
+    olderThanDays: number,
+    batchSize: number,
+  ): Promise<number> {
+    let deleted = 0;
+    for (;;) {
+      const batch = await this.prisma.$executeRaw`
+        DELETE FROM outbox_jobs
+        WHERE id IN (
+          SELECT job.id
+          FROM outbox_jobs AS job
+          JOIN payment_attempts AS attempt ON attempt.id = job.attempt_id
+          WHERE job.status = 'COMPLETED'
+            AND job.completed_at < now() - ${olderThanDays} * interval '1 day'
+            AND attempt.status <> 'PENDING'
+          LIMIT ${batchSize}
+        )`;
+      deleted += batch;
+      if (batch < batchSize) return deleted;
+    }
+  }
+
+  async pruneWorkers(olderThanDays: number): Promise<number> {
+    return this.prisma.$executeRaw`
+      DELETE FROM outbox_workers
+      WHERE heartbeat_at < now() - ${olderThanDays} * interval '1 day'`;
   }
 
   async listDead(limit: number) {
@@ -265,7 +394,7 @@ export class OutboxStore {
   }
 
   async stats(): Promise<OutboxStats> {
-    const [jobs, pendingErrors, [timing]] = await Promise.all([
+    const [jobs, pendingErrors, attempts, [timing]] = await Promise.all([
       this.prisma.outboxJob.groupBy({
         by: ['type', 'status'],
         _count: { _all: true },
@@ -280,18 +409,37 @@ export class OutboxStore {
         _count: { _all: true },
         orderBy: { lastError: 'asc' },
       }),
+      this.prisma.paymentAttempt.groupBy({
+        by: ['status', 'failureCode'],
+        _count: { _all: true },
+        orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
+      }),
       this.prisma.$queryRaw<
         {
           dead_jobs: number;
           expired_leases: number;
           oldest_due_job_age_seconds: number | null;
           reconciliation_lookups: number;
+          lease_recoveries: number;
           unresolved_attempts: number;
           oldest_unresolved_attempt_age_seconds: number | null;
+          payment_retries: number;
+          settle_p50_seconds: number | null;
+          settle_p95_seconds: number | null;
         }[]
       >`
         SELECT
           (SELECT count(*)::int FROM outbox_jobs WHERE status = 'DEAD') AS dead_jobs,
+          (SELECT coalesce(sum(lease_recoveries), 0)::int FROM outbox_jobs) AS lease_recoveries,
+          (SELECT count(*)::int FROM payment_retry_requests) AS payment_retries,
+          (SELECT percentile_cont(0.5) WITHIN GROUP (
+              ORDER BY extract(epoch FROM completed_at - created_at))::float8
+            FROM payment_attempts
+            WHERE completed_at > now() - interval '1 hour') AS settle_p50_seconds,
+          (SELECT percentile_cont(0.95) WITHIN GROUP (
+              ORDER BY extract(epoch FROM completed_at - created_at))::float8
+            FROM payment_attempts
+            WHERE completed_at > now() - interval '1 hour') AS settle_p95_seconds,
           (SELECT count(*)::int FROM outbox_jobs
             WHERE status = 'PROCESSING' AND locked_until <= now()) AS expired_leases,
           (SELECT floor(extract(epoch FROM now() - min(available_at)))::int FROM outbox_jobs
@@ -313,13 +461,22 @@ export class OutboxStore {
         lastError: row.lastError!,
         count: row._count._all,
       })),
+      attempts: attempts.map((row) => ({
+        status: row.status,
+        failureCode: row.failureCode,
+        count: row._count._all,
+      })),
       deadJobs: timing.dead_jobs,
       expiredLeases: timing.expired_leases,
       oldestDueJobAgeSeconds: timing.oldest_due_job_age_seconds,
       reconciliationLookups: timing.reconciliation_lookups,
+      leaseRecoveries: timing.lease_recoveries,
       unresolvedAttempts: timing.unresolved_attempts,
       oldestUnresolvedAttemptAgeSeconds:
         timing.oldest_unresolved_attempt_age_seconds,
+      paymentRetries: timing.payment_retries,
+      settleSecondsP50: timing.settle_p50_seconds,
+      settleSecondsP95: timing.settle_p95_seconds,
     };
   }
 }

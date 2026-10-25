@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, jest } from '@jest/globals';
 import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
-import type { EnvironmentVariables } from '../../config/environment.js';
+import type {
+  ApiEnvironment,
+  CoreEnvironment,
+} from '../../config/environment.js';
 import { OutboxJobType } from '../../generated/prisma/enums.js';
 import type { ClaimedJob, OutboxStore } from '../../outbox/outbox-store.js';
 import type { AttemptJobProcessor } from './attempt-job-processor.js';
+import { InProcessWorkerStarter } from './in-process-worker.js';
 import { OutboxWorker } from './outbox-worker.js';
 
 const job: ClaimedJob = {
@@ -18,15 +22,32 @@ const job: ClaimedJob = {
   reclaimed: false,
 };
 
-function config(enabled: boolean): ConfigService<EnvironmentVariables, true> {
-  const values: Partial<EnvironmentVariables> = {
-    OUTBOX_WORKER_ENABLED: enabled,
-    OUTBOX_POLL_INTERVAL_MS: 100,
-    RECONCILIATION_DELAY_SECONDS: 60,
-  };
-  return {
-    get: (key: keyof EnvironmentVariables) => values[key],
-  } as unknown as ConfigService<EnvironmentVariables, true>;
+const config = {
+  get: (key: keyof CoreEnvironment) =>
+    ({ OUTBOX_POLL_INTERVAL_MS: 100, RECONCILIATION_DELAY_SECONDS: 60 })[
+      key as 'OUTBOX_POLL_INTERVAL_MS'
+    ],
+} as unknown as ConfigService<CoreEnvironment, true>;
+
+function fakeOutbox(claim: () => Promise<ClaimedJob[]>) {
+  const heartbeats: { jobsFinished: number }[] = [];
+  const stopped: string[] = [];
+  const outbox = {
+    claim,
+    enqueueStaleReconciliations: () => Promise.resolve(0),
+    recordWorkerHeartbeat: (
+      _id: string,
+      progress: { jobsFinished: number },
+    ) => {
+      heartbeats.push(progress);
+      return Promise.resolve();
+    },
+    markWorkerStopped: (id: string) => {
+      stopped.push(id);
+      return Promise.resolve();
+    },
+  } as unknown as OutboxStore;
+  return { outbox, heartbeats, stopped };
 }
 
 describe('OutboxWorker', () => {
@@ -41,31 +62,31 @@ describe('OutboxWorker', () => {
     let polls = 0;
     let markThirdPoll!: () => void;
     const thirdPoll = new Promise<void>((resolve) => (markThirdPoll = resolve));
-    const outbox = {
-      enqueueStaleReconciliations: () => Promise.resolve(0),
-      claim: () => {
-        polls += 1;
-        if (polls === 1)
-          return Promise.reject(new Error('connection terminated'));
-        if (polls === 2) return Promise.resolve([job]);
-        markThirdPoll();
-        return Promise.resolve([]);
-      },
-    } as unknown as OutboxStore;
+    const { outbox, heartbeats, stopped } = fakeOutbox(() => {
+      polls += 1;
+      if (polls === 1)
+        return Promise.reject(new Error('connection terminated'));
+      if (polls === 2) return Promise.resolve([job]);
+      markThirdPoll();
+      return Promise.resolve([]);
+    });
     const processor = {
       handle: (claimed: ClaimedJob) => {
         handled.push(claimed.id);
         return Promise.resolve();
       },
     } as unknown as AttemptJobProcessor;
-    const worker = new OutboxWorker(outbox, processor, config(true));
+    const worker = new OutboxWorker(outbox, processor, config);
 
-    worker.onApplicationBootstrap();
+    worker.start();
     await thirdPoll;
     await worker.beforeApplicationShutdown();
 
     expect(handled).toEqual(['job-1']);
     expect(polls).toBe(3);
+    expect(heartbeats[0]).toEqual({ jobsFinished: 0, lastJobFinishedAt: null });
+    expect(stopped).toEqual([worker.workerId]);
+    expect(worker.isRunning).toBe(false);
   });
 
   it('finishes the batch in flight before shutdown completes', async () => {
@@ -74,44 +95,72 @@ describe('OutboxWorker', () => {
     let jobStarted!: () => void;
     const started = new Promise<void>((resolve) => (jobStarted = resolve));
     let claimed = false;
-    const outbox = {
-      enqueueStaleReconciliations: () => Promise.resolve(0),
-      claim: () => {
-        if (claimed) return Promise.resolve([]);
-        claimed = true;
-        return Promise.resolve([job]);
-      },
-    } as unknown as OutboxStore;
+    const { outbox, stopped } = fakeOutbox(() => {
+      if (claimed) return Promise.resolve([]);
+      claimed = true;
+      return Promise.resolve([job]);
+    });
     const processor = {
       handle: () => {
         jobStarted();
         return new Promise<void>((resolve) => (finishJob = resolve));
       },
     } as unknown as AttemptJobProcessor;
-    const worker = new OutboxWorker(outbox, processor, config(true));
+    const worker = new OutboxWorker(outbox, processor, config);
     worker.start();
     await started;
 
-    let stopped = false;
-    const stopping = worker.stop().then(() => (stopped = true));
+    let isStopped = false;
+    const stopping = worker.stop().then(() => (isStopped = true));
     await Promise.resolve();
-    expect(stopped).toBe(false);
+    expect(isStopped).toBe(false);
+    expect(stopped).toEqual([]);
 
     finishJob();
     await stopping;
-    expect(stopped).toBe(true);
+    expect(isStopped).toBe(true);
+    expect(stopped).toEqual([worker.workerId]);
   });
 
-  it('does not start when disabled', () => {
-    const claim = jest.fn();
-    const worker = new OutboxWorker(
-      { claim } as unknown as OutboxStore,
-      {} as AttemptJobProcessor,
-      config(false),
+  it('counts finished jobs for the next heartbeat', async () => {
+    const { outbox, heartbeats } = fakeOutbox(() =>
+      Promise.resolve([job, job]),
     );
+    const processor = {
+      handle: () => Promise.resolve(),
+    } as unknown as AttemptJobProcessor;
+    const worker = new OutboxWorker(outbox, processor, config);
 
-    worker.onApplicationBootstrap();
+    await worker.processDueJobs();
+    await worker.recordHeartbeat();
 
-    expect(claim).not.toHaveBeenCalled();
+    expect(heartbeats).toEqual([
+      { jobsFinished: 2, lastJobFinishedAt: expect.any(Date) },
+    ]);
   });
+});
+
+describe('InProcessWorkerStarter', () => {
+  const apiConfig = (enabled: boolean) =>
+    ({
+      get: () => enabled,
+    }) as unknown as ConfigService<ApiEnvironment, true>;
+
+  it.each([
+    [true, 1],
+    [false, 0],
+  ])(
+    'starts the worker only when OUTBOX_WORKER_ENABLED=%s',
+    (enabled, starts) => {
+      const start = jest.fn();
+      const starter = new InProcessWorkerStarter(
+        { start } as unknown as OutboxWorker,
+        apiConfig(enabled),
+      );
+
+      starter.onApplicationBootstrap();
+
+      expect(start).toHaveBeenCalledTimes(starts);
+    },
+  );
 });

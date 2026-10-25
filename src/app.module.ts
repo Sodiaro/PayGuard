@@ -1,16 +1,17 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module.js';
 import { RateLimitModule } from './common/rate-limit/rate-limit.module.js';
-import { AppConfigModule } from './config/app-config.module.js';
+import { ApiConfigModule } from './config/app-config.module.js';
 import { DatabaseModule } from './database/database.module.js';
 import { HealthModule } from './health/health.module.js';
 import { MerchantsModule } from './merchants/merchants.module.js';
+import { InProcessWorkerStarter } from './payments/processing/in-process-worker.js';
 import { PaymentProcessingModule } from './payments/processing/payment-processing.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
 
 @Module({
   imports: [
-    AppConfigModule,
+    ApiConfigModule,
     DatabaseModule,
     // Before AuthModule: global guards run in registration order, and the per-IP limit must
     // reject floods before the API-key guard spends a database lookup on them.
@@ -21,5 +22,6 @@ import { PaymentsModule } from './payments/payments.module.js';
     PaymentsModule,
     PaymentProcessingModule,
   ],
+  providers: [InProcessWorkerStarter],
 })
 export class AppModule {}

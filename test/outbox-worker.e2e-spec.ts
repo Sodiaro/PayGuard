@@ -11,6 +11,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types.js';
 import { runAdminCli } from '../src/cli/admin-cli.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
+import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../src/merchants/merchants.service.js';
 import { OutboxStore } from '../src/outbox/outbox-store.js';
@@ -228,12 +229,16 @@ describe('Outbox and worker (PostgreSQL)', () => {
       status: 'PENDING',
     });
 
+    await worker.recordHeartbeat();
     const health = await request(app.getHttpServer())
       .get('/health')
       .expect(200);
     expect(health.body).toMatchObject({
       status: 'degraded',
-      details: { outbox: { status: 'degraded', reasons: ['dead_jobs'] } },
+      details: {
+        queue: { status: 'degraded', reasons: ['dead_jobs'] },
+        workers: { status: 'up' },
+      },
     });
 
     const out: string[] = [];
@@ -244,6 +249,8 @@ describe('Outbox and worker (PostgreSQL)', () => {
           merchants: app.get(MerchantsService),
           apiKeys: app.get(ApiKeysService),
           outbox: store,
+          audit: new OperatorAuditLog(prismaOf(app)),
+          actor: 'test-operator',
         },
         { out: (line) => out.push(line), err: (line) => out.push(line) },
       );
@@ -260,14 +267,19 @@ describe('Outbox and worker (PostgreSQL)', () => {
     });
   });
 
-  it('reports a healthy outbox when nothing is stuck', async () => {
+  it('reports a healthy queue and worker when nothing is stuck', async () => {
+    await worker.recordHeartbeat();
     const health = await request(app.getHttpServer())
       .get('/health')
       .expect(200);
 
     expect(health.body).toMatchObject({
       status: 'ok',
-      details: { database: { status: 'up' }, outbox: { status: 'up' } },
+      details: {
+        database: { status: 'up' },
+        queue: { status: 'up' },
+        workers: { status: 'up' },
+      },
     });
   });
 });

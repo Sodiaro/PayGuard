@@ -5,6 +5,7 @@ import request from 'supertest';
 import { App } from 'supertest/types.js';
 import { AppModule } from '../src/app.module.js';
 import { configureApp } from '../src/app.setup.js';
+import { OutboxWorker } from '../src/payments/processing/outbox-worker.js';
 
 describe('Health endpoints (PostgreSQL)', () => {
   let app: INestApplication<App>;
@@ -24,6 +25,7 @@ describe('Health endpoints (PostgreSQL)', () => {
   });
 
   it('GET /health reports the database as up', async () => {
+    await app.get(OutboxWorker).recordHeartbeat();
     const response = await request(app.getHttpServer())
       .get('/health')
       .expect(200);

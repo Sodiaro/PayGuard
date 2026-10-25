@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { requestContext } from '../../common/logging/request-context.js';
-import type { EnvironmentVariables } from '../../config/environment.js';
+import type { CoreEnvironment } from '../../config/environment.js';
 import { PrismaService } from '../../database/prisma.service.js';
 import {
   OutboxErrorCategory,
@@ -44,7 +44,7 @@ export class AttemptJobProcessor {
     private readonly prisma: PrismaService,
     private readonly outbox: OutboxStore,
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
-    config: ConfigService<EnvironmentVariables, true>,
+    config: ConfigService<CoreEnvironment, true>,
   ) {
     this.reconciliationDelaySeconds = config.get(
       'RECONCILIATION_DELAY_SECONDS',
@@ -65,6 +65,10 @@ export class AttemptJobProcessor {
           });
         }
         try {
+          if (this.outbox.hasExhaustedRuns(job)) {
+            await this.retryLater(job, OutboxErrorCategory.LEASE_EXPIRED);
+            return;
+          }
           await this.dispatch(job);
         } catch (error) {
           this.logger.error(
@@ -150,6 +154,7 @@ export class AttemptJobProcessor {
     attempt: PendingAttempt,
   ): Promise<void> {
     let lookup: ProviderLookupResult;
+    const startedAt = performance.now();
     try {
       lookup = await withProviderTimeout(
         this.provider.lookupPayment({ attemptId: attempt.id }),
@@ -158,6 +163,11 @@ export class AttemptJobProcessor {
       await this.retryLater(job, providerErrorCategory(error));
       return;
     }
+    this.logger.log('Provider lookup answered', {
+      ...jobFields(job),
+      lookupStatus: knownLookupStatus(lookup),
+      providerDurationMs: elapsedMs(startedAt),
+    });
 
     switch (lookup.status) {
       case 'succeeded':
@@ -201,6 +211,7 @@ export class AttemptJobProcessor {
     onUnknownOutcome: UnknownOutcomeHandler,
   ): Promise<void> {
     let resolution: AttemptResolution;
+    const startedAt = performance.now();
     try {
       const result = await withProviderTimeout(
         this.provider.processPayment({
@@ -216,16 +227,18 @@ export class AttemptJobProcessor {
       this.logger.warn('Payment submission ended without a definite outcome', {
         ...jobFields(job),
         category,
+        providerDurationMs: elapsedMs(startedAt),
       });
       await onUnknownOutcome(category);
       return;
     }
-    await this.recordAndComplete(job, resolution);
+    await this.recordAndComplete(job, resolution, elapsedMs(startedAt));
   }
 
   private async recordAndComplete(
     job: ClaimedJob,
     resolution: AttemptResolution,
+    providerDurationMs?: number,
   ): Promise<void> {
     const { applied, completed } = await this.prisma.$transaction(
       async (tx) => ({
@@ -242,6 +255,7 @@ export class AttemptJobProcessor {
         ...jobFields(job),
         attemptStatus: resolution.attemptStatus,
         failureCode: resolution.failureCode,
+        providerDurationMs,
       },
     );
     if (!completed) {
@@ -304,4 +318,20 @@ function jobFields(job: ClaimedJob) {
     paymentId: job.paymentId,
     attemptId: job.attemptId,
   };
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.round(performance.now() - startedAt);
+}
+
+// Logged instead of the raw value so an unexpected provider answer cannot inject arbitrary text.
+function knownLookupStatus(lookup: ProviderLookupResult): string {
+  const known = [
+    'succeeded',
+    'declined',
+    'processing',
+    'not_found',
+    'unavailable',
+  ];
+  return known.includes(lookup.status) ? lookup.status : 'unrecognised';
 }
