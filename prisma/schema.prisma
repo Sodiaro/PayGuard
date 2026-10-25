@@ -41,6 +41,8 @@ model MerchantApiKey {
   label      String?   @db.VarChar(100)
   expiresAt  DateTime? @map("expires_at") @db.Timestamptz(3)
   revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(3)
+  // Coarse by design (see src/auth/key-usage-tracker.ts): accurate to the tracking window, not per request.
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(3)
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
 
   // Restrict: merchants are suspended, never deleted, so key history stays auditable.
@@ -173,22 +175,24 @@ enum OutboxErrorCategory {
 }
 
 model OutboxJob {
-  id          String               @id @default(uuid(7)) @db.Uuid
-  type        OutboxJobType
-  paymentId   String               @map("payment_id") @db.Uuid
-  attemptId   String               @map("attempt_id") @db.Uuid
-  status      OutboxJobStatus      @default(QUEUED)
+  id              String               @id @default(uuid(7)) @db.Uuid
+  type            OutboxJobType
+  paymentId       String               @map("payment_id") @db.Uuid
+  attemptId       String               @map("attempt_id") @db.Uuid
+  status          OutboxJobStatus      @default(QUEUED)
   // Number of times the job has been claimed, including claims lost to a crash.
-  runCount    Int                  @default(0) @map("run_count")
-  availableAt DateTime             @default(now()) @map("available_at") @db.Timestamptz(3)
-  lockedBy    String?              @map("locked_by") @db.VarChar(128)
-  leaseToken  String?              @map("lease_token") @db.Uuid
-  lockedUntil DateTime?            @map("locked_until") @db.Timestamptz(3)
-  lastError   OutboxErrorCategory? @map("last_error")
-  requestId   String?              @map("request_id") @db.VarChar(128)
-  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt   DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
-  completedAt DateTime?            @map("completed_at") @db.Timestamptz(3)
+  runCount        Int                  @default(0) @map("run_count")
+  // Claims that took the job over from a worker whose lease expired.
+  leaseRecoveries Int                  @default(0) @map("lease_recoveries")
+  availableAt     DateTime             @default(now()) @map("available_at") @db.Timestamptz(3)
+  lockedBy        String?              @map("locked_by") @db.VarChar(128)
+  leaseToken      String?              @map("lease_token") @db.Uuid
+  lockedUntil     DateTime?            @map("locked_until") @db.Timestamptz(3)
+  lastError       OutboxErrorCategory? @map("last_error")
+  requestId       String?              @map("request_id") @db.VarChar(128)
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  completedAt     DateTime?            @map("completed_at") @db.Timestamptz(3)
 
   payment Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   attempt PaymentAttempt @relation(fields: [attemptId], references: [id], onDelete: Restrict)
@@ -197,4 +201,34 @@ model OutboxJob {
   @@unique([attemptId, type])
   @@index([paymentId])
   @@map("outbox_jobs")
+}
+
+// One row per worker process, refreshed while it runs. Lets any instance tell whether background
+// processing is alive and progressing.
+model OutboxWorker {
+  id                String    @id @db.VarChar(128)
+  startedAt         DateTime  @default(now()) @map("started_at") @db.Timestamptz(3)
+  heartbeatAt       DateTime  @default(now()) @map("heartbeat_at") @db.Timestamptz(3)
+  lastJobFinishedAt DateTime? @map("last_job_finished_at") @db.Timestamptz(3)
+  jobsFinished      Int       @default(0) @map("jobs_finished")
+  stoppedAt         DateTime? @map("stopped_at") @db.Timestamptz(3)
+
+  @@index([heartbeatAt])
+  @@map("outbox_workers")
+}
+
+// Append-only record of operator actions. Database administrators can still alter it, so it
+// provides accountability for normal operations, not tamper evidence.
+model OperatorAuditEvent {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  actor      String   @db.VarChar(200)
+  action     String   @db.VarChar(64)
+  targetType String   @map("target_type") @db.VarChar(32)
+  targetId   String   @map("target_id") @db.VarChar(128)
+  details    Json     @default("{}")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([createdAt])
+  @@index([targetType, targetId])
+  @@map("operator_audit_events")
 }
