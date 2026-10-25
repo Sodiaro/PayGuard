@@ -81,4 +81,16 @@ describe('Rate limiting', () => {
     await request(app.getHttpServer()).get('/health/live').expect(200);
     await request(app.getHttpServer()).get('/health').expect(200);
   });
+
+  it('ignores X-Forwarded-For from clients that are not trusted proxies', async () => {
+    const statuses: number[] = [];
+    for (let i = 0; i < 16; i++) {
+      const response = await request(app.getHttpServer())
+        .get('/v1/merchants/me')
+        .set('X-Forwarded-For', `198.51.100.${i}`);
+      statuses.push(response.status);
+    }
+
+    expect(statuses[15]).toBe(429);
+  });
 });

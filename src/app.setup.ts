@@ -8,18 +8,19 @@ import { HttpExceptionFilter } from './common/http/http-exception.filter.js';
 import { requestIdMiddleware } from './common/http/request-id.middleware.js';
 import { createValidationPipe } from './common/http/validation.js';
 import { requestLoggingMiddleware } from './common/logging/request-logging.middleware.js';
-import { EnvironmentVariables } from './config/environment.js';
+import { ApiEnvironment } from './config/environment.js';
 
 // Shared by main.ts and the e2e tests so tests run the exact HTTP pipeline clients hit.
 export function configureApp(app: INestApplication): void {
-  const config =
-    app.get<ConfigService<EnvironmentVariables, true>>(ConfigService);
+  const config = app.get<ConfigService<ApiEnvironment, true>>(ConfigService);
 
-  const proxyHops = config.get('TRUST_PROXY_HOPS', { infer: true });
-  if (proxyHops > 0) {
+  // Trusting by address rather than hop count: X-Forwarded-For is honoured only when the peer is a
+  // listed proxy, so clients that reach the API directly cannot choose their own IP.
+  const trustedProxies = config.get('TRUSTED_PROXIES', { infer: true });
+  if (trustedProxies.length > 0) {
     (app.getHttpAdapter().getInstance() as Express).set(
       'trust proxy',
-      proxyHops,
+      trustedProxies,
     );
   }
 

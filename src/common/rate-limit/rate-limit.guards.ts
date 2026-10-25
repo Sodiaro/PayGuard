@@ -10,6 +10,7 @@ import {
 import { Reflector } from '@nestjs/core';
 import type { Response } from 'express';
 import type { AuthenticatedRequest } from '../../auth/authenticated-merchant.js';
+import { clientRateLimitKey } from './client-key.js';
 import type { TokenBucketLimiter } from './token-bucket.js';
 
 export const IP_RATE_LIMITER = Symbol('IP_RATE_LIMITER');
@@ -48,7 +49,7 @@ function enforce(
 
 // Global, and registered before the API-key guard: it bounds the database lookups an anonymous
 // client can cause with invalid keys. Behind a proxy, request.ip is only the client's address if
-// TRUST_PROXY_HOPS is set correctly.
+// TRUSTED_PROXIES lists that proxy.
 @Injectable()
 export class IpRateLimitGuard implements CanActivate {
   constructor(
@@ -63,7 +64,7 @@ export class IpRateLimitGuard implements CanActivate {
     );
     if (!skip) {
       const ip = context.switchToHttp().getRequest<AuthenticatedRequest>().ip;
-      enforce(this.limiter, `ip:${ip ?? 'unknown'}`, context);
+      enforce(this.limiter, clientRateLimitKey(ip), context);
     }
     return true;
   }

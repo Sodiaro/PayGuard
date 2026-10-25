@@ -4,12 +4,15 @@ import {
   IsBoolean,
   IsEnum,
   IsInt,
+  IsOptional,
   IsString,
   Matches,
   Max,
   Min,
   validateSync,
+  ValidateBy,
 } from 'class-validator';
+import { isIP } from 'node:net';
 import { SimulatorOutcome } from '../payments/providers/simulated-payment-provider.js';
 
 export enum NodeEnvironment {
@@ -25,17 +28,50 @@ function StrictBoolean(): PropertyDecorator {
   );
 }
 
-export class EnvironmentVariables {
+function CommaSeparated(): PropertyDecorator {
+  return Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string'
+      ? value
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+      : value,
+  );
+}
+
+const PROXY_KEYWORDS = new Set(['loopback', 'linklocal', 'uniquelocal']);
+
+export function isTrustedProxyEntry(entry: string): boolean {
+  if (PROXY_KEYWORDS.has(entry)) return true;
+  const [address, prefix, ...rest] = entry.split('/');
+  const family = isIP(address);
+  if (family === 0 || rest.length > 0) return false;
+  if (prefix === undefined) return true;
+  const bits = Number(prefix);
+  // A /0 range would trust every client's X-Forwarded-For, which defeats the purpose.
+  return /^\d+$/.test(prefix) && bits >= 1 && bits <= (family === 4 ? 32 : 128);
+}
+
+function IsTrustedProxyList(): PropertyDecorator {
+  return ValidateBy({
+    name: 'isTrustedProxyList',
+    validator: {
+      validate: (value: unknown) =>
+        Array.isArray(value) &&
+        value.every(
+          (entry) => typeof entry === 'string' && isTrustedProxyEntry(entry),
+        ),
+      defaultMessage: () =>
+        'TRUSTED_PROXIES must be comma-separated IP addresses or CIDR ranges (not /0), or loopback, linklocal, uniquelocal',
+    },
+  });
+}
+
+// Settings every process needs: the API, the standalone worker and the operator CLI.
+export class CoreEnvironment {
   @Expose()
   @IsEnum(NodeEnvironment)
   NODE_ENV: NodeEnvironment = NodeEnvironment.Development;
-
-  @Expose()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(65535)
-  PORT: number = 3000;
 
   @Expose()
   @IsString()
@@ -43,30 +79,6 @@ export class EnvironmentVariables {
     message: 'DATABASE_URL must be a postgresql:// connection string',
   })
   DATABASE_URL: string;
-
-  @Expose()
-  @StrictBoolean()
-  @IsBoolean()
-  SWAGGER_ENABLED: boolean = false;
-
-  // Comma-separated exact origins. Empty means no CORS: secret API keys belong on servers,
-  // not in browsers. Wildcards and paths are rejected.
-  @Expose()
-  @Transform(({ value }: { value: unknown }) =>
-    typeof value === 'string'
-      ? value
-          .split(',')
-          .map((origin) => origin.trim())
-          .filter(Boolean)
-      : value,
-  )
-  @IsArray()
-  @Matches(/^https?:\/\/[A-Za-z0-9.-]+(:\d{1,5})?$/, {
-    each: true,
-    message:
-      'CORS_ALLOWED_ORIGINS must be comma-separated origins like https://app.example.com',
-  })
-  CORS_ALLOWED_ORIGINS: string[] = [];
 
   // Operator-controlled outcome of the simulated provider; merchants cannot influence it.
   @Expose()
@@ -77,12 +89,6 @@ export class EnvironmentVariables {
   @StrictBoolean()
   @IsBoolean()
   PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: boolean = false;
-
-  // Disable to run an instance that serves HTTP only; any number of instances may run workers.
-  @Expose()
-  @StrictBoolean()
-  @IsBoolean()
-  OUTBOX_WORKER_ENABLED: boolean = true;
 
   @Expose()
   @Type(() => Number)
@@ -121,6 +127,48 @@ export class EnvironmentVariables {
   @Max(86_400)
   RECONCILIATION_DELAY_SECONDS: number = 60;
 
+  // Recorded as the actor of operator CLI actions; defaults to the OS user and host.
+  @Expose()
+  @IsOptional()
+  @Matches(/^[\x20-\x7E]{1,200}$/, {
+    message: 'PAYGUARD_OPERATOR must be 1-200 printable ASCII characters',
+  })
+  PAYGUARD_OPERATOR?: string;
+}
+
+// Settings of the HTTP API process only.
+export class ApiEnvironment extends CoreEnvironment {
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(65535)
+  PORT: number = 3000;
+
+  @Expose()
+  @StrictBoolean()
+  @IsBoolean()
+  SWAGGER_ENABLED: boolean = false;
+
+  // Comma-separated exact origins. Empty means no CORS: secret API keys belong on servers,
+  // not in browsers. Wildcards and paths are rejected.
+  @Expose()
+  @CommaSeparated()
+  @IsArray()
+  @Matches(/^https?:\/\/[A-Za-z0-9.-]+(:\d{1,5})?$/, {
+    each: true,
+    message:
+      'CORS_ALLOWED_ORIGINS must be comma-separated origins like https://app.example.com',
+  })
+  CORS_ALLOWED_ORIGINS: string[] = [];
+
+  // Runs the outbox worker inside the API process. Disable when standalone workers
+  // (node dist/worker.js) do the processing.
+  @Expose()
+  @StrictBoolean()
+  @IsBoolean()
+  OUTBOX_WORKER_ENABLED: boolean = true;
+
   @Expose()
   @Type(() => Number)
   @IsInt()
@@ -135,20 +183,48 @@ export class EnvironmentVariables {
   @Max(10_000)
   RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE: number = 60;
 
-  // Number of reverse proxies in front of the API. 0 trusts no X-Forwarded-For header, so
-  // per-IP limits key on the socket address; set it to the real hop count behind a load balancer.
+  // Addresses of reverse proxies allowed to set X-Forwarded-For. The header is ignored unless the
+  // connecting peer is on this list, so a directly exposed API cannot be fooled by spoofed
+  // headers. Empty: the socket address is the client.
+  @Expose()
+  @CommaSeparated()
+  @IsArray()
+  @IsTrustedProxyList()
+  TRUSTED_PROXIES: string[] = [];
+
   @Expose()
   @Type(() => Number)
   @IsInt()
-  @Min(0)
-  @Max(10)
-  TRUST_PROXY_HOPS: number = 0;
+  @Min(10)
+  @Max(86_400)
+  HEALTH_QUEUE_BACKLOG_SECONDS: number = 120;
+
+  // Workers refresh their heartbeat every 10 seconds, so this must leave room for missed beats.
+  @Expose()
+  @Type(() => Number)
+  @IsInt()
+  @Min(20)
+  @Max(3600)
+  HEALTH_WORKER_TIMEOUT_SECONDS: number = 30;
 }
 
-export function validateEnvironment(
+export function validateCoreEnvironment(
   config: Record<string, unknown>,
-): EnvironmentVariables {
-  const environment = plainToInstance(EnvironmentVariables, config, {
+): CoreEnvironment {
+  return validateAs(CoreEnvironment, config);
+}
+
+export function validateApiEnvironment(
+  config: Record<string, unknown>,
+): ApiEnvironment {
+  return validateAs(ApiEnvironment, config);
+}
+
+function validateAs<T extends object>(
+  schema: new () => T,
+  config: Record<string, unknown>,
+): T {
+  const environment = plainToInstance(schema, config, {
     excludeExtraneousValues: true,
     exposeDefaultValues: true,
   });

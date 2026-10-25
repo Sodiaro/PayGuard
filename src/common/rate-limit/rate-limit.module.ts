@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
-import type { EnvironmentVariables } from '../../config/environment.js';
+import type { ApiEnvironment } from '../../config/environment.js';
 import {
   IP_RATE_LIMITER,
   IpRateLimitGuard,
@@ -10,7 +10,7 @@ import {
 } from './rate-limit.guards.js';
 import { TokenBucketLimiter } from './token-bucket.js';
 
-type Config = ConfigService<EnvironmentVariables, true>;
+type Config = ConfigService<ApiEnvironment, true>;
 
 @Module({
   providers: [
