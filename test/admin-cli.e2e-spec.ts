@@ -16,6 +16,7 @@ import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../src/merchants/merchants.service.js';
 import { OutboxStore } from '../src/outbox/outbox-store.js';
+import { PaymentInvestigator } from '../src/payments/payment-investigation.js';
 import { createTestApp, prismaOf } from './support/test-app.js';
 import { resetDatabase } from './support/test-database.js';
 
@@ -55,6 +56,7 @@ describe('Admin CLI (PostgreSQL)', () => {
           prismaOf(app),
           app.get(ConfigService),
         ),
+        investigator: new PaymentInvestigator(prismaOf(app)),
         actor: 'test-operator',
       },
       { out: (line) => out.push(line), err: (line) => err.push(line) },

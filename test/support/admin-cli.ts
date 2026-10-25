@@ -7,6 +7,7 @@ import { PrismaService } from '../../src/database/prisma.service.js';
 import { ApiKeysService } from '../../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../../src/merchants/merchants.service.js';
 import { OutboxStore } from '../../src/outbox/outbox-store.js';
+import { PaymentInvestigator } from '../../src/payments/payment-investigation.js';
 
 export const TEST_OPERATOR = 'test-operator@ci';
 
@@ -24,6 +25,7 @@ export async function runCli(app: INestApplication, ...argv: string[]) {
         app.get(PrismaService),
         app.get(ConfigService),
       ),
+      investigator: new PaymentInvestigator(app.get(PrismaService)),
       actor: TEST_OPERATOR,
     },
     { out: (line) => out.push(line), err: (line) => err.push(line) },

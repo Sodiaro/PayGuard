@@ -17,7 +17,9 @@ import type {
   MerchantsService,
 } from '../merchants/merchants.service.js';
 import type { OutboxStats, OutboxStore } from '../outbox/outbox-store.js';
+import type { PaymentInvestigator } from '../payments/payment-investigation.js';
 import { renderPrometheusMetrics } from './ops-metrics.js';
+import { printInvestigation, printUnresolved } from './payment-reports.js';
 import {
   SimulatorWebhookError,
   type SimulatedWebhookSender,
@@ -30,6 +32,8 @@ const WORKER_ACTIVE_SECONDS = 30;
 // Below this, a typo in a prune command could remove history that support still needs.
 const MIN_RETENTION_DAYS = 7;
 const DEFAULT_SIMULATOR_TARGET = 'http://127.0.0.1:3000';
+const UUID_FORMAT =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface AdminCliDependencies {
   merchants: MerchantsService;
@@ -37,6 +41,7 @@ export interface AdminCliDependencies {
   outbox: OutboxStore;
   audit: OperatorAuditLog;
   simulator: SimulatedWebhookSender;
+  investigator: PaymentInvestigator;
   // Recorded on every state-changing command (see resolveOperator).
   actor: string;
 }
@@ -61,6 +66,8 @@ Operations:
   ops:status
   ops:metrics
   outbox:requeue      --job <id>
+  payments:unresolved [--merchant <id|slug>] [--limit <1-200>]
+  payment:inspect     --payment <id>
   audit:list          [--limit <1-200>]
   maintenance:prune   --completed-jobs-days <n> [--workers-days <n>] [--batch-size <n>]   (n >= ${MIN_RETENTION_DAYS})
 
@@ -68,6 +75,8 @@ Simulator (refused when NODE_ENV=production):
   simulator:webhook   --attempt <id> [--type payment.succeeded|payment.declined|payment.processing] [--url <API base URL>]`;
 
 class UsageError extends Error {}
+// A well-formed command that cannot be carried out; reported without the usage text.
+class CommandError extends Error {}
 
 const OPTIONS = {
   name: { type: 'string' },
@@ -84,6 +93,7 @@ const OPTIONS = {
   'workers-days': { type: 'string' },
   'batch-size': { type: 'string' },
   attempt: { type: 'string' },
+  payment: { type: 'string' },
   type: { type: 'string' },
   url: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
@@ -133,7 +143,8 @@ export async function runAdminCli(
       error instanceof MerchantAlreadyExistsError ||
       error instanceof MerchantNotFoundError ||
       error instanceof ApiKeyNotFoundError ||
-      error instanceof SimulatorWebhookError
+      error instanceof SimulatorWebhookError ||
+      error instanceof CommandError
     ) {
       io.err(`Error: ${error.message}`);
       return 1;
@@ -145,7 +156,15 @@ export async function runAdminCli(
 async function execute(
   command: string,
   options: Options,
-  { merchants, apiKeys, outbox, audit, simulator, actor }: AdminCliDependencies,
+  {
+    merchants,
+    apiKeys,
+    outbox,
+    audit,
+    simulator,
+    investigator,
+    actor,
+  }: AdminCliDependencies,
   io: AdminCliOutput,
 ): Promise<void> {
   switch (command) {
@@ -240,6 +259,29 @@ async function execute(
       io.out(renderPrometheusMetrics(stats, workers).trimEnd());
       return;
     }
+    case 'payments:unresolved': {
+      const merchant = options.merchant
+        ? await merchants.resolve(options.merchant)
+        : undefined;
+      printUnresolved(
+        await investigator.unresolved({
+          limit: integerOption(options, 'limit', 50, 1, 200),
+          merchantId: merchant?.id,
+        }),
+        io,
+      );
+      return;
+    }
+    case 'payment:inspect': {
+      const paymentId = required(options, 'payment');
+      if (!UUID_FORMAT.test(paymentId)) {
+        throw new UsageError('--payment must be a payment ID');
+      }
+      const payment = await investigator.inspect(paymentId);
+      if (!payment) throw new CommandError(`No payment with id ${paymentId}`);
+      printInvestigation(payment, io);
+      return;
+    }
     case 'outbox:requeue': {
       const jobId = required(options, 'job');
       if (!(await outbox.requeueDead(jobId, actor))) {
@@ -325,6 +367,10 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
   io.out(
     `Oldest unresolved attempt (s):  ${stats.oldestUnresolvedAttemptAgeSeconds ?? '-'}`,
   );
+  io.out(
+    `Awaiting an operator:           ${stats.attemptsAwaitingOperator} (lookups exhausted; see payments:unresolved)`,
+  );
+  io.out(`Contradicting provider answers: ${stats.attemptResultConflicts}`);
   io.out(`Payment retries:                ${stats.paymentRetries}`);
   io.out(
     `Settle time p50/p95, 1h (s):    ${formatSeconds(stats.settleSecondsP50)} / ${formatSeconds(stats.settleSecondsP95)}`,
@@ -384,7 +430,7 @@ function formatSeconds(value: number | null): string {
 
 function required(
   options: Options,
-  name: 'name' | 'merchant' | 'key' | 'job' | 'attempt',
+  name: 'name' | 'merchant' | 'key' | 'job' | 'attempt' | 'payment',
 ): string {
   const value = options[name];
   if (!value) throw new UsageError(`Missing required option --${name}`);

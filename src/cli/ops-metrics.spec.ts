@@ -55,6 +55,8 @@ const stats: OutboxStats = {
   ],
   webhookDuplicateDeliveries: 3,
   webhookConflictingDeliveries: 1,
+  attemptsAwaitingOperator: 1,
+  attemptResultConflicts: 0,
 };
 
 describe('renderPrometheusMetrics', () => {
@@ -92,6 +94,8 @@ describe('renderPrometheusMetrics', () => {
       'payguard_webhook_events{status="RECEIVED",result="none"} 1',
     );
     expect(output).toContain('payguard_webhook_conflicting_deliveries 1');
+    expect(output).toContain('payguard_payment_attempts_awaiting_operator 1');
+    expect(output).toContain('payguard_payment_attempt_result_conflicts 0');
   });
 
   it('uses only bounded labels, never identifiers', () => {

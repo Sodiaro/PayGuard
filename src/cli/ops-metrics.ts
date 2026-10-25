@@ -88,6 +88,16 @@ export function renderPrometheusMetrics(
     single(stats.oldestUnresolvedAttemptAgeSeconds),
   );
   gauge(
+    'payguard_payment_attempts_awaiting_operator',
+    'Unresolved attempts whose reconciliation lookups are exhausted.',
+    single(stats.attemptsAwaitingOperator),
+  );
+  gauge(
+    'payguard_payment_attempt_result_conflicts',
+    'Definite provider answers that contradicted an already recorded outcome.',
+    single(stats.attemptResultConflicts),
+  );
+  gauge(
     'payguard_payment_retries',
     'Accepted payment retries.',
     single(stats.paymentRetries),

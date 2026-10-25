@@ -17,6 +17,7 @@ import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../src/merchants/merchants.service.js';
 import { OutboxStore } from '../src/outbox/outbox-store.js';
+import { PaymentInvestigator } from '../src/payments/payment-investigation.js';
 import type { PaymentResponse } from '../src/payments/payment.responses.js';
 import { OutboxWorker } from '../src/payments/processing/outbox-worker.js';
 import { failWritesTo } from './support/db-faults.js';
@@ -256,6 +257,7 @@ describe('Outbox and worker (PostgreSQL)', () => {
             prismaOf(app),
             app.get(ConfigService),
           ),
+          investigator: new PaymentInvestigator(prismaOf(app)),
           actor: 'test-operator',
         },
         { out: (line) => out.push(line), err: (line) => out.push(line) },
