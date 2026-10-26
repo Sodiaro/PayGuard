@@ -39,17 +39,18 @@ Prisma.
 ## Getting started
 
 ```bash
-# 1. Configure the environment, then edit .env and replace every "change-me"
-#    (the password must be the same in POSTGRES_PASSWORD and both URLs).
+# 1. Configure the environment, then edit .env and replace every "change-me". Each role's password
+#    must match in PAYGUARD_*_PASSWORD and in the URLs that use that role.
 cp .env.example .env
 
 # 2. Install dependencies from the lockfile (this also generates the Prisma client).
 npm ci
 
-# 3. Start PostgreSQL. On first start it also creates the payguard_test database.
+# 3. Start PostgreSQL. On first start of the volume it provisions the database roles and creates
+#    the payguard and payguard_test databases (see Database roles).
 docker compose up -d postgres
 
-# 4. Apply database migrations.
+# 4. Apply database migrations (as the schema owner, MIGRATION_DATABASE_URL).
 npm run db:migrate:deploy
 
 # 5. Provision a merchant; the API key is printed once.
@@ -80,16 +81,23 @@ curl -X POST http://localhost:3000/v1/payments \
 
 ```bash
 docker compose up --build
-docker compose exec api node dist/cli/admin.js merchant:create --name "Acme Ltd"
+docker compose run --rm cli merchant:create --name "Acme Ltd"
 ```
 
-This starts PostgreSQL and runs a one-off `migrate` job (`prisma migrate deploy`). It then starts
-two services from the same production image: `api` (HTTP only, `OUTBOX_WORKER_ENABLED=false`) on
-`127.0.0.1:${API_HOST_PORT}`, and `worker` (`node dist/worker.js`, no HTTP port). Both run as the
-unprivileged `node` user with a read-only root filesystem (only `/tmp` is writable), all Linux
-capabilities dropped, `no-new-privileges`, and a 30 s stop grace period. In a container, run the
-admin CLI with `node dist/cli/admin.js` (there is no npm or TypeScript in the runtime image). Stop
-the stack with `docker compose down`; add `-v` to delete the database volume as well.
+This starts PostgreSQL (provisioning the roles on a new volume) and runs a one-off `migrate` job
+(`prisma migrate deploy`, as the schema owner). It then starts two services from the same
+production image: `api` (HTTP only, `OUTBOX_WORKER_ENABLED=false`) on `127.0.0.1:${API_HOST_PORT}`,
+and `worker` (`node dist/worker.js`, no HTTP port), both connecting as the runtime role. The `cli`
+service (profile `tools`, started only by `docker compose run`) runs the operator CLI with the
+operator role's credentials, which the `api` and `worker` containers never hold. All three run as
+the unprivileged `node` user with a read-only root filesystem (only `/tmp` is writable), all Linux
+capabilities dropped and `no-new-privileges`; the long-running ones have a 30 s stop grace period.
+Stop the stack with `docker compose down`; add `-v` to delete the database volume as well.
+
+**This stack runs with `NODE_ENV=development`.** Its only payment provider is the simulator, which
+production refuses (see [Configuration](#configuration)). It is a local, production-like
+demonstration with hardened containers and simulated payments, not a deployment. The same image
+started with `NODE_ENV=production` exits at startup.
 
 ## Commands
 
@@ -121,35 +129,120 @@ All configuration comes from environment variables. In local development they ar
 startup and exits with an error that names each invalid variable without printing its value.
 
 The **Used by** column says which processes read a variable: `all` means the API, the standalone
-worker and the operator CLI; `api` means the HTTP process only. The worker and the CLI do not
-validate API-only settings, so a worker container does not need them.
+worker and the operator CLI; `api` means the HTTP process only. Each process validates only its
+own settings, so a worker container needs no API-only settings and the CLI needs no provider.
 
-| Variable                                  | Used by  | Default         | Description                                                                            |
-| ----------------------------------------- | -------- | --------------- | -------------------------------------------------------------------------------------- |
-| `DATABASE_URL`                            | all      | required        | PostgreSQL connection string (`postgresql://...`)                                      |
-| `NODE_ENV`                                | all      | `development`   | `development` (readable logs), `test` or `production` (JSON logs)                      |
-| `PAYMENT_SIMULATOR_OUTCOME`               | all      | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`             |
-| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS` | all      | `false`         | `true`: submissions are processed but time out; outcomes come from lookup              |
-| `OUTBOX_POLL_INTERVAL_MS`                 | all      | `1000`          | Idle delay between outbox polls (100-60000)                                            |
-| `OUTBOX_LEASE_SECONDS`                    | all      | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)               |
-| `OUTBOX_MAX_RUNS`                         | all      | `10`            | Runs per job before it is parked as `DEAD` for investigation                           |
-| `OUTBOX_BACKOFF_MAX_SECONDS`              | all      | `300`           | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                               |
-| `RECONCILIATION_DELAY_SECONDS`            | all      | `60`            | Wait before the first lookup of an unknown outcome; also the stale-attempt age         |
-| `PAYGUARD_OPERATOR`                       | CLI      | `<user>@<host>` | Actor recorded in the audit trail for CLI actions (printable ASCII, ≤ 200)             |
-| `SIMULATOR_WEBHOOK_SECRET`                | api, CLI | unset           | Webhook signing secret, 32-256 visible ASCII, not an API key; unset disables webhooks  |
-| `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`     | api      | `300`           | Allowed difference between a webhook's signed timestamp and the clock (30-900)         |
-| `PORT`                                    | api      | `3000`          | HTTP port                                                                              |
-| `SWAGGER_ENABLED`                         | api      | `false`         | `true` serves Swagger UI at `/docs`                                                    |
-| `CORS_ALLOWED_ORIGINS`                    | api      | empty           | Comma-separated exact origins; empty sends no CORS headers                             |
-| `OUTBOX_WORKER_ENABLED`                   | api      | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs      |
-| `RATE_LIMIT_IP_PER_MINUTE`                | api      | `300`           | Requests per client IP per minute, all routes except health checks                     |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`   | api      | `60`            | Payment creations and retries per merchant per minute                                  |
-| `TRUSTED_PROXIES`                         | api      | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [Rate limiting](#rate-limiting)) |
-| `HEALTH_QUEUE_BACKLOG_SECONDS`            | api      | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)   |
-| `HEALTH_WORKER_TIMEOUT_SECONDS`           | api      | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)       |
-| `TEST_DATABASE_URL`                       | tests    | required        | Database for `npm run test:e2e`; its name must end with `_test`                        |
-| `POSTGRES_USER` / `_PASSWORD` / `_DB`     | Compose  | required        | Credentials for the Compose PostgreSQL container                                       |
-| `POSTGRES_HOST_PORT` / `API_HOST_PORT`    | Compose  | `5432`/`3000`   | Host ports published by Compose (bound to 127.0.0.1)                                   |
+| Variable                                                                         | Used by               | Default         | Description                                                                                 |
+| -------------------------------------------------------------------------------- | --------------------- | --------------- | ------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                                                                       | all                   | required        | `development` (readable logs), `test` or `production` (JSON logs). No default               |
+| `PAYMENT_PROVIDER`                                                               | api, worker           | required        | The payment provider. Only `simulator` exists, and it is refused when `NODE_ENV=production` |
+| `DATABASE_URL`                                                                   | api, worker           | required        | Connection as the runtime role (`payguard_app`), see [Database roles](#database-roles)      |
+| `OPERATOR_DATABASE_URL`                                                          | CLI                   | required        | Connection as the operator role (`payguard_cli`); the CLI never uses `DATABASE_URL`         |
+| `MIGRATION_DATABASE_URL`                                                         | migrations            | required        | Connection as the schema owner (`payguard_owner`), used only by `npm run db:migrate:*`      |
+| `PAYMENT_SIMULATOR_OUTCOME`                                                      | all                   | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                  |
+| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: submissions are processed but time out; outcomes come from lookup                   |
+| `OUTBOX_POLL_INTERVAL_MS`                                                        | all                   | `1000`          | Idle delay between outbox polls (100-60000)                                                 |
+| `OUTBOX_LEASE_SECONDS`                                                           | all                   | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)                    |
+| `OUTBOX_MAX_RUNS`                                                                | all                   | `10`            | Runs per job before it is parked as `DEAD` for investigation                                |
+| `OUTBOX_BACKOFF_MAX_SECONDS`                                                     | all                   | `300`           | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                                    |
+| `RECONCILIATION_DELAY_SECONDS`                                                   | all                   | `60`            | Wait before the first lookup of an unknown outcome; also the stale-attempt age              |
+| `PAYGUARD_OPERATOR`                                                              | CLI                   | `<user>@<host>` | Actor recorded in the audit trail for CLI actions (printable ASCII, ≤ 200)                  |
+| `SIMULATOR_WEBHOOK_SECRET`                                                       | api, CLI              | unset           | Webhook signing secret, 32-256 visible ASCII, not an API key; unset disables webhooks       |
+| `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`                                            | api                   | `300`           | Allowed difference between a webhook's signed timestamp and the clock (30-900)              |
+| `PORT`                                                                           | api                   | `3000`          | HTTP port                                                                                   |
+| `SWAGGER_ENABLED`                                                                | api                   | `false`         | `true` serves Swagger UI at `/docs`                                                         |
+| `CORS_ALLOWED_ORIGINS`                                                           | api                   | empty           | Comma-separated exact origins; empty sends no CORS headers                                  |
+| `OUTBOX_WORKER_ENABLED`                                                          | api                   | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs           |
+| `RATE_LIMIT_IP_PER_MINUTE`                                                       | api                   | `300`           | Requests per client IP per minute, all routes except health checks                          |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`                                          | api                   | `60`            | Payment creations and retries per merchant per minute                                       |
+| `TRUSTED_PROXIES`                                                                | api                   | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [Rate limiting](#rate-limiting))      |
+| `HEALTH_QUEUE_BACKLOG_SECONDS`                                                   | api                   | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)        |
+| `HEALTH_WORKER_TIMEOUT_SECONDS`                                                  | api                   | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)            |
+| `TEST_DATABASE_URL`, `TEST_OPERATOR_DATABASE_URL`, `TEST_MIGRATION_DATABASE_URL` | tests                 | required        | The three connections for `npm run test:e2e`, to one database whose name ends with `_test`  |
+| `POSTGRES_USER` / `_PASSWORD` / `_DB`                                            | Compose               | required        | The container's bootstrap superuser, used only to provision the roles                       |
+| `PAYGUARD_OWNER_PASSWORD` / `_APP_` / `_CLI_`                                    | Compose, provisioning | required        | Passwords given to `payguard_owner`, `payguard_app` and `payguard_cli`                      |
+| `POSTGRES_HOST_PORT` / `API_HOST_PORT`                                           | Compose               | `5432`/`3000`   | Host ports published by Compose (bound to 127.0.0.1)                                        |
+
+**Development, test and production.**
+
+- **Development:** `NODE_ENV=development` and `PAYMENT_PROVIDER=simulator`, as in `.env.example`.
+- **Tests:** `test/setup-env.ts` sets `NODE_ENV=test` and `PAYMENT_PROVIDER=simulator` itself, and
+  points all three connections at the `_test` database.
+- **Production:** `NODE_ENV=production` must be set explicitly, and `PAYMENT_PROVIDER` must name a
+  real provider. None exists yet, so a production configuration of the API or worker exits at
+  startup, before accepting work, with an error naming the variable. The simulator has no
+  production override. The CLI does not load a provider and runs in any environment, but its
+  `simulator:webhook` command is refused in production.
+
+## Database roles
+
+Each process connects with only the privileges it needs. None of these roles is a superuser, can
+create roles or databases, replicate, or bypass row security:
+
+| Role                           | Kind                         | Used by                            | Can                                                                                                                        |
+| ------------------------------ | ---------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                            |
+| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, jobs, events; update only the columns its state changes touch |
+| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                  |
+| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                           |
+
+What the roles cannot do is the point:
+
+- **History stays append-only by privilege.** Neither the runtime nor the operator role holds
+  `UPDATE`, `DELETE` or `TRUNCATE` on `payment_events` or `operator_audit_events`. The runtime
+  role cannot read or write the audit trail at all.
+- **No escalation.** Neither role can alter or drop the append-only triggers, set
+  `session_replication_role`, create tables, or grant itself anything.
+- **The runtime role is narrow.** It cannot delete any row or change amounts, ownership, keys or
+  merchant status.
+- **The operator role is narrow too.** It cannot change payments or attempts.
+
+`test/database-privileges.e2e-spec.ts` checks every one of these against PostgreSQL, and pins the
+exact grant list.
+
+**Provisioning.** `docker/postgres/init/01-roles-and-databases.sh` creates the roles, makes
+`payguard_owner` the owner of the databases, and allows only the two groups (and the owner) to
+connect. It runs as a superuser:
+
+- Compose runs it on first start of an empty volume.
+- CI runs it against its service database.
+- For any other server, run it once by hand (it is idempotent):
+
+  ```bash
+  PGHOST=... PGUSER=<superuser> PGPASSWORD=... PAYGUARD_DATABASES="payguard" \
+  PAYGUARD_OWNER_PASSWORD=... PAYGUARD_APP_PASSWORD=... PAYGUARD_CLI_PASSWORD=... \
+    bash docker/postgres/init/01-roles-and-databases.sh
+  ```
+
+The application never holds credentials that could create roles. Privileges are granted by
+migrations (`20261026120000_runtime_and_operator_privileges`), so they travel with the schema. A
+migration fails if the roles were never provisioned, and **every migration that adds a table must
+grant on it** (the privilege test fails otherwise).
+
+**Rotating a password.**
+
+1. Run the script again with the new password; it sets the passwords of all three login roles.
+2. Update the URL that uses the role, and restart the processes that use it.
+
+For rotation without downtime, provision a second login role in the same group (for example
+`payguard_app_2`), move the processes to it, then drop the old one. In production, store these
+credentials in a secret manager, not in files.
+
+**Upgrading an existing local volume.** A volume created before these roles existed has tables
+owned by its bootstrap superuser.
+
+1. Run the script against it, with `docker compose exec` into the `postgres` service. It creates
+   the roles and hands every existing table, type and function to `payguard_owner`, changing no
+   data.
+2. Apply the migrations as `payguard_owner`.
+
+Alternatively, recreate the volume with `docker compose down -v`, which deletes its data.
+
+**What this does not protect against.** The schema owner can still disable the append-only
+triggers or rewrite history. So can any superuser or database administrator. The roles stop the
+application, and anyone holding its or the CLI's credentials, from doing so. They do not make the
+history tamper-proof. Keep owner and superuser credentials out of every running process, and ship
+the history to write-once storage if tamper evidence is required.
 
 ## Merchants and API keys
 
@@ -664,8 +757,8 @@ only real proxies; `0.0.0.0/0`, `::/0` and any other `/0` range are rejected at 
 ## Operations
 
 Merchant and key administration is done with the operator CLI, which talks to the database
-directly and is therefore not reachable over HTTP. Locally use `npm run admin -- <command>`; in a
-container use `node dist/cli/admin.js <command>`.
+directly, as the operator role (`OPERATOR_DATABASE_URL`), and is therefore not reachable over HTTP.
+Locally use `npm run admin -- <command>`; with Compose use `docker compose run --rm cli <command>`.
 
 ```bash
 # Create a merchant and its first key (slug defaults to one derived from the name).
@@ -890,9 +983,11 @@ npm run admin -- audit:list [--limit 50]   # newest first, default 20, at most 2
 - **Actor:** `PAYGUARD_OPERATOR`, or `<os user>@<host>` when unset. It is self-declared, not
   authenticated: anyone who can run the CLI can set it. It identifies who acted only as reliably as
   access to the CLI host and database is controlled.
-- **Append-only, not tamper-proof:** a database trigger rejects every `UPDATE` and `DELETE` on the
-  table, so application code cannot rewrite history. A database owner can still drop the trigger.
-  For tamper evidence, ship events to an external, write-once store.
+- **Append-only, not tamper-proof:** the application's and the CLI's roles hold no `UPDATE`,
+  `DELETE` or `TRUNCATE` privilege on the table, and a trigger also rejects updates and deletes by
+  its owner. The schema owner or a superuser can still drop the trigger (see
+  [Database roles](#database-roles)). For tamper evidence, ship events to an external, write-once
+  store.
 - Events are kept indefinitely; `maintenance:prune` never touches them.
 - Provider evidence and the worker's own decisions are not operator actions and are not written
   here; they are in each payment's history (see [Investigating a payment](#investigating-a-payment)),
@@ -1080,6 +1175,16 @@ token; the payment domain depends only on that interface.
     shutdown of the real worker loop, and the standalone worker module processing a payment.
   - Health with PostgreSQL unreachable: readiness `503` without leaking connection details, while
     liveness stays `200`.
+  - Database roles:
+    - the application, the CLI and migrations connect as three different roles;
+    - no role is a superuser or can create roles or databases;
+    - both history tables refuse `UPDATE`, `DELETE` and `TRUNCATE` from the runtime and operator
+      roles by privilege, and from the owner by trigger;
+    - escalation, schema changes and disabling the triggers are refused;
+    - the exact grant list is pinned;
+    - every migration was applied by, and is owned by, the owner;
+    - a payment's creation, processing, webhook, retry and reconciliation, and the CLI's commands,
+      all work with only these privileges.
   - Webhook intake: valid, wrong, missing, malformed and re-encoded signatures, stale and future
     timestamps, a merchant API key in place of a signature, re-serialized bodies, malformed JSON
     and invalid UTF-8, schema violations, oversized, compressed and non-JSON bodies (none of which
@@ -1162,6 +1267,12 @@ checks:
 - forged and unsigned webhooks get `401`, and the simulator command is refused in production;
 - a payment is resolved by the reconciliation lookup in the standalone worker;
 - `payment:inspect`, `payments:unresolved`, `ops:status` and `ops:metrics` agree;
+- the API and worker refuse to start, with an explanation and no credentials in it, under
+  `NODE_ENV=production` (simulator refused), without a provider, or without `NODE_ENV`, and the
+  refused runs change nothing;
+- the API and worker are connected as `payguard_app` only; `psql` as `payguard_app` or
+  `payguard_cli` cannot delete or update history, disable a trigger or create a role; and every
+  table is owned by `payguard_owner`;
 - neither the webhook secret nor the API key appears in the logs.
 
 It removes its containers, network and volume on exit, after a failure or a cancellation too,
@@ -1169,16 +1280,23 @@ printing the services' recent logs when it fails.
 
 ### Test database
 
-- Tests use only `TEST_DATABASE_URL`, and refuse to start unless its database name ends with
-  `_test`. There is no fallback to `DATABASE_URL`.
-- Jest's global setup applies migrations to that database (`prisma migrate deploy`) before any
-  test runs.
+- Tests connect through three variables, and the whole suite runs with the deployed privileges:
+  - `TEST_DATABASE_URL`: the runtime role, as the API and worker do;
+  - `TEST_OPERATOR_DATABASE_URL`: the operator role, for CLI commands and provisioning merchants;
+  - `TEST_MIGRATION_DATABASE_URL`: the schema owner.
+
+  Tests refuse to start unless all three name the same database ending in `_test`. There is no
+  fallback to the non-test variables.
+
+- Jest's global setup applies migrations to that database as the owner (`prisma migrate deploy`)
+  before any test runs. The roles must already exist; Compose provisions them on a new volume.
 - Every test starts from empty tables: a single `TRUNCATE` over all application tables (which
   satisfies foreign keys) runs in `beforeEach`, after confirming the connected database is a
-  `_test` one.
+  `_test` one. Truncation, fault-injection triggers and rewritten timestamps use the owner's
+  connection (`ownerDatabase()`), because the application's roles are rightly denied them.
 - Integration test files run one at a time (`maxWorkers: 1` in `jest.e2e.config.js`), because they
   share the database. Unit tests still run in parallel.
-- Locally, Compose creates `payguard_test` on the first start of the data volume.
+- Locally, Compose creates `payguard_test`, and the roles, on the first start of the data volume.
 
 ## Continuous integration
 
@@ -1196,8 +1314,9 @@ Each CI step calls the same npm scripts you run locally.
 
 ## Known limitations
 
-- **Simulated payments only.** There is no real provider integration, card handling, capture,
-  refund or payout. A real `PaymentProvider` would need at least:
+- **Simulated payments only, so no production deployment.** There is no real provider integration,
+  card handling, capture, refund or payout. The simulator is refused under `NODE_ENV=production`,
+  so the API and worker cannot run in production until a real provider is added. A real `PaymentProvider` would need at least:
   - an idempotency key per submission (the attempt ID) that the provider honours across retries;
   - a lookup by that key which, once a submission's timeout has passed, answers consistently and
     distinguishes "never received" from "still processing";
@@ -1234,7 +1353,8 @@ Each CI step calls the same npm scripts you run locally.
 - **No manual resolution without the provider.** An attempt is resolved only by a provider
   answer. One the provider can never confirm stays `PENDING` and visible indefinitely.
 - **History is operator-only and not tamper-proof.** Merchants cannot see `payment_events`. Like
-  the audit trail, it is append-only for the application but not protected from a database owner.
+  the audit trail, it is append-only by privilege for the application and the CLI, but the schema
+  owner and superusers can still change it.
   Refused retries change nothing and are not recorded (the merchant gets the `409` and reason).
 - **Retention is manual.** Payments, attempts, idempotency keys, audit and webhook events grow without
   bound by design; only completed outbox jobs and worker rows can be pruned, and only when an
@@ -1262,33 +1382,39 @@ Each CI step calls the same npm scripts you run locally.
 
 ## Troubleshooting
 
-| Symptom                                                      | Fix                                                                                                                                                                                                                                                                                                                                                                 |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `401 Missing API key`                                        | Send `Authorization: Bearer <key>`. Keys in query strings are ignored by design.                                                                                                                                                                                                                                                                                    |
-| `401 Invalid API key` with a key you just created            | Check for truncation or extra whitespace, then `key:list` for its status and `merchant:list` for suspension. The server log names the rejection reason.                                                                                                                                                                                                             |
-| `400` with `field: "Idempotency-Key"`                        | Send an `Idempotency-Key` header of 1-255 visible ASCII characters (no spaces).                                                                                                                                                                                                                                                                                     |
-| `409 Idempotency-Key has already been used...`               | The key belongs to an earlier operation with a different request. Use a new key for a new operation, or resend the original request to read the result.                                                                                                                                                                                                             |
-| `429 Rate limit exceeded`                                    | Wait `Retry-After` seconds. If every client is limited together behind a proxy, list the proxy's address in `TRUSTED_PROXIES`.                                                                                                                                                                                                                                      |
-| A payment stays `PENDING`                                    | Run `payment:inspect --payment <id>` for its state and history, or `payments:unresolved` for all of them. No active worker in `ops:status` means nothing is processing (start `worker`, or set `OUTBOX_WORKER_ENABLED=true`); `reconciliation_exhausted` means the provider never gave a definite answer (see [Investigating a payment](#investigating-a-payment)). |
-| `/health` shows `workers` with `no_active_worker`            | No worker has sent a heartbeat within `HEALTH_WORKER_TIMEOUT_SECONDS`. With the API's worker disabled, check that the `worker` service is running and can reach PostgreSQL (`docker compose logs worker`).                                                                                                                                                          |
-| `/health` shows `queue` with `dead_jobs`                     | Run `ops:status` for the dead jobs, then follow [Payment processing](#payment-processing).                                                                                                                                                                                                                                                                          |
-| `TRUSTED_PROXIES must be comma-separated IP addresses ...`   | Use IPs, CIDR ranges with a prefix of at least 1, or `loopback`/`linklocal`/`uniquelocal`. `0.0.0.0/0` is rejected on purpose.                                                                                                                                                                                                                                      |
-| `TRUST_PROXY_HOPS` has no effect                             | It is not a PayGuard setting; use `TRUSTED_PROXIES`.                                                                                                                                                                                                                                                                                                                |
-| `maintenance:prune` refuses a value                          | Retention must be at least 7 days and the batch size 1-10000.                                                                                                                                                                                                                                                                                                       |
-| Webhooks answer `503 Webhooks are not configured`            | Set `SIMULATOR_WEBHOOK_SECRET` for the API (Compose passes it through from your shell or `.env`).                                                                                                                                                                                                                                                                   |
-| Webhooks answer `401 Invalid webhook signature`              | The server log names the reason: `signature_missing`, `signature_malformed`, `signature_mismatch`, `signature_timestamp_too_old` or `signature_timestamp_in_future`. Sign the exact bytes you send with the same secret, and check both clocks.                                                                                                                     |
-| Webhooks answer `409`                                        | The event ID was stored earlier with different content. A redelivery must carry the same event (formatting may differ); a new event needs a new ID.                                                                                                                                                                                                                 |
-| `simulator:webhook` says it is disabled                      | It refuses to run with `NODE_ENV=production`. In a Compose container, run it with `docker compose exec -e NODE_ENV=development api node dist/cli/admin.js simulator:webhook ...` on a non-production stack.                                                                                                                                                         |
-| `409 Payment cannot be retried: <reason>`                    | Only `FAILED` payments with fewer than 3 attempts can be retried; a `PENDING` payment is still being processed or reconciled.                                                                                                                                                                                                                                       |
-| `Refusing to run integration tests against "..."`            | `TEST_DATABASE_URL` must point at a database whose name ends with `_test`.                                                                                                                                                                                                                                                                                          |
-| `TEST_DATABASE_URL must be set to run integration tests`     | Add `TEST_DATABASE_URL` to `.env` (see `.env.example`).                                                                                                                                                                                                                                                                                                             |
-| `database "payguard_test" does not exist`                    | The init script runs only on a fresh volume. Run `docker compose exec postgres createdb -U payguard payguard_test`, or reset with `docker compose down -v`.                                                                                                                                                                                                         |
-| `Property 'merchant' does not exist on type 'PrismaService'` | The generated client is stale. Run `npm run prisma:generate`.                                                                                                                                                                                                                                                                                                       |
-| `Bind for 127.0.0.1:5432 failed: port is already allocated`  | Another PostgreSQL is running. Set `POSTGRES_HOST_PORT` (e.g. `5434`) in `.env` and update the port in both database URLs.                                                                                                                                                                                                                                          |
-| `EADDRINUSE` on start                                        | Change `PORT` (local) or `API_HOST_PORT` (Compose) in `.env`.                                                                                                                                                                                                                                                                                                       |
-| `Invalid environment configuration: ...`                     | The listed variables are missing or malformed. Compare `.env` with `.env.example`.                                                                                                                                                                                                                                                                                  |
-| `/health` returns 503 with `Database is unreachable`         | Check that PostgreSQL is running and that `DATABASE_URL` matches the Compose credentials. The server log has the real error.                                                                                                                                                                                                                                        |
-| Database authentication fails although the password is right | URL-encode special characters in the password inside `DATABASE_URL` (e.g. `@` → `%40`).                                                                                                                                                                                                                                                                             |
-| `ExperimentalWarning: VM Modules is an experimental feature` | Expected: Jest's ESM mode prints this. It is harmless.                                                                                                                                                                                                                                                                                                              |
-| Prisma suggests updating to `8.0.0-rc.*`                     | Ignore it. Prisma publishes release candidates under its `latest` tag, and this project pins the stable 7.10.1.                                                                                                                                                                                                                                                     |
-| Prettier reports every file as changed on Windows            | Line endings: `.gitattributes` enforces LF. Re-checkout, or set `git config core.autocrlf false`.                                                                                                                                                                                                                                                                   |
+| Symptom                                                                       | Fix                                                                                                                                                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `401 Missing API key`                                                         | Send `Authorization: Bearer <key>`. Keys in query strings are ignored by design.                                                                                                                                                                                                                                                                                    |
+| `401 Invalid API key` with a key you just created                             | Check for truncation or extra whitespace, then `key:list` for its status and `merchant:list` for suspension. The server log names the rejection reason.                                                                                                                                                                                                             |
+| `400` with `field: "Idempotency-Key"`                                         | Send an `Idempotency-Key` header of 1-255 visible ASCII characters (no spaces).                                                                                                                                                                                                                                                                                     |
+| `409 Idempotency-Key has already been used...`                                | The key belongs to an earlier operation with a different request. Use a new key for a new operation, or resend the original request to read the result.                                                                                                                                                                                                             |
+| `429 Rate limit exceeded`                                                     | Wait `Retry-After` seconds. If every client is limited together behind a proxy, list the proxy's address in `TRUSTED_PROXIES`.                                                                                                                                                                                                                                      |
+| A payment stays `PENDING`                                                     | Run `payment:inspect --payment <id>` for its state and history, or `payments:unresolved` for all of them. No active worker in `ops:status` means nothing is processing (start `worker`, or set `OUTBOX_WORKER_ENABLED=true`); `reconciliation_exhausted` means the provider never gave a definite answer (see [Investigating a payment](#investigating-a-payment)). |
+| `/health` shows `workers` with `no_active_worker`                             | No worker has sent a heartbeat within `HEALTH_WORKER_TIMEOUT_SECONDS`. With the API's worker disabled, check that the `worker` service is running and can reach PostgreSQL (`docker compose logs worker`).                                                                                                                                                          |
+| `/health` shows `queue` with `dead_jobs`                                      | Run `ops:status` for the dead jobs, then follow [Payment processing](#payment-processing).                                                                                                                                                                                                                                                                          |
+| `TRUSTED_PROXIES must be comma-separated IP addresses ...`                    | Use IPs, CIDR ranges with a prefix of at least 1, or `loopback`/`linklocal`/`uniquelocal`. `0.0.0.0/0` is rejected on purpose.                                                                                                                                                                                                                                      |
+| `TRUST_PROXY_HOPS` has no effect                                              | It is not a PayGuard setting; use `TRUSTED_PROXIES`.                                                                                                                                                                                                                                                                                                                |
+| `maintenance:prune` refuses a value                                           | Retention must be at least 7 days and the batch size 1-10000.                                                                                                                                                                                                                                                                                                       |
+| Webhooks answer `503 Webhooks are not configured`                             | Set `SIMULATOR_WEBHOOK_SECRET` for the API (Compose passes it through from your shell or `.env`).                                                                                                                                                                                                                                                                   |
+| Webhooks answer `401 Invalid webhook signature`                               | The server log names the reason: `signature_missing`, `signature_malformed`, `signature_mismatch`, `signature_timestamp_too_old` or `signature_timestamp_in_future`. Sign the exact bytes you send with the same secret, and check both clocks.                                                                                                                     |
+| Webhooks answer `409`                                                         | The event ID was stored earlier with different content. A redelivery must carry the same event (formatting may differ); a new event needs a new ID.                                                                                                                                                                                                                 |
+| `simulator:webhook` says it is disabled                                       | It refuses to run with `NODE_ENV=production`. The Compose stack runs in development: `docker compose run --rm cli simulator:webhook --attempt <id> --url http://api:3000`.                                                                                                                                                                                          |
+| `PAYMENT_PROVIDER=simulator is not allowed when NODE_ENV=production`          | Intended: the simulator records payments no provider processed, and has no production override. Use `NODE_ENV=development` for local and demonstration stacks; production needs a real provider.                                                                                                                                                                    |
+| `PAYMENT_PROVIDER must be one of: simulator` or `NODE_ENV must be one of ...` | Neither has a default. Set both explicitly for the API and the worker (see `.env.example`).                                                                                                                                                                                                                                                                         |
+| `OPERATOR_DATABASE_URL must be a postgresql:// connection string`             | The CLI connects as the operator role and does not fall back to `DATABASE_URL`. Set `OPERATOR_DATABASE_URL`.                                                                                                                                                                                                                                                        |
+| `permission denied for table ...` from the app or CLI                         | It is connecting as a role without that privilege. Check that each URL uses its own role (`payguard_app`, `payguard_cli`, `payguard_owner`), and that migrations have been applied: they grant the privileges.                                                                                                                                                      |
+| `role "payguard_runtime" does not exist` during migrations                    | The roles were never provisioned on this server. Run `docker/postgres/init/01-roles-and-databases.sh` as a superuser (see [Database roles](#database-roles)).                                                                                                                                                                                                       |
+| `must be owner of table ...` during migrations                                | The migration runs as a role that does not own the schema, usually because the tables predate the roles. Run the provisioning script once: it hands existing objects to `payguard_owner`.                                                                                                                                                                           |
+| `409 Payment cannot be retried: <reason>`                                     | Only `FAILED` payments with fewer than 3 attempts can be retried; a `PENDING` payment is still being processed or reconciled.                                                                                                                                                                                                                                       |
+| `Refusing to run integration tests against "..."`                             | The three `TEST_*DATABASE_URL` variables must point at a database whose name ends with `_test`.                                                                                                                                                                                                                                                                     |
+| `TEST_DATABASE_URL must be set to run integration tests`                      | Add `TEST_DATABASE_URL`, `TEST_OPERATOR_DATABASE_URL` and `TEST_MIGRATION_DATABASE_URL` to `.env` (see `.env.example`).                                                                                                                                                                                                                                             |
+| `database "payguard_test" does not exist`                                     | The init script runs only on a fresh volume. Run the provisioning script against the existing server (see [Database roles](#database-roles)); it creates missing databases. Or reset with `docker compose down -v`.                                                                                                                                                 |
+| `Property 'merchant' does not exist on type 'PrismaService'`                  | The generated client is stale. Run `npm run prisma:generate`.                                                                                                                                                                                                                                                                                                       |
+| `Bind for 127.0.0.1:5432 failed: port is already allocated`                   | Another PostgreSQL is running. Set `POSTGRES_HOST_PORT` (e.g. `5434`) in `.env` and update the port in both database URLs.                                                                                                                                                                                                                                          |
+| `EADDRINUSE` on start                                                         | Change `PORT` (local) or `API_HOST_PORT` (Compose) in `.env`.                                                                                                                                                                                                                                                                                                       |
+| `Invalid environment configuration: ...`                                      | The listed variables are missing or malformed. Compare `.env` with `.env.example`.                                                                                                                                                                                                                                                                                  |
+| `/health` returns 503 with `Database is unreachable`                          | Check that PostgreSQL is running and that `DATABASE_URL` matches the Compose credentials. The server log has the real error.                                                                                                                                                                                                                                        |
+| Database authentication fails although the password is right                  | URL-encode special characters in the password inside `DATABASE_URL` (e.g. `@` → `%40`).                                                                                                                                                                                                                                                                             |
+| `ExperimentalWarning: VM Modules is an experimental feature`                  | Expected: Jest's ESM mode prints this. It is harmless.                                                                                                                                                                                                                                                                                                              |
+| Prisma suggests updating to `8.0.0-rc.*`                                      | Ignore it. Prisma publishes release candidates under its `latest` tag, and this project pins the stable 7.10.1.                                                                                                                                                                                                                                                     |
+| Prettier reports every file as changed on Windows                             | Line endings: `.gitattributes` enforces LF. Re-checkout, or set `git config core.autocrlf false`.                                                                                                                                                                                                                                                                   |
