@@ -26,6 +26,8 @@
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "test:cov": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
     "test:e2e": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.e2e.config.js",
+    "smoke:docker": "bash scripts/docker-smoke.sh",
+    "test:soak": "nest build && node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.soak.config.js",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "db:migrate:dev": "prisma migrate dev",

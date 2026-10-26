@@ -16,3 +16,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Opt-in soak runs (npm run test:soak)
+soak-results/
