@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end smoke test of the Compose stack: a fresh PostgreSQL, the migrate job, the API and the
-# standalone worker, built from this checkout. It runs as its own Compose project with generated
+# End-to-end smoke test of the Compose stack: a fresh PostgreSQL with provisioned roles, the migrate
+# job, the API, the standalone worker and the operator CLI, built from this checkout. It runs as its own Compose project with generated
 # credentials, its own ports and its own volume, so local development data is never touched, and
 # it removes everything it created on exit, including after a failure.
 #
@@ -13,8 +13,11 @@ api="http://127.0.0.1:${SMOKE_API_PORT:-3180}"
 random_hex() { node -e "process.stdout.write(require('crypto').randomBytes($1).toString('hex'))"; }
 
 # Generated for this run only; nothing here is a real secret.
-export POSTGRES_USER=payguard POSTGRES_DB=payguard
+export POSTGRES_USER=postgres POSTGRES_DB=payguard
 export POSTGRES_PASSWORD="smoke-$(random_hex 12)"
+export PAYGUARD_OWNER_PASSWORD="smoke-$(random_hex 12)"
+export PAYGUARD_APP_PASSWORD="smoke-$(random_hex 12)"
+export PAYGUARD_CLI_PASSWORD="smoke-$(random_hex 12)"
 export SIMULATOR_WEBHOOK_SECRET="smoke-$(random_hex 24)"
 export API_HOST_PORT="${SMOKE_API_PORT:-3180}" POSTGRES_HOST_PORT="${SMOKE_DB_PORT:-5480}"
 # Every submission's answer is lost: one payment is resolved by webhook before its lookup is due,
@@ -24,9 +27,15 @@ export RECONCILIATION_DELAY_SECONDS=15
 export SWAGGER_ENABLED=false CORS_ALLOWED_ORIGINS= TRUSTED_PROXIES=
 
 compose() { docker compose -p "$project" "$@"; }
-cli() { compose exec -T api node dist/cli/admin.js "$@"; }
-# Simulator commands are refused under NODE_ENV=production, which the containers run with.
-simulator_cli() { compose exec -T -e NODE_ENV=development api node dist/cli/admin.js "$@"; }
+# The CLI runs in its own container with the operator role's credentials.
+cli() { compose run --rm --no-deps -T cli "$@"; }
+# psql as one of the application's roles, inside the postgres container.
+sql_as() {
+  local role=$1 password=$2
+  shift 2
+  compose exec -T -e PGPASSWORD="$password" postgres \
+    psql -h 127.0.0.1 -U "$role" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -At "$@"
+}
 json() { node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).$1"; }
 step() { echo "== $*"; }
 fail() {
@@ -88,9 +97,9 @@ step "Payment resolved by webhook, with a duplicate delivery"
 first=$(create_payment smoke-webhook)
 first_id=$(echo "$first" | json id)
 first_attempt=$(echo "$first" | json 'attempts[0].id')
-simulator_cli simulator:webhook --attempt "$first_attempt" | grep -q "HTTP 202 accepted" ||
+cli simulator:webhook --attempt "$first_attempt" --url http://api:3000 | grep -q "HTTP 202 accepted" ||
   fail "webhook not accepted"
-simulator_cli simulator:webhook --attempt "$first_attempt" | grep -q "HTTP 200 duplicate" ||
+cli simulator:webhook --attempt "$first_attempt" --url http://api:3000 | grep -q "HTTP 200 duplicate" ||
   fail "duplicate webhook not recognised"
 wait_for 30 "webhook payment SUCCEEDED" payment_is "$first_id" SUCCEEDED
 cli payment:inspect --payment "$first_id" | grep -qE 'PROVIDER_WEBHOOK +attempt\.resolved' ||
@@ -104,7 +113,8 @@ forged=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/webhooks/simula
 unsigned=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/webhooks/simulator" \
   -H 'Content-Type: application/json' -d '{}')
 [ "$unsigned" = 401 ] || fail "unsigned webhook answered $unsigned"
-if cli simulator:webhook --attempt "$first_attempt" >/dev/null 2>&1; then
+if compose run --rm --no-deps -T -e NODE_ENV=production cli \
+  simulator:webhook --attempt "$first_attempt" --url http://api:3000 >/dev/null 2>&1; then
   fail "simulator command ran under NODE_ENV=production"
 fi
 
@@ -123,6 +133,45 @@ echo "$status" | grep -qE 'Awaiting an operator: +0' || fail "attempts awaiting 
 echo "$status" | grep -qE 'active +heartbeat' || fail "no active worker reported"
 cli ops:metrics | grep -q '^payguard_workers_active 1$' || fail "metrics do not show the worker"
 
+step "Production configuration fails closed before any work"
+payments_before=$(sql_as payguard_cli "$PAYGUARD_CLI_PASSWORD" -c 'SELECT count(*) FROM payments')
+# refuses <service> <expected message> <docker compose run -e options...>
+refuses() {
+  local service=$1 expected=$2
+  shift 2
+  local output
+  if output=$(compose run --rm --no-deps -T "$@" "$service" 2>&1); then
+    fail "$service started with: $*"
+  fi
+  grep -qF "$expected" <<<"$output" || fail "$service did not explain its refusal ($*)"
+  if grep -qF "$PAYGUARD_APP_PASSWORD" <<<"$output"; then fail "$service printed a credential"; fi
+}
+simulator_refused='PAYMENT_PROVIDER=simulator is not allowed when NODE_ENV=production'
+refuses api "$simulator_refused" -e NODE_ENV=production
+refuses worker "$simulator_refused" -e NODE_ENV=production
+refuses api 'PAYMENT_PROVIDER must be one of: simulator' -e PAYMENT_PROVIDER=
+refuses worker 'PAYMENT_PROVIDER must be one of: simulator' -e PAYMENT_PROVIDER=
+refuses worker 'NODE_ENV must be one of the following values' -e NODE_ENV=
+[ "$(sql_as payguard_cli "$PAYGUARD_CLI_PASSWORD" -c 'SELECT count(*) FROM payments')" = "$payments_before" ] ||
+  fail "a refused process changed payments"
+
+step "Least-privilege database roles"
+connected=$(compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c \
+  "SELECT string_agg(DISTINCT usename, ',' ORDER BY usename) FROM pg_stat_activity
+   WHERE datname = current_database() AND pid <> pg_backend_pid()")
+[ "$connected" = payguard_app ] || fail "API and worker connect as: $connected"
+for statement in 'DELETE FROM payment_events' "UPDATE operator_audit_events SET actor = 'x'" \
+  'ALTER TABLE payment_events DISABLE TRIGGER payment_events_append_only' 'CREATE ROLE intruder'; do
+  for role in payguard_app:"$PAYGUARD_APP_PASSWORD" payguard_cli:"$PAYGUARD_CLI_PASSWORD"; do
+    if output=$(sql_as "${role%%:*}" "${role#*:}" -c "$statement" 2>&1); then
+      fail "${role%%:*} was allowed: $statement"
+    fi
+    grep -qE 'permission denied|must be owner' <<<"$output" || fail "unexpected error: $output"
+  done
+done
+owners=$(sql_as payguard_owner "$PAYGUARD_OWNER_PASSWORD" -c \
+  "SELECT string_agg(DISTINCT tableowner, ',') FROM pg_tables WHERE schemaname = 'public'")
+[ "$owners" = payguard_owner ] || fail "tables owned by: $owners"
 step "No secrets in the logs"
 logs=$(compose logs --no-color api worker)
 if grep -qF "$SIMULATOR_WEBHOOK_SECRET" <<<"$logs"; then fail "webhook secret logged"; fi

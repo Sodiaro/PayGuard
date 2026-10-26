@@ -33,9 +33,16 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+    # CI-only throwaway credentials. The service's payguard user is the bootstrap superuser: it only
+    # provisions the roles; migrations, the application and the CLI each use their own role.
     env:
-      DATABASE_URL: postgresql://payguard:payguard-ci@localhost:5432/payguard_test
-      TEST_DATABASE_URL: postgresql://payguard:payguard-ci@localhost:5432/payguard_test
+      PAYGUARD_OWNER_PASSWORD: owner-ci
+      PAYGUARD_APP_PASSWORD: app-ci
+      PAYGUARD_CLI_PASSWORD: cli-ci
+      MIGRATION_DATABASE_URL: postgresql://payguard_owner:owner-ci@localhost:5432/payguard_test
+      TEST_MIGRATION_DATABASE_URL: postgresql://payguard_owner:owner-ci@localhost:5432/payguard_test
+      TEST_DATABASE_URL: postgresql://payguard_app:app-ci@localhost:5432/payguard_test
+      TEST_OPERATOR_DATABASE_URL: postgresql://payguard_cli:cli-ci@localhost:5432/payguard_test
 
     steps:
       - uses: actions/checkout@v7
@@ -62,6 +69,14 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+      - name: Provision database roles
+        env:
+          PGHOST: localhost
+          PGUSER: payguard
+          PGPASSWORD: payguard-ci
+          PAYGUARD_DATABASES: payguard_test
+        run: bash docker/postgres/init/01-roles-and-databases.sh
 
       - name: Apply migrations to the test database
         run: npm run db:migrate:deploy

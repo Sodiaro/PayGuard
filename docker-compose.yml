@@ -1,12 +1,17 @@
 name: payguard
 
 # Credentials have no defaults: a missing .env fails loudly instead of using a guessable password.
-x-database-url: &database-url postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+# Each process connects as its own role (see the README on database roles); nothing but role
+# provisioning ever connects as the POSTGRES_USER superuser.
+x-runtime-database-url: &runtime-database-url postgresql://payguard_app:${PAYGUARD_APP_PASSWORD}@postgres:5432/${POSTGRES_DB}
+x-operator-database-url: &operator-database-url postgresql://payguard_cli:${PAYGUARD_CLI_PASSWORD}@postgres:5432/${POSTGRES_DB}
+x-migration-database-url: &migration-database-url postgresql://payguard_owner:${PAYGUARD_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB}
 
-# Settings shared by the API and the worker.
+# Settings shared by the API, the worker and the CLI. The payment simulator is the only provider
+# and is refused under NODE_ENV=production, so this stack runs hardened containers in development
+# mode: a local, production-like demonstration with simulated payments, not a deployment.
 x-core-environment: &core-environment
-  NODE_ENV: production
-  DATABASE_URL: *database-url
+  NODE_ENV: development
   PAYMENT_SIMULATOR_OUTCOME: ${PAYMENT_SIMULATOR_OUTCOME:-SUCCEEDED}
   PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: ${PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS:-false}
   OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
@@ -35,6 +40,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      # Read only by the init script that provisions the roles, on first start of the volume.
+      PAYGUARD_OWNER_PASSWORD: ${PAYGUARD_OWNER_PASSWORD:?Set PAYGUARD_OWNER_PASSWORD in .env}
+      PAYGUARD_APP_PASSWORD: ${PAYGUARD_APP_PASSWORD:?Set PAYGUARD_APP_PASSWORD in .env}
+      PAYGUARD_CLI_PASSWORD: ${PAYGUARD_CLI_PASSWORD:?Set PAYGUARD_CLI_PASSWORD in .env}
     ports:
       - '127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432'
     volumes:
@@ -54,7 +63,7 @@ services:
       target: build
     command: ['npx', 'prisma', 'migrate', 'deploy']
     environment:
-      DATABASE_URL: *database-url
+      MIGRATION_DATABASE_URL: *migration-database-url
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,6 +75,8 @@ services:
       target: runtime
     environment:
       <<: *core-environment
+      DATABASE_URL: *runtime-database-url
+      PAYMENT_PROVIDER: simulator
       PORT: 3000
       # Processing runs in the worker service below.
       OUTBOX_WORKER_ENABLED: 'false'
@@ -103,7 +114,31 @@ services:
       context: .
       target: runtime
     command: ['node', 'dist/worker.js']
-    environment: *core-environment
+    environment:
+      <<: *core-environment
+      DATABASE_URL: *runtime-database-url
+      PAYMENT_PROVIDER: simulator
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # The operator CLI, with the operator role's credentials, which the API and worker never hold:
+  #   docker compose run --rm cli merchant:create --name "Acme Ltd"
+  cli:
+    <<: *hardening
+    restart: 'no'
+    profiles: ['tools']
+    build:
+      context: .
+      target: runtime
+    entrypoint: ['node', 'dist/cli/admin.js']
+    environment:
+      <<: *core-environment
+      OPERATOR_DATABASE_URL: *operator-database-url
+      SIMULATOR_WEBHOOK_SECRET: ${SIMULATOR_WEBHOOK_SECRET:-}
+      PAYGUARD_OPERATOR: ${PAYGUARD_OPERATOR:-}
     depends_on:
       postgres:
         condition: service_healthy
