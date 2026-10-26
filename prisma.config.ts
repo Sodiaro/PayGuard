@@ -8,7 +8,8 @@ export default defineConfig({
     path: 'prisma/migrations',
   },
   datasource: {
+    // The schema owner, not the application's runtime role: only migrations may change the schema.
     // Not env(): it throws when unset, which would break `prisma generate` without a database.
-    url: process.env.DATABASE_URL,
+    url: process.env.MIGRATION_DATABASE_URL,
   },
 });
