@@ -432,9 +432,10 @@ describe('Provider webhook intake (PostgreSQL)', () => {
 
     await webhooks.deliver(body, { signature }).expect(202);
     await webhooks.deliver(body, { signature }).expect(200);
-    await webhooks
-      .deliver(body, { signature: signature.replace(/.$/, '0') })
-      .expect(401);
+    // Always a different last digit: replacing it with a fixed one leaves 1 in 16 signatures valid.
+    const tampered =
+      signature.slice(0, -1) + (signature.endsWith('0') ? '1' : '0');
+    await webhooks.deliver(body, { signature: tampered }).expect(401);
     await webhooks.deliver(JSON.stringify({ ...event, type: 'x' })).expect(400);
     await drainOutbox(app, prisma);
 

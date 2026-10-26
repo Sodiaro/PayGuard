@@ -68,7 +68,6 @@ export class SimulatedWebhookSender {
       select: {
         id: true,
         createdAt: true,
-        submittedAt: true,
         payment: { select: { amount: true, currency: true } },
       },
     });
@@ -78,8 +77,9 @@ export class SimulatedWebhookSender {
       );
     }
 
-    // The event's creation time comes from the attempt, so sending again redelivers the same
-    // event (a duplicate), as a provider retry would. Only the signed delivery time is current.
+    // The event's creation time is the attempt's, fixed from the start, so sending again (before
+    // or after the worker submits it) redelivers the same event, a duplicate, as a provider retry
+    // would. Only the signed delivery time is current.
     const event = simulatedWebhookEvent(
       {
         attemptId: attempt.id,
@@ -87,7 +87,7 @@ export class SimulatedWebhookSender {
         currency: attempt.payment.currency,
       },
       type,
-      attempt.submittedAt ?? attempt.createdAt,
+      attempt.createdAt,
     );
     const delivery = signSimulatedWebhook(
       secret,
