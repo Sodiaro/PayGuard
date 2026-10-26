@@ -100,19 +100,27 @@ export class OutboxStore {
 
   // A no-op when the attempt already has a job of this type (or, for webhook jobs, the event
   // already has one): re-enqueueing never duplicates work. Returns whether a job was created.
+  //
+  // Every time that decides when a job may run (available_at here and in reschedule/requeue,
+  // locked_until in claim) is computed by PostgreSQL, which also judges it in claim. An
+  // application clock out of step with the database's would otherwise make new work look not yet
+  // due, or delayed work look overdue.
   async enqueue(db: Db, job: EnqueueJob): Promise<boolean> {
-    const created = await db.outboxJob.createMany({
-      data: {
-        type: job.type,
-        paymentId: job.paymentId,
-        attemptId: job.attemptId,
-        availableAt: new Date(Date.now() + (job.delaySeconds ?? 0) * 1000),
-        requestId: job.requestId ?? null,
-        webhookEventId: job.webhookEventId ?? null,
-      },
-      skipDuplicates: true,
-    });
-    return created.count === 1;
+    const created = await db.$executeRaw`
+      INSERT INTO outbox_jobs
+        (id, type, payment_id, attempt_id, available_at, request_id, webhook_event_id, updated_at)
+      VALUES (
+        uuidv7(),
+        ${job.type}::outbox_job_type,
+        ${job.paymentId}::uuid,
+        ${job.attemptId}::uuid,
+        now() + ${job.delaySeconds ?? 0} * interval '1 second',
+        ${job.requestId ?? null},
+        ${job.webhookEventId ?? null}::uuid,
+        now()
+      )
+      ON CONFLICT DO NOTHING`;
+    return created === 1;
   }
 
   // SKIP LOCKED lets concurrent workers claim disjoint jobs; the fresh lease token fences every
@@ -205,60 +213,52 @@ export class OutboxStore {
     delaySeconds = backoffSeconds(job.runCount, this.backoffMaxSeconds),
   ): Promise<RescheduleOutcome> {
     const dead = job.runCount >= this.maxRuns;
-    const result = await db.outboxJob.updateMany({
-      where: {
-        id: job.id,
-        leaseToken: job.leaseToken,
-        status: OutboxJobStatus.PROCESSING,
-      },
-      data: {
-        status: dead ? OutboxJobStatus.DEAD : OutboxJobStatus.QUEUED,
-        availableAt: new Date(Date.now() + delaySeconds * 1000),
-        lastError: category,
-        lockedBy: null,
-        leaseToken: null,
-        lockedUntil: null,
-      },
-    });
-    if (result.count === 0) return 'lease_lost';
+    const updated = await db.$executeRaw`
+      UPDATE outbox_jobs
+      SET status = ${dead ? OutboxJobStatus.DEAD : OutboxJobStatus.QUEUED}::outbox_job_status,
+          available_at = now() + ${delaySeconds} * interval '1 second',
+          last_error = ${category}::outbox_error_category,
+          locked_by = NULL,
+          lease_token = NULL,
+          locked_until = NULL,
+          updated_at = now()
+      WHERE id = ${job.id}::uuid
+        AND lease_token = ${job.leaseToken}::uuid
+        AND status = 'PROCESSING'`;
+    if (updated === 0) return 'lease_lost';
     return dead ? 'dead' : 'rescheduled';
   }
 
   // Safety net for attempts left PENDING without live work, such as attempts created before the
   // outbox existed or whose processing job died. Attempts that already have a reconciliation job,
   // including a DEAD one, are left alone so dead work stays visible instead of looping.
+  // The attempt's age comes from created_at, which the application sets, so a clock difference
+  // shifts when the sweep notices it by that much. That is harmless: attempts with live work are
+  // excluded, and the sweep only ever queues a lookup.
   async enqueueStaleReconciliations(olderThanSeconds: number): Promise<number> {
-    const stale = await this.prisma.$queryRaw<
-      { attempt_id: string; payment_id: string }[]
-    >`
-      SELECT attempt.id AS attempt_id, attempt.payment_id
-      FROM payment_attempts AS attempt
-      WHERE attempt.status = ${PaymentAttemptStatus.PENDING}::payment_attempt_status
-        AND attempt.created_at < now() - ${olderThanSeconds} * interval '1 second'
-        AND NOT EXISTS (
-          SELECT 1 FROM outbox_jobs AS job
-          WHERE job.attempt_id = attempt.id
-            AND (job.status IN ('QUEUED', 'PROCESSING') OR job.type = 'RECONCILE_ATTEMPT')
-        )
-      ORDER BY attempt.created_at
-      LIMIT ${STALE_SWEEP_BATCH}`;
-    if (stale.length === 0) return 0;
-
     return this.prisma.$transaction(async (tx) => {
-      const created = await tx.outboxJob.createManyAndReturn({
-        data: stale.map((row) => ({
-          type: OutboxJobType.RECONCILE_ATTEMPT,
-          paymentId: row.payment_id,
-          attemptId: row.attempt_id,
-        })),
-        skipDuplicates: true,
-        select: { id: true, paymentId: true, attemptId: true },
-      });
+      const created = await tx.$queryRaw<
+        { id: string; payment_id: string; attempt_id: string }[]
+      >`
+        INSERT INTO outbox_jobs (id, type, payment_id, attempt_id, available_at, updated_at)
+        SELECT uuidv7(), 'RECONCILE_ATTEMPT', attempt.payment_id, attempt.id, now(), now()
+        FROM payment_attempts AS attempt
+        WHERE attempt.status = ${PaymentAttemptStatus.PENDING}::payment_attempt_status
+          AND attempt.created_at < now() - ${olderThanSeconds} * interval '1 second'
+          AND NOT EXISTS (
+            SELECT 1 FROM outbox_jobs AS job
+            WHERE job.attempt_id = attempt.id
+              AND (job.status IN ('QUEUED', 'PROCESSING') OR job.type = 'RECONCILE_ATTEMPT')
+          )
+        ORDER BY attempt.created_at
+        LIMIT ${STALE_SWEEP_BATCH}
+        ON CONFLICT DO NOTHING
+        RETURNING id, payment_id, attempt_id`;
       await recordPaymentEvents(
         tx,
         created.map((job) => ({
-          paymentId: job.paymentId,
-          attemptId: job.attemptId,
+          paymentId: job.payment_id,
+          attemptId: job.attempt_id,
           type: PaymentEventType.RECONCILIATION_SCHEDULED,
           source: PaymentEventSource.WORKER,
           outboxJobId: job.id,
@@ -311,15 +311,11 @@ export class OutboxStore {
         },
       });
       if (!job) return false;
-      const requeued = await tx.outboxJob.updateMany({
-        where: { id: jobId, status: OutboxJobStatus.DEAD },
-        data: {
-          status: OutboxJobStatus.QUEUED,
-          runCount: 0,
-          availableAt: new Date(),
-        },
-      });
-      if (requeued.count === 0) return false;
+      const requeued = await tx.$executeRaw`
+        UPDATE outbox_jobs
+        SET status = 'QUEUED', run_count = 0, available_at = now(), updated_at = now()
+        WHERE id = ${jobId}::uuid AND status = 'DEAD'`;
+      if (requeued === 0) return false;
 
       const details = {
         jobType: job.type,
@@ -348,16 +344,22 @@ export class OutboxStore {
     });
   }
 
+  // Liveness is judged against the database clock (workerSnapshot), so the heartbeat is stamped
+  // with it too. lastJobFinishedAt is the worker's own clock: it is only reported, never compared
+  // to decide anything.
   async recordWorkerHeartbeat(
     workerId: string,
     progress: { jobsFinished: number; lastJobFinishedAt: Date | null },
   ): Promise<void> {
-    const now = new Date();
-    await this.prisma.outboxWorker.upsert({
-      where: { id: workerId },
-      create: { id: workerId, heartbeatAt: now, ...progress },
-      update: { heartbeatAt: now, stoppedAt: null, ...progress },
-    });
+    await this.prisma.$executeRaw`
+      INSERT INTO outbox_workers
+        (id, started_at, heartbeat_at, last_job_finished_at, jobs_finished, stopped_at)
+      VALUES (${workerId}, now(), now(), ${progress.lastJobFinishedAt}, ${progress.jobsFinished}, NULL)
+      ON CONFLICT (id) DO UPDATE
+      SET heartbeat_at = now(),
+          last_job_finished_at = EXCLUDED.last_job_finished_at,
+          jobs_finished = EXCLUDED.jobs_finished,
+          stopped_at = NULL`;
   }
 
   async markWorkerStopped(workerId: string): Promise<void> {

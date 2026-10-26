@@ -27,7 +27,13 @@ import { ProviderWebhookProcessor } from '../src/webhooks/provider-webhook-proce
 import { WorkerModule } from '../src/worker.module.js';
 import { runCli } from './support/admin-cli.js';
 import { failWritesTo } from './support/db-faults.js';
-import { drainOutbox, expireLeases, makeJobsDue } from './support/outbox.js';
+import {
+  drainOutbox,
+  expireLeases,
+  makeJobDue,
+  makeJobsDue,
+  processDueJobsExpecting,
+} from './support/outbox.js';
 import { paymentsApi, type Merchant } from './support/payments-api.js';
 import { ScriptedProvider } from './support/scripted-provider.js';
 import {
@@ -78,7 +84,7 @@ describe('Provider webhook processing (PostgreSQL)', () => {
   ) => {
     provider.willProcessThenTimeOut(outcome);
     const payment = await create(merchant);
-    await worker.processDueJobs();
+    await processDueJobsExpecting(app, prisma, 1);
     return payment;
   };
 
@@ -90,7 +96,9 @@ describe('Provider webhook processing (PostgreSQL)', () => {
   };
 
   // Webhook jobs are due at once; the reconciliation lookup is still delayed, so only they run.
-  const processWebhooks = () => worker.processDueJobs();
+  // A mismatch fails with the outbox's scheduling state.
+  const processWebhooks = (expected = 1) =>
+    processDueJobsExpecting(app, prisma, expected);
 
   const deliver = async (event: ProviderWebhookEvent) => {
     const response = await webhooks.deliver(event);
@@ -351,7 +359,7 @@ describe('Provider webhook processing (PostgreSQL)', () => {
 
       await deliver(succeeded);
       await deliver(declined);
-      await processWebhooks();
+      await processWebhooks(2);
 
       const results = [
         (await storedEvent(succeeded)).result,
@@ -462,10 +470,7 @@ describe('Provider webhook processing (PostgreSQL)', () => {
         lastError: 'INTERNAL_ERROR',
       });
 
-      await prisma.outboxJob.update({
-        where: { id: job.id },
-        data: { availableAt: new Date(Date.now() - 1000) },
-      });
+      await makeJobDue(prisma, job.id);
       await processWebhooks();
       await expect(storedEvent(event)).resolves.toMatchObject({
         result: 'APPLIED',
@@ -481,9 +486,9 @@ describe('Provider webhook processing (PostgreSQL)', () => {
       await deliver(event);
 
       await app.get(OutboxStore).claim('crashed-worker', 10);
-      await expect(processWebhooks()).resolves.toBe(0);
+      await processWebhooks(0);
       await expireLeases(prisma);
-      await expect(processWebhooks()).resolves.toBe(1);
+      await processWebhooks(1);
 
       await expect(storedEvent(event)).resolves.toMatchObject({
         result: 'APPLIED',
@@ -527,11 +532,39 @@ describe('Provider webhook processing (PostgreSQL)', () => {
       );
     });
 
+    const listeningUrl = async () => {
+      const server = app.getHttpServer() as Server;
+      if (!server.listening) await app.listen(0, '127.0.0.1');
+      const { port } = server.address() as AddressInfo;
+      return `http://127.0.0.1:${port}`;
+    };
+
+    it('redelivers the same event when sent before and after the worker submits the attempt', async () => {
+      provider.willProcessThenTimeOut(SimulatorOutcome.Succeeded);
+      const payment = await create();
+      const url = await listeningUrl();
+      const send = () =>
+        runCli(
+          app,
+          'simulator:webhook',
+          '--attempt',
+          payment.attempts[0].id,
+          '--url',
+          url,
+        );
+
+      await expect(send()).resolves.toMatchObject({
+        out: expect.stringContaining('HTTP 202 accepted') as unknown as string,
+      });
+      await processWebhooks(2);
+      await expect(send()).resolves.toMatchObject({
+        out: expect.stringContaining('HTTP 200 duplicate') as unknown as string,
+      });
+    });
+
     it('delivers a signed simulator event over HTTP from the operator CLI', async () => {
       const payment = await createAwaitingPayment();
-      await app.listen(0, '127.0.0.1');
-      const { port } = (app.getHttpServer() as Server).address() as AddressInfo;
-      const url = `http://127.0.0.1:${port}`;
+      const url = await listeningUrl();
 
       const first = await runCli(
         app,
