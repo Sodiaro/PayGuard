@@ -76,11 +76,18 @@ jobs:
         run: npm run build
 
   docker:
-    name: Docker image
+    name: Docker images and smoke test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build runtime image
-        run: docker build --target runtime --tag payguard-api:ci .
+      # The smoke script uses Node only to generate throwaway credentials and read JSON.
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      # Builds the images and runs the Compose stack (fresh database, migrations, API, standalone
+      # worker) with generated credentials, then removes it, also on failure.
+      - name: Build and smoke-test the Compose stack
+        run: npm run smoke:docker
