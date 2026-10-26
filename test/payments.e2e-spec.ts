@@ -41,7 +41,7 @@ describe('Payments API (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
     globex = await provisionMerchant(app, 'globex');

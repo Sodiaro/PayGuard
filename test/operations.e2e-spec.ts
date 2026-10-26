@@ -10,7 +10,7 @@ import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import request from 'supertest';
 import type { App } from 'supertest/types.js';
-import type { PrismaService } from '../src/database/prisma.service.js';
+import { PrismaService } from '../src/database/prisma.service.js';
 import { OutboxStore } from '../src/outbox/outbox-store.js';
 import type { PaymentResponse } from '../src/payments/payment.responses.js';
 import { PaymentsController } from '../src/payments/payments.controller.js';
@@ -22,10 +22,11 @@ import { paymentsApi, type Merchant } from './support/payments-api.js';
 import { ScriptedProvider } from './support/scripted-provider.js';
 import {
   createTestApp,
+  operatorOf,
   prismaOf,
   provisionMerchant,
 } from './support/test-app.js';
-import { resetDatabase } from './support/test-database.js';
+import { ownerDatabase, resetDatabase } from './support/test-database.js';
 
 describe('Operations (PostgreSQL)', () => {
   const provider = new ScriptedProvider();
@@ -43,7 +44,7 @@ describe('Operations (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
   });
@@ -84,11 +85,14 @@ describe('Operations (PostgreSQL)', () => {
   });
 
   describe('operator audit trail', () => {
+    // The application's role cannot read the audit trail at all; the owner reads it for tests.
     const events = () =>
-      prisma.operatorAuditEvent.findMany({ orderBy: { createdAt: 'asc' } });
+      ownerDatabase().operatorAuditEvent.findMany({
+        orderBy: { createdAt: 'asc' },
+      });
 
     it('records each state-changing command once, with its actor and no secrets', async () => {
-      await resetDatabase(prisma);
+      await resetDatabase();
       const created = await runCli(
         app,
         'merchant:create',
@@ -150,18 +154,26 @@ describe('Operations (PostgreSQL)', () => {
       expect(listed.out).toContain('merchant.reactivated');
     });
 
-    it('keeps audit records append-only for the application', async () => {
+    it('keeps audit records append-only: by privilege for the application, by trigger for the owner', async () => {
       await runCli(app, 'merchant:suspend', '--merchant', 'acme');
       const recorded = (await events()).length;
+      const operator = operatorOf(app).get(PrismaService);
 
+      for (const role of [prisma, operator]) {
+        await expect(
+          role.operatorAuditEvent.updateMany({
+            data: { actor: 'someone-else' },
+          }),
+        ).rejects.toThrow(/permission denied/);
+        await expect(role.operatorAuditEvent.deleteMany()).rejects.toThrow(
+          /permission denied/,
+        );
+      }
       await expect(
-        prisma.operatorAuditEvent.updateMany({
+        ownerDatabase().operatorAuditEvent.updateMany({
           data: { actor: 'someone-else' },
         }),
       ).rejects.toThrow(/append-only/);
-      await expect(prisma.operatorAuditEvent.deleteMany()).rejects.toThrow(
-        /append-only/,
-      );
       await expect(events()).resolves.toHaveLength(recorded);
     });
 
@@ -175,7 +187,7 @@ describe('Operations (PostgreSQL)', () => {
       ).resolves.toMatchObject({ code: 0 });
 
       await expect(
-        prisma.operatorAuditEvent.findMany({
+        ownerDatabase().operatorAuditEvent.findMany({
           where: { action: 'outbox_job.requeued' },
         }),
       ).resolves.toEqual([
@@ -270,7 +282,7 @@ describe('Operations (PostgreSQL)', () => {
       );
       expect(again.out).toContain('Deleted 0 completed outbox jobs');
       await expect(
-        prisma.operatorAuditEvent.count({
+        ownerDatabase().operatorAuditEvent.count({
           where: { action: 'maintenance.pruned' },
         }),
       ).resolves.toBe(2);

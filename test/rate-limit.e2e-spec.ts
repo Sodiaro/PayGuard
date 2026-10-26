@@ -17,7 +17,7 @@ describe('Rate limiting', () => {
   // A fresh app per test gives fresh in-memory limiters.
   beforeEach(async () => {
     app = await createTestApp();
-    await resetDatabase(prismaOf(app));
+    await resetDatabase();
   });
 
   afterEach(async () => {

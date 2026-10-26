@@ -63,7 +63,7 @@ describe('Provider webhook processing (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
   });
@@ -444,11 +444,7 @@ describe('Provider webhook processing (PostgreSQL)', () => {
       const event = eventFor(payment, 'payment.succeeded');
       await deliver(event);
 
-      const restore = await failWritesTo(
-        prisma,
-        'provider_webhook_events',
-        'UPDATE',
-      );
+      const restore = await failWritesTo('provider_webhook_events', 'UPDATE');
       try {
         await processWebhooks();
       } finally {

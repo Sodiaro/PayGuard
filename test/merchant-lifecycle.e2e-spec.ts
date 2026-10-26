@@ -10,7 +10,7 @@ import type { INestApplication } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { parseApiKey } from '../src/auth/api-key.js';
 import { ApiKeyAuthenticator } from '../src/auth/api-key-authenticator.service.js';
-import type { PrismaService } from '../src/database/prisma.service.js';
+import { PrismaService } from '../src/database/prisma.service.js';
 import { MerchantStatus } from '../src/generated/prisma/enums.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
 import {
@@ -19,8 +19,8 @@ import {
   MerchantAlreadyExistsError,
 } from '../src/merchants/merchant-errors.js';
 import { MerchantsService } from '../src/merchants/merchants.service.js';
-import { createTestApp, prismaOf } from './support/test-app.js';
-import { resetDatabase } from './support/test-database.js';
+import { createTestApp, operatorOf, prismaOf } from './support/test-app.js';
+import { ownerDatabase, resetDatabase } from './support/test-database.js';
 
 describe('Merchant lifecycle and API keys (PostgreSQL)', () => {
   let app: INestApplication;
@@ -32,13 +32,14 @@ describe('Merchant lifecycle and API keys (PostgreSQL)', () => {
   beforeAll(async () => {
     app = await createTestApp();
     prisma = prismaOf(app);
-    merchants = app.get(MerchantsService);
-    apiKeys = app.get(ApiKeysService);
+    // Provisioning and revocation are operator actions, so they run with the operator role.
+    merchants = operatorOf(app).get(MerchantsService);
+    apiKeys = operatorOf(app).get(ApiKeysService);
     authenticator = app.get(ApiKeyAuthenticator);
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
   });
 
   afterAll(async () => {
@@ -98,7 +99,7 @@ describe('Merchant lifecycle and API keys (PostgreSQL)', () => {
       const { merchant } = await merchants.provision({ name: 'Acme' });
 
       await expect(
-        prisma.$executeRaw`
+        operatorOf(app).get(PrismaService).$executeRaw`
           INSERT INTO merchant_api_keys (id, merchant_id, prefix, secret_hash)
           VALUES (gen_random_uuid(), ${merchant.id}::uuid, 'feedfacecafebeef',
                   convert_to('pgsk_feedfacecafebeef_plaintext-secret', 'UTF8'))`,
@@ -211,7 +212,7 @@ describe('Merchant lifecycle and API keys (PostgreSQL)', () => {
         name: 'Acme',
         firstKey: { expiresAt: new Date(Date.now() + 60_000) },
       });
-      await prisma.merchantApiKey.update({
+      await ownerDatabase().merchantApiKey.update({
         where: { id: apiKey.id },
         data: { expiresAt: new Date(Date.now() - 1000) },
       });

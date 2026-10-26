@@ -55,7 +55,7 @@ describe('Provider webhook intake (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
 
@@ -352,11 +352,7 @@ describe('Provider webhook intake (PostgreSQL)', () => {
     it('returns a retryable 503 and stores nothing when the event cannot be written', async () => {
       const payment = await createAwaitingPayment();
       const event = eventFor(payment, 'payment.succeeded');
-      const restore = await failWritesTo(
-        prisma,
-        'provider_webhook_events',
-        'INSERT',
-      );
+      const restore = await failWritesTo('provider_webhook_events', 'INSERT');
       try {
         const response = await webhooks.deliver(event).expect(503);
         expect(JSON.stringify(response.body)).not.toMatch(
@@ -374,7 +370,7 @@ describe('Provider webhook intake (PostgreSQL)', () => {
     it('never acknowledges an event whose processing could not be queued', async () => {
       const payment = await createAwaitingPayment();
       const event = eventFor(payment, 'payment.succeeded');
-      const restore = await failWritesTo(prisma, 'outbox_jobs', 'INSERT');
+      const restore = await failWritesTo('outbox_jobs', 'INSERT');
       try {
         await webhooks.deliver(event).expect(503);
       } finally {

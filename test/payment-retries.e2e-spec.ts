@@ -39,7 +39,7 @@ describe('Payment retries (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
     globex = await provisionMerchant(app, 'globex');
@@ -153,7 +153,7 @@ describe('Payment retries (PostgreSQL)', () => {
   it('creates the retry attempt and its job atomically', async () => {
     const payment = await failedPayment();
     const before = await counts();
-    const restore = await failWritesTo(prisma, 'outbox_jobs', 'INSERT');
+    const restore = await failWritesTo('outbox_jobs', 'INSERT');
     try {
       await api.retry(acme, payment.id, 'retry-1').expect(500);
     } finally {

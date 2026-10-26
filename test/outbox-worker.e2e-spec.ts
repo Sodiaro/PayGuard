@@ -7,19 +7,14 @@ import {
   it,
 } from '@jest/globals';
 import type { INestApplication } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import request from 'supertest';
 import type { App } from 'supertest/types.js';
 import { runAdminCli } from '../src/cli/admin-cli.js';
-import { SimulatedWebhookSender } from '../src/cli/simulated-webhook-sender.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
-import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
-import { ApiKeysService } from '../src/merchants/api-keys.service.js';
-import { MerchantsService } from '../src/merchants/merchants.service.js';
 import { OutboxStore } from '../src/outbox/outbox-store.js';
-import { PaymentInvestigator } from '../src/payments/payment-investigation.js';
 import type { PaymentResponse } from '../src/payments/payment.responses.js';
 import { OutboxWorker } from '../src/payments/processing/outbox-worker.js';
+import { cliDependencies } from './support/admin-cli.js';
 import { failWritesTo } from './support/db-faults.js';
 import {
   drainOutbox,
@@ -54,7 +49,7 @@ describe('Outbox and worker (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
   });
@@ -67,7 +62,7 @@ describe('Outbox and worker (PostgreSQL)', () => {
     (await api.create(acme, key).expect(202)).body as PaymentResponse;
 
   it('commits payment, attempt and job together or not at all', async () => {
-    const restore = await failWritesTo(prisma, 'outbox_jobs', 'INSERT');
+    const restore = await failWritesTo('outbox_jobs', 'INSERT');
     try {
       const response = await api.create(acme, 'key-1').expect(500);
       expect(response.body).toMatchObject({
@@ -187,7 +182,7 @@ describe('Outbox and worker (PostgreSQL)', () => {
 
   it('retries internal failures with backoff and recovers once they clear', async () => {
     const payment = await createPayment();
-    const restore = await failWritesTo(prisma, 'payment_attempts', 'UPDATE');
+    const restore = await failWritesTo('payment_attempts', 'UPDATE');
     try {
       await worker.processDueJobs();
     } finally {
@@ -211,7 +206,7 @@ describe('Outbox and worker (PostgreSQL)', () => {
 
   it('parks a job as DEAD after its run limit, visible to health checks and operators', async () => {
     const payment = await createPayment();
-    const restore = await failWritesTo(prisma, 'payment_attempts', 'UPDATE');
+    const restore = await failWritesTo('payment_attempts', 'UPDATE');
     try {
       for (let run = 0; run < 10; run++) {
         await makeJobsDue(prisma);
@@ -246,22 +241,10 @@ describe('Outbox and worker (PostgreSQL)', () => {
 
     const out: string[] = [];
     const run = (...argv: string[]) =>
-      runAdminCli(
-        argv,
-        {
-          merchants: app.get(MerchantsService),
-          apiKeys: app.get(ApiKeysService),
-          outbox: store,
-          audit: new OperatorAuditLog(prismaOf(app)),
-          simulator: new SimulatedWebhookSender(
-            prismaOf(app),
-            app.get(ConfigService),
-          ),
-          investigator: new PaymentInvestigator(prismaOf(app)),
-          actor: 'test-operator',
-        },
-        { out: (line) => out.push(line), err: (line) => out.push(line) },
-      );
+      runAdminCli(argv, cliDependencies(app, 'test-operator'), {
+        out: (line) => out.push(line),
+        err: (line) => out.push(line),
+      });
 
     await expect(run('ops:status')).resolves.toBe(0);
     expect(out.join('\n')).toMatch(/Dead jobs:\s+1/);

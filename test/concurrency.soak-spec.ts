@@ -152,7 +152,7 @@ describe('Concurrency soak (PostgreSQL, worker processes)', () => {
     }
     mkdirSync(runDir, { recursive: true });
     app = await createTestApp();
-    await resetDatabase(prismaOf(app));
+    await resetDatabase();
     await app.listen(0, '127.0.0.1');
     const { port } = (app.getHttpServer() as Server).address() as AddressInfo;
     baseUrl = `http://127.0.0.1:${port}`;

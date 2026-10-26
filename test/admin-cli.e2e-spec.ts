@@ -7,16 +7,10 @@ import {
   it,
 } from '@jest/globals';
 import type { INestApplication } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { ApiKeyAuthenticator } from '../src/auth/api-key-authenticator.service.js';
 import { runAdminCli } from '../src/cli/admin-cli.js';
-import { SimulatedWebhookSender } from '../src/cli/simulated-webhook-sender.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
-import { OperatorAuditLog } from '../src/audit/operator-audit-log.js';
-import { ApiKeysService } from '../src/merchants/api-keys.service.js';
-import { MerchantsService } from '../src/merchants/merchants.service.js';
-import { OutboxStore } from '../src/outbox/outbox-store.js';
-import { PaymentInvestigator } from '../src/payments/payment-investigation.js';
+import { cliDependencies } from './support/admin-cli.js';
 import { createTestApp, prismaOf } from './support/test-app.js';
 import { resetDatabase } from './support/test-database.js';
 
@@ -35,7 +29,7 @@ describe('Admin CLI (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
   });
 
   afterAll(async () => {
@@ -47,18 +41,7 @@ describe('Admin CLI (PostgreSQL)', () => {
     const err: string[] = [];
     const code = await runAdminCli(
       argv,
-      {
-        merchants: app.get(MerchantsService),
-        apiKeys: app.get(ApiKeysService),
-        outbox: app.get(OutboxStore),
-        audit: new OperatorAuditLog(prismaOf(app)),
-        simulator: new SimulatedWebhookSender(
-          prismaOf(app),
-          app.get(ConfigService),
-        ),
-        investigator: new PaymentInvestigator(prismaOf(app)),
-        actor: 'test-operator',
-      },
+      cliDependencies(app, 'test-operator'),
       { out: (line) => out.push(line), err: (line) => err.push(line) },
     );
     const keys = out.flatMap((line) => ISSUED_KEY_LINE.exec(line)?.[1] ?? []);

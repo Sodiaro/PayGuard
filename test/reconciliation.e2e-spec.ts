@@ -32,7 +32,7 @@ import {
   prismaOf,
   provisionMerchant,
 } from './support/test-app.js';
-import { resetDatabase } from './support/test-database.js';
+import { ownerDatabase, resetDatabase } from './support/test-database.js';
 
 describe('Reconciliation of unknown outcomes (PostgreSQL)', () => {
   const provider = new ScriptedProvider();
@@ -50,7 +50,7 @@ describe('Reconciliation of unknown outcomes (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
   });
@@ -265,14 +265,14 @@ describe('Reconciliation of unknown outcomes (PostgreSQL)', () => {
 
   it('sweeps stale pending attempts that have no live job into reconciliation', async () => {
     const payment = await createPayment();
-    await prisma.outboxJob.deleteMany();
+    await ownerDatabase().outboxJob.deleteMany();
     provider.ledger.set(payment.attempts[0].id, {
       outcome: 'succeeded',
       providerReference: 'sim_swept',
     });
 
     await expect(worker.sweepStaleAttempts()).resolves.toBe(0);
-    await ageAttempts(prisma, 3600);
+    await ageAttempts(3600);
     await expect(worker.sweepStaleAttempts()).resolves.toBe(1);
     await expect(worker.sweepStaleAttempts()).resolves.toBe(0);
 
@@ -290,8 +290,7 @@ describe('Recovery across a restart with the simulated provider', () => {
     const before = await createTestApp({
       provider: new SimulatedPaymentProvider(SimulatorOutcome.Succeeded, true),
     });
-    const prismaBefore = prismaOf(before);
-    await resetDatabase(prismaBefore);
+    await resetDatabase();
     const merchant = await provisionMerchant(before, 'acme');
     const created = (
       await paymentsApi(before).create(merchant, 'key-1').expect(202)

@@ -30,7 +30,7 @@ describe('Independent workers running concurrently (PostgreSQL)', () => {
 
   beforeAll(async () => {
     app = await createTestApp({ provider });
-    await resetDatabase(prismaOf(app));
+    await resetDatabase();
     // Separate application contexts: each worker has its own connection pool and worker ID,
     // as standalone worker processes would.
     for (let i = 0; i < 2; i++) {

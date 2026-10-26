@@ -1,6 +1,7 @@
 import type { INestApplication } from '@nestjs/common';
 import type { PrismaService } from '../../src/database/prisma.service.js';
 import { OutboxWorker } from '../../src/payments/processing/outbox-worker.js';
+import { ownerDatabase } from './test-database.js';
 
 // Time is moved by editing timestamps in the test database, so tests never sleep.
 export async function makeJobsDue(prisma: PrismaService): Promise<void> {
@@ -13,11 +14,9 @@ export async function expireLeases(prisma: PrismaService): Promise<void> {
     UPDATE outbox_jobs SET locked_until = now() - interval '1 second' WHERE status = 'PROCESSING'`;
 }
 
-export async function ageAttempts(
-  prisma: PrismaService,
-  seconds: number,
-): Promise<void> {
-  await prisma.$executeRaw`
+// Creation times are not writable by the application's role, so the schema owner rewrites them.
+export async function ageAttempts(seconds: number): Promise<void> {
+  await ownerDatabase().$executeRaw`
     UPDATE payment_attempts SET created_at = created_at - ${seconds} * interval '1 second'`;
 }
 

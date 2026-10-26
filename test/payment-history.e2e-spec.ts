@@ -9,7 +9,7 @@ import {
 import type { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import type { App } from 'supertest/types.js';
-import type { PrismaService } from '../src/database/prisma.service.js';
+import { PrismaService } from '../src/database/prisma.service.js';
 import { OutboxStore } from '../src/outbox/outbox-store.js';
 import type { PaymentResponse } from '../src/payments/payment.responses.js';
 import { AttemptJobProcessor } from '../src/payments/processing/attempt-job-processor.js';
@@ -22,10 +22,11 @@ import { paymentsApi, type Merchant } from './support/payments-api.js';
 import { ScriptedProvider } from './support/scripted-provider.js';
 import {
   createTestApp,
+  operatorOf,
   prismaOf,
   provisionMerchant,
 } from './support/test-app.js';
-import { resetDatabase } from './support/test-database.js';
+import { ownerDatabase, resetDatabase } from './support/test-database.js';
 import {
   eventFor,
   testWebhookSecret,
@@ -52,7 +53,7 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
   });
@@ -348,7 +349,7 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
         source: 'PROVIDER_LOOKUP',
       });
       await expect(
-        prisma.operatorAuditEvent.count({
+        ownerDatabase().operatorAuditEvent.count({
           where: { action: 'outbox_job.requeued', targetId: dead.id },
         }),
       ).resolves.toBe(1);
@@ -383,15 +384,16 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
       );
       await lockHeld;
 
-      const store = app.get(OutboxStore);
+      // Requeueing is an operator action, run with the operator role as the CLI would.
+      const store = operatorOf(app).get(OutboxStore);
       const racing = Promise.all([
         store.requeueDead(dead.id, 'alice'),
         store.requeueDead(dead.id, 'bob'),
       ]);
+      // pg_locks, unlike pg_stat_activity, shows other roles' waits to an unprivileged role.
       for (let waiting = 0; waiting < 2;) {
         [{ waiting }] = await prisma.$queryRaw<{ waiting: number }[]>`
-          SELECT count(*)::int AS waiting FROM pg_stat_activity
-          WHERE datname = current_database() AND wait_event_type = 'Lock'`;
+          SELECT count(DISTINCT pid)::int AS waiting FROM pg_locks WHERE NOT granted`;
       }
       release();
       await blocker;
@@ -399,7 +401,7 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
 
       expect(results.filter(Boolean)).toHaveLength(1);
       await expect(
-        prisma.operatorAuditEvent.count({
+        ownerDatabase().operatorAuditEvent.count({
           where: { action: 'outbox_job.requeued' },
         }),
       ).resolves.toBe(1);
@@ -429,7 +431,7 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
 
     it('rolls back the state change when its history cannot be written, and retries it', async () => {
       const { payment } = await create();
-      const restore = await failWritesTo(prisma, 'payment_events', 'INSERT');
+      const restore = await failWritesTo('payment_events', 'INSERT');
       try {
         await worker.processDueJobs();
       } finally {
@@ -454,7 +456,7 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
     });
 
     it('creates no payment, and no history, when the creation transaction fails', async () => {
-      const restore = await failWritesTo(prisma, 'payment_events', 'INSERT');
+      const restore = await failWritesTo('payment_events', 'INSERT');
       try {
         await api.create(acme, IDEMPOTENCY_KEY).expect(500);
       } finally {
@@ -470,11 +472,23 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
       const { payment } = await create();
       const [event] = await history(payment.id);
 
+      // The application and operator roles hold no UPDATE or DELETE privilege on history at all;
+      // the trigger stops the owner, which does.
+      for (const role of [prisma, operatorOf(app).get(PrismaService)]) {
+        await expect(
+          role.$executeRaw`UPDATE payment_events SET type = 'payment.forged' WHERE id = ${event.id}::uuid`,
+        ).rejects.toThrow(/permission denied/);
+        await expect(
+          role.$executeRaw`DELETE FROM payment_events WHERE id = ${event.id}::uuid`,
+        ).rejects.toThrow(/permission denied/);
+      }
       await expect(
-        prisma.$executeRaw`UPDATE payment_events SET type = 'payment.forged' WHERE id = ${event.id}::uuid`,
+        ownerDatabase()
+          .$executeRaw`UPDATE payment_events SET type = 'payment.forged' WHERE id = ${event.id}::uuid`,
       ).rejects.toThrow(/append-only/);
       await expect(
-        prisma.$executeRaw`DELETE FROM payment_events WHERE id = ${event.id}::uuid`,
+        ownerDatabase()
+          .$executeRaw`DELETE FROM payment_events WHERE id = ${event.id}::uuid`,
       ).rejects.toThrow(/append-only/);
       await expect(history(payment.id)).resolves.toEqual([event]);
     });

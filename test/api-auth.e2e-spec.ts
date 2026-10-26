@@ -14,33 +14,30 @@ import type { App } from 'supertest/types.js';
 import { parseApiKey } from '../src/auth/api-key.js';
 import { AppLogger } from '../src/common/logging/app-logger.js';
 import type { ErrorResponse } from '../src/common/http/error-response.js';
-import type { PrismaService } from '../src/database/prisma.service.js';
 import { MerchantStatus } from '../src/generated/prisma/enums.js';
 import { ApiKeysService } from '../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../src/merchants/merchants.service.js';
 import {
   createTestApp,
-  prismaOf,
+  operatorOf,
   provisionMerchant,
 } from './support/test-app.js';
-import { resetDatabase } from './support/test-database.js';
+import { ownerDatabase, resetDatabase } from './support/test-database.js';
 
 type Merchant = Awaited<ReturnType<typeof provisionMerchant>>;
 
 describe('API-key authentication over HTTP (PostgreSQL)', () => {
   let app: INestApplication<App>;
-  let prisma: PrismaService;
   let acme: Merchant;
   let globex: Merchant;
   let logOutput: string[];
 
   beforeAll(async () => {
     app = await createTestApp({ logger: new AppLogger({ json: true }) });
-    prisma = prismaOf(app);
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     acme = await provisionMerchant(app, 'acme');
     globex = await provisionMerchant(app, 'globex');
 
@@ -90,19 +87,21 @@ describe('API-key authentication over HTTP (PostgreSQL)', () => {
     });
 
     it('answers every invalid credential identically', async () => {
-      const revoked = await app.get(MerchantsService).issueKey('globex', {});
-      await app.get(ApiKeysService).revoke(revoked.apiKey.id);
+      const revoked = await operatorOf(app)
+        .get(MerchantsService)
+        .issueKey('globex', {});
+      await operatorOf(app).get(ApiKeysService).revoke(revoked.apiKey.id);
 
-      const expiring = await app
+      const expiring = await operatorOf(app)
         .get(MerchantsService)
         .issueKey('globex', { expiresAt: new Date(Date.now() + 60_000) });
-      await prisma.merchantApiKey.update({
+      await ownerDatabase().merchantApiKey.update({
         where: { id: expiring.apiKey.id },
         data: { expiresAt: new Date(Date.now() - 1000) },
       });
 
       const suspended = await provisionMerchant(app, 'initech');
-      await app
+      await operatorOf(app)
         .get(MerchantsService)
         .setStatus('initech', MerchantStatus.SUSPENDED);
 

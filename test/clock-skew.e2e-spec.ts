@@ -21,6 +21,7 @@ import { paymentsApi, type Merchant } from './support/payments-api.js';
 import { ScriptedProvider } from './support/scripted-provider.js';
 import {
   createTestApp,
+  operatorOf,
   prismaOf,
   provisionMerchant,
 } from './support/test-app.js';
@@ -71,7 +72,7 @@ describe('Scheduling when the application clock disagrees with PostgreSQL', () =
   });
 
   beforeEach(async () => {
-    await resetDatabase(prisma);
+    await resetDatabase();
     provider.reset();
     acme = await provisionMerchant(app, 'acme');
   });
@@ -142,7 +143,7 @@ describe('Scheduling when the application clock disagrees with PostgreSQL', () =
 
     skewApplicationClock(SKEW_MS);
     await expect(
-      app.get(OutboxStore).requeueDead(dead.id, 'test-operator'),
+      operatorOf(app).get(OutboxStore).requeueDead(dead.id, 'test-operator'),
     ).resolves.toBe(true);
     await processDueJobsExpecting(app, prisma, 1);
   });

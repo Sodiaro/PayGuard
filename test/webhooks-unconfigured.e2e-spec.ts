@@ -13,7 +13,7 @@ describe('Provider webhooks without a configured secret', () => {
 
   beforeAll(async () => {
     app = await createTestApp();
-    await resetDatabase(prismaOf(app));
+    await resetDatabase();
   });
 
   afterAll(async () => {
