@@ -93,24 +93,26 @@ the stack with `docker compose down`; add `-v` to delete the database volume as 
 
 ## Commands
 
-| Command                     | Purpose                                                             |
-| --------------------------- | ------------------------------------------------------------------- |
-| `npm run start:dev`         | Start the API with file watching                                    |
-| `npm run build`             | Compile to `dist/`                                                  |
-| `npm run start:prod`        | Run the compiled app (`node dist/main.js`)                          |
-| `npm run start:worker`      | Run the compiled standalone worker (`node dist/worker.js`)          |
-| `npm run admin -- <cmd>`    | Build, then run the operator CLI (see [Operations](#operations))    |
-| `npm test`                  | Unit tests (no database needed)                                     |
-| `npm run test:cov`          | Unit tests with a coverage report in `coverage/`                    |
-| `npm run test:e2e`          | Integration and HTTP tests against PostgreSQL (`TEST_DATABASE_URL`) |
-| `npm run lint`              | ESLint with type-aware rules (`lint:fix` to auto-fix)               |
-| `npm run format:check`      | Check Prettier formatting (`format` to rewrite files)               |
-| `npm run typecheck`         | Type-check sources and tests without emitting output                |
-| `npm run prisma:generate`   | Regenerate the Prisma client after editing the schema               |
-| `npm run prisma:validate`   | Validate `prisma/schema.prisma`                                     |
-| `npm run db:migrate:dev`    | Create and apply a migration in development                         |
-| `npm run db:migrate:deploy` | Apply pending migrations (CI, Docker, production)                   |
-| `npm run db:migrate:check`  | Fail if the migrated database and `schema.prisma` differ (CI)       |
+| Command                     | Purpose                                                                 |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `npm run start:dev`         | Start the API with file watching                                        |
+| `npm run build`             | Compile to `dist/`                                                      |
+| `npm run start:prod`        | Run the compiled app (`node dist/main.js`)                              |
+| `npm run start:worker`      | Run the compiled standalone worker (`node dist/worker.js`)              |
+| `npm run admin -- <cmd>`    | Build, then run the operator CLI (see [Operations](#operations))        |
+| `npm test`                  | Unit tests (no database needed)                                         |
+| `npm run test:cov`          | Unit tests with a coverage report in `coverage/`                        |
+| `npm run test:e2e`          | Integration and HTTP tests against PostgreSQL (`TEST_DATABASE_URL`)     |
+| `npm run test:soak`         | Opt-in concurrency soak with worker processes (see [Testing](#testing)) |
+| `npm run smoke:docker`      | Build and smoke-test the Compose stack in an isolated project           |
+| `npm run lint`              | ESLint with type-aware rules (`lint:fix` to auto-fix)                   |
+| `npm run format:check`      | Check Prettier formatting (`format` to rewrite files)                   |
+| `npm run typecheck`         | Type-check sources and tests without emitting output                    |
+| `npm run prisma:generate`   | Regenerate the Prisma client after editing the schema                   |
+| `npm run prisma:validate`   | Validate `prisma/schema.prisma`                                         |
+| `npm run db:migrate:dev`    | Create and apply a migration in development                             |
+| `npm run db:migrate:deploy` | Apply pending migrations (CI, Docker, production)                       |
+| `npm run db:migrate:check`  | Fail if the migrated database and `schema.prisma` differ (CI)           |
 
 ## Configuration
 
@@ -391,6 +393,16 @@ POST /v1/payments ──► one transaction: payment + attempt #1 (PENDING) + PR
 - **Leases:** a job whose worker dies or stalls becomes claimable again when its lease expires
   (recorded as `LEASE_EXPIRED`). Every job update is fenced by the lease token, so a worker whose
   lease was taken over cannot complete or reschedule the job.
+- **One clock for scheduling:** PostgreSQL's. When a job becomes due (on creation, after a
+  backoff, after a requeue), when its lease expires, and whether a worker's heartbeat is recent
+  are all computed with `now()` in the statement that writes them, and judged with `now()` when
+  claiming or reporting. Application hosts therefore need no clock agreement with the database
+  for any scheduling decision: a container VM that resumes from host sleep with a lagging clock
+  cannot make new work look not yet due, or delayed work look overdue. The application's clock
+  still stamps record times (`created_at`, `completed_at`), used for history and reporting only;
+  the stale sweep compares an attempt's `created_at` with `now()`, so a clock difference shifts
+  when it notices an attempt by that much, which is harmless because it only queues a lookup for
+  attempts without live work.
 - **No transaction spans a provider call.** Provider calls have a 10 s timeout. The outcome and the
   job's completion are written in the same transaction, so a job is never marked done before its
   result is stored.
@@ -608,8 +620,8 @@ npm run admin -- simulator:webhook --attempt <attempt-id> [--type payment.declin
 ```
 
 The type defaults to the configured `PAYMENT_SIMULATOR_OUTCOME`, and the event's `createdAt` to
-the attempt's submission time, so running the command again redelivers the same event (a
-duplicate). With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, a webhook resolves a `PENDING`
+the attempt's creation time, so running the command again, before or after the worker submits
+the attempt, redelivers the same event (a duplicate). With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, a webhook resolves a `PENDING`
 payment before its delayed lookup runs, which then finds nothing left to do.
 
 ### Rate limiting
@@ -951,7 +963,8 @@ src/
 prisma/
 ├── schema.prisma
 └── migrations/
-test/                       # Integration and HTTP tests against real PostgreSQL
+test/                       # Integration and HTTP tests against real PostgreSQL, and the soak test
+scripts/docker-smoke.sh     # Compose stack smoke test (npm run smoke:docker, CI)
 ```
 
 Payment providers plug in as `PaymentProvider` implementations bound to the `PAYMENT_PROVIDER`
@@ -1090,11 +1103,69 @@ token; the payment domain depends only on that interface.
     the provider). The append-only trigger and the actor constraint are enforced. The
     investigation commands' filtering, ordering, diagnoses and verdicts are checked, and they
     show no key, secret, idempotency key or fingerprint. The merchant API exposes no history.
+  - Scheduling with the application clock two minutes ahead of and behind PostgreSQL's: new and
+    requeued work is due at once, a delayed lookup and a retry backoff still wait their full
+    delay, and worker liveness is unaffected.
+  - Independent workers (separate connection pools and worker IDs) running their poll loops
+    while payments, duplicate requests and lookups that become due arrive: every attempt is
+    submitted once, looked up once and resolved once.
 - Tests swap the provider through `createTestApp({ provider })`. The `ScriptedProvider` test
   double keeps a ledger of what it "processed", can lose answers, fail or hold a call open, and
   counts submissions and lookups. Tests drive the worker directly (`processDueJobs()`), and move
-  time by editing timestamps in the test database, so none of them sleep. Failures are injected
+  time by editing timestamps in the test database with its own clock, so none of them sleep
+  (tests of running worker loops wait for a condition, within a deadline). Failures are injected
   with temporary triggers in that database.
+- When a worker batch handles a different number of jobs than a test expects, the failure lists
+  both clocks and every job's status, due time, lease and last error (`processDueJobsExpecting`
+  in `test/support/outbox.ts`).
+
+### Concurrency soak test
+
+`npm run test:soak` builds the project and runs `test/concurrency.soak-spec.ts`. That is a
+functional soak, not a performance benchmark. It runs against the test database, with the same
+`_test` safeguards and truncation as the integration tests, and checks behaviour under
+concurrency; its timings describe the machine and run that produced them, nothing more. It:
+
+- serves the API on a local port and starts `SOAK_WORKERS` real worker processes
+  (`node dist/worker.js`);
+- runs `SOAK_CLIENTS` concurrent HTTP clients for `SOAK_DURATION_SECONDS`, each making seeded
+  random choices (`SOAK_SEED`) between creating payments (sometimes the same request twice at
+  once), delivering signed webhooks (sometimes twice), and retrying failed payments (sometimes
+  twice); the simulator loses every submission's answer and declines everything, so every
+  attempt goes through reconciliation, races webhooks, and is retried up to the attempt limit;
+- kills one worker with `SIGKILL` half-way and starts a replacement (`SOAK_KILL_WORKER=false`
+  to skip), so work it held must be recovered through lease expiry;
+- waits up to `SOAK_DRAIN_SECONDS` for every attempt and job to settle, then checks with SQL
+  that each payment agrees with its latest attempt, attempt numbers are contiguous and within
+  the limit, every finished attempt has exactly one resolution in its history and none was
+  submitted twice, accepted retries match retry attempts, no payment belongs to the wrong
+  merchant, no job is dead, nothing is unresolved, and there is exactly one payment per key and
+  one stored event per acknowledged webhook;
+- writes `soak-results/<time>/summary.json` (settings, request counts and status codes,
+  latency p50/p95/p99 per operation, throughput, outcome counts, lease recoveries, violations)
+  and worker logs, plus `outbox-diagnostics.txt` when anything failed.
+
+```bash
+SOAK_DURATION_SECONDS=120 SOAK_CLIENTS=16 SOAK_WORKERS=4 npm run test:soak
+```
+
+### Docker smoke test
+
+`npm run smoke:docker` (`scripts/docker-smoke.sh`, Bash, needs Docker, Node and curl) builds the
+images from the checkout and starts the full Compose stack as its own project
+(`payguard-smoke`, ports `SMOKE_API_PORT`/`SMOKE_DB_PORT`, default 3180/5480) with generated
+throwaway credentials and its own volume, so local development data is never touched. It
+checks:
+
+- the migrate job applies every migration to the fresh database;
+- a payment is resolved by a signed webhook, and a second delivery is recognised as a duplicate;
+- forged and unsigned webhooks get `401`, and the simulator command is refused in production;
+- a payment is resolved by the reconciliation lookup in the standalone worker;
+- `payment:inspect`, `payments:unresolved`, `ops:status` and `ops:metrics` agree;
+- neither the webhook secret nor the API key appears in the logs.
+
+It removes its containers, network and volume on exit, after a failure or a cancellation too,
+printing the services' recent logs when it fails.
 
 ### Test database
 
@@ -1116,7 +1187,10 @@ token; the payment domain depends only on that interface.
 1. **verify**: `npm ci` → `format:check` → `lint` → `typecheck` → `prisma:validate` → unit tests
    → `db:migrate:deploy` → `db:migrate:check` → integration tests (PostgreSQL 18 service
    container) → `build`.
-2. **docker**: builds the runtime image so Dockerfile changes are verified.
+2. **docker**: `npm run smoke:docker`, which builds the images and smoke-tests the whole Compose
+   stack (see [Docker smoke test](#docker-smoke-test)).
+
+The soak test is not part of CI: run it on demand.
 
 Each CI step calls the same npm scripts you run locally.
 
@@ -1151,6 +1225,9 @@ Each CI step calls the same npm scripts you run locally.
   by the sender. The secret is shared with the operator CLI's simulator sender.
 - **Webhook timestamps rely on clocks.** Server and sender clocks must agree within
   `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`; deduplication still covers replays inside that window.
+  This is the only place host clock agreement matters; job scheduling uses PostgreSQL's clock.
+- **No load benchmark.** The soak test checks correctness under concurrency on one machine and
+  one database; capacity has not been measured.
 - **Conflicts need a person.** Distrusted webhooks and contradicting provider answers are
   recorded and logged, not resolved: a final outcome is never changed automatically, even when
   the provider later reports a different one, and there is no command to change one by hand.
