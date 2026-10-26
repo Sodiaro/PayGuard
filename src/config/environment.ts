@@ -13,6 +13,7 @@ import {
   ValidateBy,
 } from 'class-validator';
 import { isIP } from 'node:net';
+import { PaymentProviderName } from '../payments/providers/payment-provider.js';
 import { SimulatorOutcome } from '../payments/providers/simulated-payment-provider.js';
 
 export enum NodeEnvironment {
@@ -74,18 +75,32 @@ function IsTrustedProxyList(): PropertyDecorator {
   });
 }
 
-// Settings every process needs: the API, the standalone worker and the operator CLI.
-export class CoreEnvironment {
+const POSTGRES_URL = /^postgres(ql)?:\/\/.+/;
+
+// The simulator records payments as succeeded or declined without any money moving, so it is
+// refused outright in production; there is no override.
+function NotSimulatedInProduction(): PropertyDecorator {
+  return ValidateBy({
+    name: 'notSimulatedInProduction',
+    validator: {
+      validate: (value: unknown, args) =>
+        !(
+          value === PaymentProviderName.Simulator &&
+          (args?.object as { NODE_ENV?: unknown }).NODE_ENV ===
+            NodeEnvironment.Production
+        ),
+      defaultMessage: () =>
+        'PAYMENT_PROVIDER=simulator is not allowed when NODE_ENV=production: it records payments that no provider processed',
+    },
+  });
+}
+
+// Settings every process shares, apart from how it connects to the database. NODE_ENV has no
+// default: a deployment that forgets it must not silently run with development behaviour.
+class SharedEnvironment {
   @Expose()
   @IsEnum(NodeEnvironment)
-  NODE_ENV: NodeEnvironment = NodeEnvironment.Development;
-
-  @Expose()
-  @IsString()
-  @Matches(/^postgres(ql)?:\/\/.+/, {
-    message: 'DATABASE_URL must be a postgresql:// connection string',
-  })
-  DATABASE_URL: string;
+  NODE_ENV: NodeEnvironment;
 
   // Operator-controlled outcome of the simulated provider; merchants cannot influence it.
   @Expose()
@@ -136,6 +151,7 @@ export class CoreEnvironment {
 
   // Recorded as the actor of operator CLI actions; defaults to the OS user and host.
   @Expose()
+  @EmptyAsUnset()
   @IsOptional()
   @Matches(/^[\x20-\x7E]{1,200}$/, {
     message: 'PAYGUARD_OPERATOR must be 1-200 printable ASCII characters',
@@ -155,8 +171,41 @@ export class CoreEnvironment {
   SIMULATOR_WEBHOOK_SECRET?: string;
 }
 
+// Shared settings plus the runtime database connection, which has the application's privileges
+// only (see the README on database roles).
+export class CoreEnvironment extends SharedEnvironment {
+  @Expose()
+  @IsString()
+  @Matches(POSTGRES_URL, {
+    message: 'DATABASE_URL must be a postgresql:// connection string',
+  })
+  DATABASE_URL: string;
+}
+
+// Processes that submit payments or record their outcomes: the API (which also hosts the worker
+// unless disabled) and the standalone worker. There is no default provider.
+export class ProcessingEnvironment extends CoreEnvironment {
+  @Expose()
+  @IsEnum(PaymentProviderName, {
+    message: `PAYMENT_PROVIDER must be one of: ${Object.values(PaymentProviderName).join(', ')}`,
+  })
+  @NotSimulatedInProduction()
+  PAYMENT_PROVIDER: PaymentProviderName;
+}
+
+// The operator CLI connects with its own, operator-privileged role and never with DATABASE_URL,
+// so running it cannot borrow the application's credentials or vice versa.
+export class OperatorEnvironment extends SharedEnvironment {
+  @Expose()
+  @IsString()
+  @Matches(POSTGRES_URL, {
+    message: 'OPERATOR_DATABASE_URL must be a postgresql:// connection string',
+  })
+  OPERATOR_DATABASE_URL: string;
+}
+
 // Settings of the HTTP API process only.
-export class ApiEnvironment extends CoreEnvironment {
+export class ApiEnvironment extends ProcessingEnvironment {
   @Expose()
   @Type(() => Number)
   @IsInt()
@@ -236,10 +285,21 @@ export class ApiEnvironment extends CoreEnvironment {
   WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: number = 300;
 }
 
-export function validateCoreEnvironment(
+export function validateProcessingEnvironment(
+  config: Record<string, unknown>,
+): ProcessingEnvironment {
+  return validateAs(ProcessingEnvironment, config);
+}
+
+// Returned as a CoreEnvironment whose DATABASE_URL is the operator connection, so shared code
+// (PrismaService) connects the CLI with operator privileges without knowing about them.
+export function validateOperatorEnvironment(
   config: Record<string, unknown>,
 ): CoreEnvironment {
-  return validateAs(CoreEnvironment, config);
+  const environment = validateAs(OperatorEnvironment, config);
+  return Object.assign(new CoreEnvironment(), environment, {
+    DATABASE_URL: environment.OPERATOR_DATABASE_URL,
+  });
 }
 
 export function validateApiEnvironment(

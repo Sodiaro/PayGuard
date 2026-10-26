@@ -1,5 +1,11 @@
 export const PAYMENT_PROVIDER = Symbol('PAYMENT_PROVIDER');
 
+// Providers PAYMENT_PROVIDER can select. The simulator is the only implementation and is refused
+// in production (see src/config/environment.ts).
+export enum PaymentProviderName {
+  Simulator = 'simulator',
+}
+
 export const PROVIDER_CALL_TIMEOUT_MS = 10_000;
 
 export class ProviderTimeoutError extends Error {

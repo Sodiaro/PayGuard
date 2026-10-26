@@ -1,14 +1,23 @@
 import { describe, expect, it } from '@jest/globals';
+import { PaymentProviderName } from '../payments/providers/payment-provider.js';
 import { SimulatorOutcome } from '../payments/providers/simulated-payment-provider.js';
 import {
   isTrustedProxyEntry,
   NodeEnvironment,
   validateApiEnvironment,
-  validateCoreEnvironment,
+  validateOperatorEnvironment,
+  validateProcessingEnvironment,
 } from './environment.js';
 
 const DATABASE_URL =
   'postgresql://payguard:s3cret-value@localhost:5432/payguard';
+
+// Variables with no default.
+const REQUIRED = {
+  NODE_ENV: 'development',
+  DATABASE_URL,
+  PAYMENT_PROVIDER: 'simulator',
+};
 
 const CORE_DEFAULTS = {
   NODE_ENV: NodeEnvironment.Development,
@@ -24,8 +33,9 @@ const CORE_DEFAULTS = {
 
 describe('validateApiEnvironment', () => {
   it('applies defaults when only the required variables are set', () => {
-    expect(validateApiEnvironment({ DATABASE_URL })).toEqual({
+    expect(validateApiEnvironment(REQUIRED)).toEqual({
       ...CORE_DEFAULTS,
+      PAYMENT_PROVIDER: PaymentProviderName.Simulator,
       PORT: 3000,
       SWAGGER_ENABLED: false,
       CORS_ALLOWED_ORIGINS: [],
@@ -42,18 +52,19 @@ describe('validateApiEnvironment', () => {
   it('accepts a webhook secret and treats an empty one as unset', () => {
     const secret = 'whsec-0123456789abcdef0123456789abcdef';
     expect(
-      validateApiEnvironment({ DATABASE_URL, SIMULATOR_WEBHOOK_SECRET: secret })
+      validateApiEnvironment({ ...REQUIRED, SIMULATOR_WEBHOOK_SECRET: secret })
         .SIMULATOR_WEBHOOK_SECRET,
     ).toBe(secret);
     expect(
-      validateApiEnvironment({ DATABASE_URL, SIMULATOR_WEBHOOK_SECRET: '' })
+      validateApiEnvironment({ ...REQUIRED, SIMULATOR_WEBHOOK_SECRET: '' })
         .SIMULATOR_WEBHOOK_SECRET,
     ).toBeUndefined();
   });
 
   it('converts string values and drops undeclared variables', () => {
     const environment = validateApiEnvironment({
-      NODE_ENV: 'production',
+      NODE_ENV: 'test',
+      PAYMENT_PROVIDER: 'simulator',
       PORT: '8080',
       DATABASE_URL,
       SWAGGER_ENABLED: 'true',
@@ -77,7 +88,8 @@ describe('validateApiEnvironment', () => {
     });
 
     expect(environment).toEqual({
-      NODE_ENV: NodeEnvironment.Production,
+      NODE_ENV: NodeEnvironment.Test,
+      PAYMENT_PROVIDER: PaymentProviderName.Simulator,
       DATABASE_URL,
       PAYMENT_SIMULATOR_OUTCOME: SimulatorOutcome.Declined,
       PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: true,
@@ -131,7 +143,7 @@ describe('validateApiEnvironment', () => {
     ['WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS', '3600'],
   ])('rejects %s=%s', (name, value) => {
     expect(() =>
-      validateApiEnvironment({ DATABASE_URL, [name]: value }),
+      validateApiEnvironment({ ...REQUIRED, [name]: value }),
     ).toThrow(new RegExp(name));
   });
 
@@ -139,66 +151,171 @@ describe('validateApiEnvironment', () => {
     'rejects CORS_ALLOWED_ORIGINS=%s',
     (origins) => {
       expect(() =>
-        validateApiEnvironment({ DATABASE_URL, CORS_ALLOWED_ORIGINS: origins }),
+        validateApiEnvironment({ ...REQUIRED, CORS_ALLOWED_ORIGINS: origins }),
       ).toThrow(/CORS_ALLOWED_ORIGINS/);
     },
   );
 
   it('rejects a missing or non-PostgreSQL DATABASE_URL', () => {
-    expect(() => validateApiEnvironment({})).toThrow(/DATABASE_URL/);
     expect(() =>
-      validateApiEnvironment({ DATABASE_URL: 'mysql://localhost/payguard' }),
+      validateApiEnvironment({ ...REQUIRED, DATABASE_URL: undefined }),
+    ).toThrow(/DATABASE_URL/);
+    expect(() =>
+      validateApiEnvironment({
+        ...REQUIRED,
+        DATABASE_URL: 'mysql://localhost/payguard',
+      }),
     ).toThrow(/postgresql:\/\/ connection string/);
   });
 
   it.each(['0', '70000', 'abc'])('rejects PORT=%s', (port) => {
-    expect(() => validateApiEnvironment({ DATABASE_URL, PORT: port })).toThrow(
+    expect(() => validateApiEnvironment({ ...REQUIRED, PORT: port })).toThrow(
       /PORT/,
     );
   });
 
   it('rejects ambiguous boolean values instead of guessing', () => {
     expect(() =>
-      validateApiEnvironment({ DATABASE_URL, SWAGGER_ENABLED: 'yes' }),
+      validateApiEnvironment({ ...REQUIRED, SWAGGER_ENABLED: 'yes' }),
     ).toThrow(/SWAGGER_ENABLED/);
   });
 
   it('never includes variable values in the error message', () => {
     expect(() =>
       validateApiEnvironment({
-        DATABASE_URL,
+        ...REQUIRED,
         PORT: 'not-a-port',
         NODE_ENV: 'x',
       }),
     ).toThrow(expect.not.stringContaining('s3cret-value'));
     expect(() =>
       validateApiEnvironment({
-        DATABASE_URL,
+        ...REQUIRED,
         SIMULATOR_WEBHOOK_SECRET: 'short-secret-value',
       }),
     ).toThrow(expect.not.stringContaining('short-secret-value'));
   });
 });
 
-describe('validateCoreEnvironment', () => {
-  it('validates only what non-HTTP processes need', () => {
+describe('payment provider selection', () => {
+  const PRODUCTION = { ...REQUIRED, NODE_ENV: 'production' };
+
+  it.each([
+    ['the API', validateApiEnvironment],
+    ['the standalone worker', validateProcessingEnvironment],
+  ])(
+    'requires an explicit, supported provider for %s',
+    (_process, validate) => {
+      expect(() =>
+        validate({ ...REQUIRED, PAYMENT_PROVIDER: undefined }),
+      ).toThrow(/PAYMENT_PROVIDER must be one of: simulator/);
+      expect(() =>
+        validate({ ...REQUIRED, PAYMENT_PROVIDER: 'stripe' }),
+      ).toThrow(/PAYMENT_PROVIDER must be one of/);
+      expect(() => validate({ ...REQUIRED, PAYMENT_PROVIDER: '' })).toThrow(
+        /PAYMENT_PROVIDER/,
+      );
+      expect(validate(REQUIRED).PAYMENT_PROVIDER).toBe('simulator');
+    },
+  );
+
+  it.each([
+    ['the API', validateApiEnvironment],
+    ['the standalone worker', validateProcessingEnvironment],
+  ])('refuses the simulator in production for %s', (_process, validate) => {
+    expect(() => validate(PRODUCTION)).toThrow(
+      /PAYMENT_PROVIDER=simulator is not allowed when NODE_ENV=production/,
+    );
+    expect(() =>
+      validate({ ...PRODUCTION, PAYMENT_PROVIDER: undefined }),
+    ).toThrow(/PAYMENT_PROVIDER must be one of/);
+  });
+
+  it.each(['development', 'test'])(
+    'allows the simulator with NODE_ENV=%s',
+    (env) => {
+      expect(
+        validateProcessingEnvironment({ ...REQUIRED, NODE_ENV: env })
+          .PAYMENT_PROVIDER,
+      ).toBe('simulator');
+    },
+  );
+
+  it.each([
+    ['the API', validateApiEnvironment],
+    ['the standalone worker', validateProcessingEnvironment],
+    [
+      'the operator CLI',
+      (config: Record<string, unknown>) =>
+        validateOperatorEnvironment({
+          ...config,
+          OPERATOR_DATABASE_URL: DATABASE_URL,
+        }),
+    ],
+  ])('requires NODE_ENV to be set explicitly for %s', (_process, validate) => {
+    expect(() => validate({ ...REQUIRED, NODE_ENV: undefined })).toThrow(
+      /NODE_ENV must be one of the following values: development, test, production/,
+    );
+  });
+});
+
+describe('validateProcessingEnvironment', () => {
+  it('validates only what the standalone worker needs', () => {
     expect(
-      validateCoreEnvironment({
-        DATABASE_URL,
+      validateProcessingEnvironment({
+        ...REQUIRED,
         PORT: 'not-a-port',
         TRUSTED_PROXIES: '0.0.0.0/0',
       }),
-    ).toEqual(CORE_DEFAULTS);
+    ).toEqual({
+      ...CORE_DEFAULTS,
+      PAYMENT_PROVIDER: PaymentProviderName.Simulator,
+    });
   });
 
   it('still requires the shared settings', () => {
-    expect(() => validateCoreEnvironment({})).toThrow(/DATABASE_URL/);
     expect(() =>
-      validateCoreEnvironment({ DATABASE_URL, OUTBOX_LEASE_SECONDS: '5' }),
+      validateProcessingEnvironment({ ...REQUIRED, DATABASE_URL: undefined }),
+    ).toThrow(/DATABASE_URL/);
+    expect(() =>
+      validateProcessingEnvironment({ ...REQUIRED, OUTBOX_LEASE_SECONDS: '5' }),
     ).toThrow(/OUTBOX_LEASE_SECONDS/);
   });
 });
 
+describe('validateOperatorEnvironment', () => {
+  const OPERATOR_DATABASE_URL =
+    'postgresql://payguard_cli:op3rator-value@localhost:5432/payguard';
+
+  it('connects with the operator URL, never the runtime DATABASE_URL, and needs no provider', () => {
+    const environment = validateOperatorEnvironment({
+      NODE_ENV: 'production',
+      DATABASE_URL,
+      OPERATOR_DATABASE_URL,
+    });
+
+    expect(environment.DATABASE_URL).toBe(OPERATOR_DATABASE_URL);
+    expect(environment).not.toHaveProperty('PAYMENT_PROVIDER');
+  });
+
+  it('treats an empty PAYGUARD_OPERATOR, as Compose passes an unset one, as unset', () => {
+    expect(
+      validateOperatorEnvironment({
+        NODE_ENV: 'development',
+        OPERATOR_DATABASE_URL,
+        PAYGUARD_OPERATOR: '',
+      }).PAYGUARD_OPERATOR,
+    ).toBeUndefined();
+  });
+
+  it('refuses to fall back to DATABASE_URL when OPERATOR_DATABASE_URL is missing', () => {
+    expect(() =>
+      validateOperatorEnvironment({ NODE_ENV: 'development', DATABASE_URL }),
+    ).toThrow(
+      /OPERATOR_DATABASE_URL must be a postgresql:\/\/ connection string/,
+    );
+  });
+});
 describe('isTrustedProxyEntry', () => {
   it.each([
     'loopback',
