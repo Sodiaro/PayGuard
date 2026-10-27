@@ -67,7 +67,11 @@ SQL
 
   # A database created before this script existed holds objects owned by whoever migrated it
   # (typically the bootstrap superuser). Hand them to the owner role so migrations can run as it.
+  # `prisma migrate reset` recreates the public schema owned by whoever ran it and usable by no one
+  # else; restore PostgreSQL's default of the database owner owning it and every role using it.
   run_psql --dbname "$database" <<'SQL'
+ALTER SCHEMA public OWNER TO pg_database_owner;
+GRANT USAGE ON SCHEMA public TO PUBLIC;
 DO $$
 DECLARE
   item record;
