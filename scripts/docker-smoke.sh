@@ -156,10 +156,16 @@ refuses worker 'NODE_ENV must be one of the following values' -e NODE_ENV=
   fail "a refused process changed payments"
 
 step "Least-privilege database roles"
-connected=$(compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c \
-  "SELECT string_agg(DISTINCT usename, ',' ORDER BY usename) FROM pg_stat_activity
-   WHERE datname = current_database() AND pid <> pg_backend_pid()")
-[ "$connected" = payguard_app ] || fail "API and worker connect as: $connected"
+# Matched by container address: health checks and just-closed psql sessions come and go
+# concurrently. The request keeps one of the API's pooled connections open (idle timeout 10 s).
+payment_status "$first_id" >/dev/null
+for service in api worker; do
+  address=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+    "$(compose ps -q "$service")")
+  connected=$(compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c \
+    "SELECT string_agg(DISTINCT usename, ',') FROM pg_stat_activity WHERE client_addr = '$address'")
+  [ "$connected" = payguard_app ] || fail "$service connects as: ${connected:-nobody}"
+done
 for statement in 'DELETE FROM payment_events' "UPDATE operator_audit_events SET actor = 'x'" \
   'ALTER TABLE payment_events DISABLE TRIGGER payment_events_append_only' 'CREATE ROLE intruder'; do
   for role in payguard_app:"$PAYGUARD_APP_PASSWORD" payguard_cli:"$PAYGUARD_CLI_PASSWORD"; do
