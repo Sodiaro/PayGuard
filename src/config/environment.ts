@@ -134,6 +134,11 @@ class SharedEnvironment {
     SimulatorOutcome.Succeeded;
 
   @Expose()
+  @IsEnum(SimulatorOutcome)
+  PAYMENT_SIMULATOR_PAYOUT_OUTCOME: SimulatorOutcome =
+    SimulatorOutcome.Succeeded;
+
+  @Expose()
   @StrictBoolean()
   @IsBoolean()
   PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS: boolean = false;

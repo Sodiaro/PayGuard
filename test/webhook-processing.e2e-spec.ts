@@ -18,7 +18,7 @@ import {
 } from '../src/cli/simulated-webhook-sender.js';
 import type { CoreEnvironment } from '../src/config/environment.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
-import { OutboxStore } from '../src/outbox/outbox-store.js';
+import { OutboxStore, type PaymentJob } from '../src/outbox/outbox-store.js';
 import type { PaymentResponse } from '../src/payments/payment.responses.js';
 import { OutboxWorker } from '../src/payments/processing/outbox-worker.js';
 import { SimulatorOutcome } from '../src/payments/providers/simulated-payment-provider.js';
@@ -429,7 +429,7 @@ describe('Provider webhook processing (PostgreSQL)', () => {
       const applied = await attemptOf(payment);
       const processed = await storedEvent(event);
 
-      await app.get(ProviderWebhookProcessor).process(stalled);
+      await app.get(ProviderWebhookProcessor).process(stalled as PaymentJob);
 
       await expect(attemptOf(payment)).resolves.toEqual(applied);
       await expect(storedEvent(event)).resolves.toEqual(processed);

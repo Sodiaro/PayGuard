@@ -8,6 +8,8 @@ import {
   OutboxJobType,
   PaymentAttemptStatus,
   PaymentFailureCode,
+  PayoutFailureCode,
+  PayoutStatus,
   ProviderWebhookEventResult,
   ProviderWebhookEventStatus,
   RefundFailureCode,
@@ -88,6 +90,18 @@ const stats: OutboxStats = {
   unresolvedPaymentActions: 0,
   paymentActionsAwaitingOperator: 0,
   authorizedPayments: 2,
+  payouts: [
+    { status: PayoutStatus.SUCCEEDED, failureCode: null, count: 5 },
+    {
+      status: PayoutStatus.FAILED,
+      failureCode: PayoutFailureCode.PROVIDER_UNAVAILABLE,
+      count: 1,
+    },
+  ],
+  unresolvedPayouts: 1,
+  oldestUnresolvedPayoutAgeSeconds: 12,
+  payoutsAwaitingOperator: 0,
+  payoutResultConflicts: 0,
 };
 
 describe('renderPrometheusMetrics', () => {
@@ -137,6 +151,10 @@ describe('renderPrometheusMetrics', () => {
     expect(output).toContain(
       'payguard_payment_actions{type="CAPTURE",status="SUCCEEDED"} 3',
     );
+    expect(output).toContain(
+      'payguard_payouts{status="FAILED",failure_code="PROVIDER_UNAVAILABLE"} 1',
+    );
+    expect(output).toContain('payguard_payouts_unresolved 1');
   });
 
   it('uses only bounded labels, never identifiers', () => {

@@ -8,7 +8,10 @@ import { SimulatedWebhookSender } from '../../src/cli/simulated-webhook-sender.j
 import { ApiKeysService } from '../../src/merchants/api-keys.service.js';
 import { MerchantsService } from '../../src/merchants/merchants.service.js';
 import { OutboxStore } from '../../src/outbox/outbox-store.js';
-import { PaymentInvestigator } from '../../src/payments/payment-investigation.js';
+import {
+  PaymentInvestigator,
+  PayoutInvestigator,
+} from '../../src/payments/payment-investigation.js';
 import { operatorOf } from './test-app.js';
 
 export const TEST_OPERATOR = 'test-operator@ci';
@@ -26,6 +29,7 @@ export function cliDependencies(
     audit: operator.get(OperatorAuditLog),
     simulator: operator.get(SimulatedWebhookSender),
     investigator: operator.get(PaymentInvestigator),
+    payoutInvestigator: operator.get(PayoutInvestigator),
     actor,
   };
 }

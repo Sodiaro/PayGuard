@@ -45,6 +45,8 @@ src/
 │                           # capture/void job processor the worker runs
 ├── refunds/                # /v1/payments/:id/refunds and /v1/refunds, refund lifecycle, and the
 │                           # refund job processor the worker runs
+├── payouts/                # /v1/balance and /v1/payouts, balance derivation, payout lifecycle and
+│                           # history, and the payout job processor the worker runs
 ├── merchant-webhooks/      # /v1/webhook-endpoint and /v1/events, event recording, secret
 │                           # encryption, target policy, and the delivery processor the worker runs
 ├── webhooks/               # /v1/webhooks intake: raw body, signature, event schema, inbox, and
@@ -283,11 +285,53 @@ worker ──► marks refund submitted ──► provider.processRefund(refundI
   and `refund.result_conflict` go to the payment's history with the refund's ID, alongside the
   generic deferred, scheduled, dead and requeued events; refund statuses are in their details.
 
+## Balance and payouts
+
+A merchant's **balance** is not stored. The `merchant_balances` database function derives it per
+currency from the records themselves whenever it is needed: what succeeded payments captured, less
+pending and succeeded refunds, less pending and succeeded payouts. A stored running total could
+drift from the records it summarizes; a derived one cannot, at the cost of summing a merchant's
+history on each read (see [Limitations](#limitations)).
+
+A **payout** (`payouts`) sends part of the available balance to a bank account. It belongs to no
+payment, so it has its own history (`payout_events`), and its outbox jobs and merchant events
+carry the payout instead of a payment and attempt: a CHECK constraint on each table requires
+exactly one of the two.
+
+```
+Payout:  PENDING ──► SUCCEEDED (terminal)
+            └──────► FAILED    (terminal; its amount is available again)
+
+POST /v1/payouts ──► one transaction: lock (merchant, currency), derive the balance,
+                     payout (PENDING) + PROCESS_PAYOUT job + payout.created ──► 202
+worker ──► marks payout submitted ──► provider.processPayout(payoutId, destination)
+       ──► definite answer: payout outcome + merchant event + job COMPLETED, in one transaction
+       ──► no answer: RECONCILE_PAYOUT job (delayed) ──► provider.lookupPayout(payoutId)
+```
+
+- **Never more than the balance.** A pending payout counts against the balance from the moment it
+  is created. The API takes a transaction-scoped advisory lock on (merchant, currency) before
+  deriving the balance, so payouts of one currency are decided one at a time. The
+  `payouts_within_available_balance` trigger takes the same lock and repeats the check on every
+  insert, whatever the caller.
+- **Refunds may overdraw.** A refund is limited by its payment, not by the balance, so a refund
+  after a payout can make the available balance negative. Payouts are then refused until new
+  payments cover it. Refunds therefore do not take the balance lock.
+- **Same discipline as attempts.** Submission marker, lookups, resubmission under the same payout
+  ID only on `not_found`, contradictions recorded as `payout.result_conflict`, the stale sweep,
+  dead-lettering and requeue all work as for refunds.
+- **The account number** is sent to the provider and stored, but responses, merchant events,
+  logs, history and `payout:inspect` show only the bank code, the account name and the last four
+  digits.
+- **History:** `payout.created`, `payout.submitted`, `payout.outcome_unknown`, `payout.resolved`
+  and `payout.result_conflict`, with the payout's status before and after, plus the generic
+  deferred, scheduled, dead and requeued events.
+
 ## Merchant notifications
 
-Every payment and refund outcome becomes a **merchant event** (`merchant_events`), written by the
-same guarded write that records the outcome (`applyAttemptResolution`, the refund processor's
-resolution), so an outcome and its event commit or roll back together. If the merchant's endpoint
+Every payment, refund and payout outcome becomes a **merchant event** (`merchant_events`), written
+by the same guarded write that records the outcome (`applyAttemptResolution`, the refund and payout
+processors' resolutions), so an outcome and its event commit or roll back together. If the merchant's endpoint
 is enabled at that moment, a `DELIVER_MERCHANT_EVENT` outbox job is created in the same
 transaction.
 
@@ -307,8 +351,8 @@ worker ──► decrypt secret(s) ──► signed POST (10 s, no redirects, pu
   event's delivery state and the job's next step commit together, fenced by the lease. A crash
   after the merchant accepted a delivery but before it was recorded sends it again under the same
   event ID. A fenced-out worker that did deliver still records the delivery.
-- **Snapshots.** An event's `data` is the payment or refund as the API returned it when the event
-  was recorded; later changes produce later events and never rewrite earlier ones.
+- **Snapshots.** An event's `data` is the payment, refund or payout as the API returned it when the
+  event was recorded; later changes produce later events and never rewrite earlier ones.
 - **Secrets.** Signing needs the secret itself, so it cannot be hashed like an API key. It is
   stored encrypted with AES-256-GCM under `MERCHANT_WEBHOOK_ENCRYPTION_KEY`, with the merchant's ID
   as associated data, so a ciphertext copied to another merchant's endpoint fails to decrypt. The
@@ -458,24 +502,24 @@ type lookup prefix    secret: 32 random bytes, base64url
 Each process connects with only the privileges it needs. None of these roles is a superuser, can
 create roles or databases, replicate, or bypass row security:
 
-| Role                           | Kind                         | Used by                            | Can                                                                                                                                                                |
-| ------------------------------ | ---------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                                                                    |
-| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, captures and voids, refunds, endpoints, jobs, events; update only the columns its state changes touch |
-| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                                                          |
-| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                                                                   |
+| Role                           | Kind                         | Used by                            | Can                                                                                                                                                                         |
+| ------------------------------ | ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                                                                             |
+| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, captures and voids, refunds, payouts, endpoints, jobs, events; update only the columns its state changes touch |
+| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                                                                   |
+| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                                                                            |
 
 What the roles cannot do is the point:
 
 - **History stays append-only by privilege.** Neither the runtime nor the operator role holds
-  `UPDATE`, `DELETE` or `TRUNCATE` on `payment_events` or `operator_audit_events`. The runtime
+  `UPDATE`, `DELETE` or `TRUNCATE` on `payment_events`, `payout_events` or `operator_audit_events`. The runtime
   role cannot read or write the audit trail at all.
 - **No escalation.** Neither role can alter or drop the append-only triggers, set
   `session_replication_role`, create tables, or grant itself anything.
 - **The runtime role is narrow.** It cannot delete any row or change amounts, ownership, keys or
   merchant status.
-- **The operator role is narrow too.** It cannot change payments, attempts, captures, voids or
-  refunds.
+- **The operator role is narrow too.** It cannot change payments, attempts, captures, voids,
+  refunds or payouts.
 
 Privileges are granted by migrations (`20261026120000_runtime_and_operator_privileges`, and each
 later migration for the tables it adds), so they
@@ -519,8 +563,14 @@ the history to write-once storage if tamper evidence is required.
 
 ## Limitations
 
-- **Simulated payments only, so no production deployment.** There is no real provider integration,
-  card handling or payout; refunds, captures and voids go to the simulator too.
+- **Simulated payments only, so no production deployment.** There is no real provider integration
+  or card handling; refunds, captures, voids and payouts go to the simulator too, and no bank
+  account is checked or paid.
+- **Payouts are simple.** No payout schedule or automatic settlement, no fees, no currency
+  conversion, no saved bank accounts, and no returned payouts: a `SUCCEEDED` payout is final. The
+  balance is derived by summing the merchant's payments, refunds and payouts on every read and
+  payout, which is exact but grows with history; a large merchant would need a maintained balance
+  or periodic snapshots.
 - **Manual capture is single and unbounded in time.** One capture per authorization (partial
   captures release the rest), no incremental authorization, and no authorization expiry or
   automatic void of stale authorizations. The simulator is refused under `NODE_ENV=production`,
@@ -539,10 +589,10 @@ the history to write-once storage if tamper evidence is required.
   - PCI DSS scope review before any card data could pass through the system.
 - **No exactly-once guarantee; at most one charge per attempt depends on the provider.** See
   [What is and is not guaranteed](#what-is-and-is-not-guaranteed). The same holds for refunds,
-  keyed by refund ID.
-- **Refund outcomes come from submission answers and lookups only.** The provider webhook schema
-  covers payment events; provider refund events are not accepted. Refunds cannot be cancelled
-  once created.
+  captures, voids and payouts, keyed by their own IDs.
+- **Refund, capture, void and payout outcomes come from submission answers and lookups only.** The
+  provider webhook schema covers payment events only. Refunds and payouts cannot be cancelled once
+  created.
 - **Automatic reconciliation is bounded.** After `OUTBOX_MAX_RUNS` inconclusive lookups the
   payment stays `PENDING` and needs an operator. The window is about 13 minutes with the defaults.
 - **The in-process worker shares the API process** (the default outside Compose). A heavy backlog

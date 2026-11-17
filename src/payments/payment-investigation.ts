@@ -5,10 +5,12 @@ import {
   OutboxJobType,
   PaymentActionStatus,
   PaymentAttemptStatus,
+  PayoutStatus,
   ProviderWebhookEventResult,
   RefundStatus,
   type OutboxErrorCategory,
 } from '../generated/prisma/enums.js';
+import { PayoutEventType } from '../payouts/payout-events.js';
 import { PaymentEventType } from './payment-events.js';
 
 // Why an unresolved attempt is where it is, from its outbox jobs.
@@ -54,10 +56,14 @@ const JOB_TYPES = {
     submission: OutboxJobType.PROCESS_PAYMENT_ACTION,
     lookup: OutboxJobType.RECONCILE_PAYMENT_ACTION,
   },
+  payout: {
+    submission: OutboxJobType.PROCESS_PAYOUT,
+    lookup: OutboxJobType.RECONCILE_PAYOUT,
+  },
 } as const;
 
-// Attempts and refunds share the same submission/lookup job pattern. Jobs of the other kind (a
-// charge's refund jobs, webhook jobs) are ignored.
+// Attempts, refunds, actions and payouts share the same submission/lookup job pattern. Jobs of
+// other kinds (a charge's refund jobs, webhook and delivery jobs) are ignored.
 export function diagnoseUnresolved(
   jobs: readonly JobView[],
   kind: keyof typeof JOB_TYPES = 'attempt',
@@ -424,6 +430,119 @@ export class PaymentInvestigator {
     }));
   }
 }
+
+// Payouts have no payment, so they are investigated on their own.
+@Injectable()
+export class PayoutInvestigator {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async unresolved(options: { limit: number; merchantId?: string }) {
+    const payouts = await this.prisma.payout.findMany({
+      where: {
+        status: PayoutStatus.PENDING,
+        ...(options.merchantId && { merchantId: options.merchantId }),
+      },
+      orderBy: { createdAt: 'asc' },
+      take: options.limit,
+      select: {
+        id: true,
+        currency: true,
+        createdAt: true,
+        submittedAt: true,
+        merchant: { select: { slug: true } },
+        outboxJobs: { select: JOB_FIELDS },
+      },
+    });
+    const resultConflicts = await this.prisma.payoutEvent.groupBy({
+      by: ['payoutId'],
+      where: {
+        payoutId: { in: payouts.map((payout) => payout.id) },
+        type: PayoutEventType.PAYOUT_RESULT_CONFLICT,
+      },
+      _count: { _all: true },
+    });
+    return payouts.map((payout) => ({
+      payoutId: payout.id,
+      currency: payout.currency,
+      merchantSlug: payout.merchant.slug,
+      createdAt: payout.createdAt,
+      submitted: payout.submittedAt !== null,
+      diagnosis: diagnoseUnresolved(payout.outboxJobs, 'payout'),
+      resultConflicts:
+        resultConflicts.find((row) => row.payoutId === payout.id)?._count
+          ._all ?? 0,
+    }));
+  }
+
+  // The account number is not selected: operators see the destination as merchants do.
+  async inspect(payoutId: string) {
+    const payout = await this.prisma.payout.findUnique({
+      where: { id: payoutId },
+      select: {
+        id: true,
+        amount: true,
+        currency: true,
+        status: true,
+        bankCode: true,
+        accountName: true,
+        reference: true,
+        providerReference: true,
+        failureCode: true,
+        createdAt: true,
+        submittedAt: true,
+        completedAt: true,
+        merchant: { select: { id: true, slug: true, status: true } },
+        outboxJobs: {
+          where: { merchantEventId: null },
+          orderBy: { createdAt: 'asc' },
+          select: JOB_FIELDS,
+        },
+        merchantEvents: {
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: {
+            id: true,
+            type: true,
+            createdAt: true,
+            deliveryStatus: true,
+            deliveryAttempts: true,
+            lastResponseStatus: true,
+            lastError: true,
+            outboxJob: { select: JOB_FIELDS },
+          },
+        },
+        events: {
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: {
+            createdAt: true,
+            type: true,
+            source: true,
+            statusBefore: true,
+            statusAfter: true,
+            actor: true,
+            requestId: true,
+            outboxJobId: true,
+            details: true,
+          },
+        },
+      },
+    });
+    if (!payout) return null;
+    return {
+      ...payout,
+      diagnosis:
+        payout.status === PayoutStatus.PENDING
+          ? diagnoseUnresolved(payout.outboxJobs, 'payout')
+          : null,
+    };
+  }
+}
+
+export type PayoutInvestigation = NonNullable<
+  Awaited<ReturnType<PayoutInvestigator['inspect']>>
+>;
+export type UnresolvedPayout = Awaited<
+  ReturnType<PayoutInvestigator['unresolved']>
+>[number];
 
 export type PaymentInvestigation = NonNullable<
   Awaited<ReturnType<PaymentInvestigator['inspect']>>

@@ -16,7 +16,7 @@ import {
   MerchantEventType,
   recordPaymentOutcomeEvent,
 } from '../merchant-webhooks/merchant-events.js';
-import type { ClaimedJob } from '../outbox/outbox-store.js';
+import type { PaymentJob } from '../outbox/outbox-store.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import { PaymentStateConflictError } from '../payments/payment-errors.js';
 import {
@@ -78,7 +78,7 @@ export class PaymentActionJobProcessor {
     );
   }
 
-  async process(job: ClaimedJob): Promise<void> {
+  async process(job: PaymentJob): Promise<void> {
     if (!job.paymentActionId) {
       throw new Error(`Payment action job ${job.id} has no action`);
     }
@@ -112,7 +112,7 @@ export class PaymentActionJobProcessor {
   }
 
   private async processAction(
-    job: ClaimedJob,
+    job: PaymentJob,
     action: PendingAction,
   ): Promise<void> {
     // Once submission may have happened, the provider may already have captured or voided.
@@ -155,7 +155,7 @@ export class PaymentActionJobProcessor {
   }
 
   private async reconcileAction(
-    job: ClaimedJob,
+    job: PaymentJob,
     action: PendingAction,
   ): Promise<void> {
     let lookup: ProviderActionLookupResult;
@@ -218,7 +218,7 @@ export class PaymentActionJobProcessor {
   }
 
   private async submit(
-    job: ClaimedJob,
+    job: PaymentJob,
     action: PendingAction,
     onUnknownOutcome: UnknownOutcomeHandler,
   ): Promise<void> {
@@ -268,7 +268,7 @@ export class PaymentActionJobProcessor {
   }
 
   private async recordAndComplete(
-    job: ClaimedJob,
+    job: PaymentJob,
     action: PendingAction,
     resolution: ActionResolution,
     source: PaymentEventSource,
@@ -330,7 +330,7 @@ export class PaymentActionJobProcessor {
 
   private async recordIfContradicted(
     tx: Prisma.TransactionClient,
-    job: ClaimedJob,
+    job: PaymentJob,
     action: PendingAction,
     resolution: ActionResolution,
     source: PaymentEventSource,
@@ -363,7 +363,7 @@ export class PaymentActionJobProcessor {
   }
 
   private async handOverToReconciliation(
-    job: ClaimedJob,
+    job: PaymentJob,
     action: PendingAction,
     delaySeconds: number,
     category?: OutboxErrorCategory,
@@ -399,7 +399,7 @@ export class PaymentActionJobProcessor {
   }
 
   private retryLater(
-    job: ClaimedJob,
+    job: PaymentJob,
     category: OutboxErrorCategory,
   ): Promise<void> {
     return retryLater(this.outbox, this.logger, job, category);
@@ -410,7 +410,7 @@ export class PaymentActionJobProcessor {
 // payment out of AUTHORIZED in the same transaction; a failed one leaves it authorized.
 async function applyActionResolution(
   tx: Prisma.TransactionClient,
-  job: ClaimedJob,
+  job: PaymentJob,
   type: PaymentActionType,
   resolution: ActionResolution,
   source: PaymentEventSource,
@@ -466,7 +466,7 @@ async function applyActionResolution(
   return true;
 }
 
-function eventFor(job: ClaimedJob) {
+function eventFor(job: PaymentJob) {
   return {
     paymentId: job.paymentId,
     attemptId: job.attemptId,

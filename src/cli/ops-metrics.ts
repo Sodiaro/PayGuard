@@ -162,6 +162,34 @@ export function renderPrometheusMetrics(
     single(stats.paymentActionsAwaitingOperator),
   );
   gauge(
+    'payguard_payouts',
+    'Payouts by status and failure code.',
+    stats.payouts.map((row) => ({
+      labels: { status: row.status, failure_code: row.failureCode ?? 'none' },
+      value: row.count,
+    })),
+  );
+  gauge(
+    'payguard_payouts_unresolved',
+    'Payouts without a final outcome.',
+    single(stats.unresolvedPayouts),
+  );
+  gauge(
+    'payguard_payouts_oldest_unresolved_age_seconds',
+    'Age of the oldest payout without a final outcome (0 when none).',
+    single(stats.oldestUnresolvedPayoutAgeSeconds),
+  );
+  gauge(
+    'payguard_payouts_awaiting_operator',
+    'Unresolved payouts whose reconciliation lookups are exhausted.',
+    single(stats.payoutsAwaitingOperator),
+  );
+  gauge(
+    'payguard_payout_result_conflicts',
+    'Definite provider answers that contradicted an already recorded payout outcome.',
+    single(stats.payoutResultConflicts),
+  );
+  gauge(
     'payguard_merchant_events',
     'Merchant events by delivery status (none: no endpoint was enabled).',
     stats.merchantEventDeliveries.map((row) => ({

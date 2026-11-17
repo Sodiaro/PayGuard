@@ -4,6 +4,7 @@ import {
   MerchantEventDeliveryStatus,
   OutboxJobType,
   PaymentStatus,
+  PayoutStatus,
   RefundStatus,
 } from '../generated/prisma/enums.js';
 import { enqueueOutboxJob } from '../outbox/outbox-store.js';
@@ -11,6 +12,7 @@ import {
   loadPaymentView,
   toPaymentResponse,
 } from '../payments/payment-view.js';
+import { toPayoutResponse } from '../payouts/payout-view.js';
 import { toRefundResponse } from '../refunds/refund-view.js';
 
 export const MerchantEventType = {
@@ -23,6 +25,9 @@ export const MerchantEventType = {
   PAYMENT_VOID_FAILED: 'payment.void_failed',
   REFUND_SUCCEEDED: 'refund.succeeded',
   REFUND_FAILED: 'refund.failed',
+  PAYOUT_SUCCEEDED: 'payout.succeeded',
+  // The amount is available again.
+  PAYOUT_FAILED: 'payout.failed',
 } as const;
 
 const PAYMENT_OUTCOME_EVENTS: Partial<
@@ -82,15 +87,46 @@ export async function recordRefundOutcomeEvent(
   });
 }
 
+export async function recordPayoutOutcomeEvent(
+  tx: Prisma.TransactionClient,
+  payoutId: string,
+): Promise<void> {
+  const payout = await tx.payout.findUniqueOrThrow({ where: { id: payoutId } });
+  await recordMerchantEvent(tx, {
+    merchantId: payout.merchantId,
+    type:
+      payout.status === PayoutStatus.SUCCEEDED
+        ? MerchantEventType.PAYOUT_SUCCEEDED
+        : MerchantEventType.PAYOUT_FAILED,
+    payoutId,
+    data: toPayoutResponse(payout),
+  });
+}
+
+// What an event, and its delivery job, is about: a payment and one of its attempts, or a payout.
+export type MerchantEventSubject =
+  | { paymentId: string; attemptId: string; payoutId?: undefined }
+  | { payoutId: string; paymentId?: undefined; attemptId?: undefined };
+
+export function merchantEventSubject(event: {
+  paymentId: string | null;
+  attemptId: string | null;
+  payoutId: string | null;
+}): MerchantEventSubject {
+  if (event.payoutId) return { payoutId: event.payoutId };
+  if (event.paymentId && event.attemptId) {
+    return { paymentId: event.paymentId, attemptId: event.attemptId };
+  }
+  throw new Error('Merchant event has neither a payment nor a payout');
+}
+
 // A delivery is queued only if the merchant's endpoint is enabled now. Events recorded while it is
 // not are still listed by GET /v1/events and can be redelivered once it is.
 async function recordMerchantEvent(
   tx: Prisma.TransactionClient,
-  event: {
+  event: MerchantEventSubject & {
     merchantId: string;
     type: MerchantEventType;
-    paymentId: string;
-    attemptId: string;
     refundId?: string;
     data: object;
   },
@@ -105,19 +141,19 @@ async function recordMerchantEvent(
     data: {
       merchantId: event.merchantId,
       type: event.type,
-      paymentId: event.paymentId,
-      attemptId: event.attemptId,
+      paymentId: event.paymentId ?? null,
+      attemptId: event.attemptId ?? null,
       refundId: event.refundId ?? null,
+      payoutId: event.payoutId ?? null,
       data: JSON.parse(JSON.stringify(event.data)) as Prisma.InputJsonObject,
       deliveryStatus: deliver ? MerchantEventDeliveryStatus.PENDING : null,
     },
-    select: { id: true },
+    select: { id: true, paymentId: true, attemptId: true, payoutId: true },
   });
   if (deliver) {
     await enqueueOutboxJob(tx, {
+      ...merchantEventSubject(created),
       type: OutboxJobType.DELIVER_MERCHANT_EVENT,
-      paymentId: event.paymentId,
-      attemptId: event.attemptId,
       merchantEventId: created.id,
       requestId: currentRequestId(),
     });

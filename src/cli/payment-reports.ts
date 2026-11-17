@@ -1,22 +1,67 @@
 import type {
   JobView,
   PaymentInvestigation,
+  PayoutInvestigation,
   UnresolvedAction,
   UnresolvedAttempt,
   UnresolvedDiagnosis,
+  UnresolvedPayout,
   UnresolvedRefund,
 } from '../payments/payment-investigation.js';
 import type { AdminCliOutput } from './admin-cli.js';
 
 export function printUnresolved(
-  attempts: UnresolvedAttempt[],
-  refunds: UnresolvedRefund[],
-  actions: UnresolvedAction[],
+  unresolved: {
+    attempts: UnresolvedAttempt[];
+    refunds: UnresolvedRefund[];
+    actions: UnresolvedAction[];
+    payouts: UnresolvedPayout[];
+  },
   io: AdminCliOutput,
   now = new Date(),
 ): void {
-  printUnresolvedAttempts(attempts, io, now);
-  printUnresolvedActions(actions, io, now);
+  printUnresolvedAttempts(unresolved.attempts, io, now);
+  printUnresolvedActions(unresolved.actions, io, now);
+  printUnresolvedRefunds(unresolved.refunds, io, now);
+  printUnresolvedPayouts(unresolved.payouts, io, now);
+}
+
+function printUnresolvedPayouts(
+  payouts: UnresolvedPayout[],
+  io: AdminCliOutput,
+  now: Date,
+): void {
+  if (payouts.length === 0) return;
+  const blocked = payouts.filter((payout) => payout.diagnosis.needsOperator);
+  io.out('');
+  io.out(
+    `Unresolved payouts, oldest first (${payouts.length} shown, ${blocked.length} need an operator):`,
+  );
+  for (const payout of payouts) {
+    io.out(
+      [
+        `  age=${secondsBetween(payout.createdAt, now)}s`,
+        `payout=${payout.payoutId} (${payout.currency}, ${payout.merchantSlug})`,
+        `submitted=${payout.submitted ? 'yes' : 'no'}`,
+        describeDiagnosis(payout.diagnosis, now),
+        `resultConflicts=${payout.resultConflicts}`,
+      ].join('  '),
+    );
+  }
+  io.out('');
+  io.out('Inspect one with payout:inspect --payout <id>.');
+  if (blocked.length > 0) {
+    io.out(
+      'reconciliation_exhausted: confirm the payout with the provider by payout ID, then requeue its dead RECONCILE_PAYOUT job (outbox:requeue). Its amount stays out of the available balance until then.',
+    );
+  }
+}
+
+function printUnresolvedRefunds(
+  refunds: UnresolvedRefund[],
+  io: AdminCliOutput,
+  now: Date,
+): void {
   if (refunds.length === 0) return;
   const blocked = refunds.filter((refund) => refund.diagnosis.needsOperator);
   io.out('');
@@ -276,6 +321,67 @@ export function printInvestigation(
         .join('; ')}.`,
     );
   }
+}
+
+export function printPayoutInvestigation(
+  payout: PayoutInvestigation,
+  io: AdminCliOutput,
+  now = new Date(),
+): void {
+  io.out(
+    `Payout ${payout.id}  ${payout.status}  ${payout.amount.toString()} ${payout.currency}  reference=${payout.reference ?? '-'}`,
+  );
+  io.out(
+    `  merchant ${payout.merchant.slug} (${payout.merchant.id}, ${payout.merchant.status})  created ${iso(payout.createdAt)}  submitted ${iso(payout.submittedAt)}  completed ${iso(payout.completedAt)}`,
+  );
+  io.out(
+    `  destination bank=${payout.bankCode} name=${payout.accountName}  providerReference=${payout.providerReference ?? '-'}  failure=${payout.failureCode ?? '-'}`,
+  );
+  for (const job of payout.outboxJobs) {
+    io.out(`      job ${job.id}  ${describeJob(job)}`);
+  }
+  if (payout.diagnosis) {
+    io.out(`      unresolved: ${describeDiagnosis(payout.diagnosis, now)}`);
+  }
+
+  io.out('');
+  io.out('Merchant events:');
+  if (payout.merchantEvents.length === 0) io.out('  none');
+  for (const event of payout.merchantEvents) {
+    io.out(
+      `  ${iso(event.createdAt)}  ${event.type}  delivery=${event.deliveryStatus ?? 'not sent'}  attempts=${event.deliveryAttempts}  lastStatus=${event.lastResponseStatus ?? '-'}  lastError=${event.lastError ?? '-'}`,
+    );
+    if (event.outboxJob) {
+      io.out(
+        `      job ${event.outboxJob.id}  ${describeJob(event.outboxJob)}`,
+      );
+    }
+  }
+
+  io.out('');
+  io.out('History (oldest first):');
+  if (payout.events.length === 0) io.out('  none recorded');
+  for (const event of payout.events) {
+    const parts = [
+      `  ${iso(event.createdAt)}`,
+      event.source.padEnd(17),
+      event.type.padEnd(24),
+      transition('payout', event.statusBefore, event.statusAfter),
+      event.actor && `actor=${event.actor} (self-declared)`,
+      event.outboxJobId && `job=${event.outboxJobId}`,
+      event.requestId && `request=${event.requestId}`,
+      Object.keys(event.details as object).length > 0 &&
+        JSON.stringify(event.details),
+    ];
+    io.out(parts.filter(Boolean).join('  '));
+  }
+
+  io.out('');
+  io.out(
+    payout.diagnosis
+      ? `Verdict: unresolved; the payout is ${payout.diagnosis.state}${payout.diagnosis.needsOperator ? ' and needs an operator' : ''}.`
+      : `Verdict: ${payout.status}; the payout is not awaiting an outcome.`,
+  );
 }
 
 function describeDiagnosis(diagnosis: UnresolvedDiagnosis, now: Date): string {

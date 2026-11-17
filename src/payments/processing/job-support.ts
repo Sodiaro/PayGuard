@@ -6,7 +6,7 @@ import {
   type ProviderLookupResult,
 } from '../providers/payment-provider.js';
 
-// Shared by the attempt and refund job processors.
+// Shared by the attempt, refund, capture/void and payout job processors.
 
 export async function retryLater(
   outbox: OutboxStore,
@@ -33,10 +33,11 @@ export function jobFields(job: ClaimedJob) {
   return {
     jobId: job.id,
     jobType: job.type,
-    paymentId: job.paymentId,
-    attemptId: job.attemptId,
+    ...(job.paymentId && { paymentId: job.paymentId }),
+    ...(job.attemptId && { attemptId: job.attemptId }),
     ...(job.refundId && { refundId: job.refundId }),
     ...(job.paymentActionId && { paymentActionId: job.paymentActionId }),
+    ...(job.payoutId && { payoutId: job.payoutId }),
   };
 }
 

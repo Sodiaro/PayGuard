@@ -38,6 +38,8 @@ No database. They cover:
 - Manual capture: the payment transitions through `AUTHORIZED`, authorizations versus charges for
   each capture method, capture and void eligibility, and fingerprints that keep automatic capture
   on its original form.
+- Payouts: transitions, provider-result mapping, contradiction checks, the simulator's payout
+  outcomes and lookups, and fingerprints that distinguish every destination field.
 - Merchant webhooks: secret generation and encryption (tampering, another merchant, another key),
   the target policy for every non-public range and URL form, the delivery client against a local
   server (status mapping, timeouts, refused connections, no redirects, blocked addresses and host
@@ -82,6 +84,16 @@ Against **real PostgreSQL**, with the deployed database privileges:
   replays and `409`s; a capture and a void racing with exactly one accepted; cross-merchant
   `404`s; lost answers resolved by lookup and resubmission only on "not found"; history, merchant
   events and CLI output; and the trigger and indexes that bound actions.
+- Balance and payouts: the balance derived per currency from captured amounts (partial captures
+  included), refunds and payouts, ignoring failed and pending payments; payouts taking their
+  amount out of the balance at once, refused above it (counting pending payouts), a failed payout
+  releasing it, refunds taking the balance below zero; validation of every destination field;
+  replays and `409`s; identical and competing payouts racing (`Promise.all`) without ever
+  exceeding the balance; merchant isolation; listing filters and cursors; lost answers resolved by
+  lookup, resubmission only on "not found", exhausted lookups resolved after a requeue, the stale
+  sweep and pruning; signed `payout.succeeded` deliveries and redelivery without the account
+  number; payout history and `payout:inspect`; and the balance trigger and the constraints that
+  tie every job to a payment or a payout.
 - Merchant webhooks, against a receiver on 127.0.0.1: endpoint creation with a secret shown once
   and stored encrypted, updates, URL validation, rotation with both secrets signing during the
   overlap and only the new one after it, merchant isolation; events recorded without delivery when

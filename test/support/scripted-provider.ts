@@ -9,6 +9,10 @@ import {
   type ProviderLookupResult,
   type ProviderPaymentRequest,
   type ProviderPaymentResult,
+  type ProviderPayoutLookupRequest,
+  type ProviderPayoutLookupResult,
+  type ProviderPayoutRequest,
+  type ProviderPayoutResult,
   type ProviderRefundLookupRequest,
   type ProviderRefundLookupResult,
   type ProviderRefundRequest,
@@ -36,7 +40,11 @@ type ActionSubmission = (
   request: ActionRequest,
 ) => Promise<ProviderActionResult>;
 
-// A provider double with ledgers of the attempts, refunds, captures and voids it has actually
+type PayoutSubmission = (
+  request: ProviderPayoutRequest,
+) => Promise<ProviderPayoutResult>;
+
+// A provider double with ledgers of the attempts, refunds, captures, voids and payouts it has actually
 // processed. Tests choose how a submission behaves (answer, process-then-time-out, fail without
 // processing, hold open) and what lookups return, and can assert exactly how often each operation
 // was invoked.
@@ -48,9 +56,12 @@ export class ScriptedProvider implements PaymentProvider {
   refundLookups: ProviderRefundLookupRequest[] = [];
   actionSubmissions: ActionRequest[] = [];
   actionLookups: ProviderActionLookupRequest[] = [];
+  payoutSubmissions: ProviderPayoutRequest[] = [];
+  payoutLookups: ProviderPayoutLookupRequest[] = [];
   readonly ledger = new Map<string, ProviderPaymentResult>();
   readonly refundLedger = new Map<string, ProviderRefundResult>();
   readonly actionLedger = new Map<string, ProviderActionResult>();
+  readonly payoutLedger = new Map<string, ProviderPayoutResult>();
   private submission: Submission = this.processing(SimulatorOutcome.Succeeded);
   private refundSubmission: RefundSubmission = this.refunding(
     SimulatorOutcome.Succeeded,
@@ -61,6 +72,10 @@ export class ScriptedProvider implements PaymentProvider {
   private scriptedLookups: (ProviderLookupResult | Error)[] = [];
   private scriptedRefundLookups: (ProviderRefundLookupResult | Error)[] = [];
   private scriptedActionLookups: (ProviderActionLookupResult | Error)[] = [];
+  private payoutSubmission: PayoutSubmission = this.payingOut(
+    SimulatorOutcome.Succeeded,
+  );
+  private scriptedPayoutLookups: (ProviderPayoutLookupResult | Error)[] = [];
 
   reset(): void {
     this.submissions = [];
@@ -69,15 +84,20 @@ export class ScriptedProvider implements PaymentProvider {
     this.refundLookups = [];
     this.actionSubmissions = [];
     this.actionLookups = [];
+    this.payoutSubmissions = [];
+    this.payoutLookups = [];
     this.ledger.clear();
     this.refundLedger.clear();
     this.actionLedger.clear();
+    this.payoutLedger.clear();
     this.scriptedLookups = [];
     this.scriptedRefundLookups = [];
     this.scriptedActionLookups = [];
+    this.scriptedPayoutLookups = [];
     this.submission = this.processing(SimulatorOutcome.Succeeded);
     this.refundSubmission = this.refunding(SimulatorOutcome.Succeeded);
     this.actionSubmission = this.acting(SimulatorOutcome.Succeeded);
+    this.payoutSubmission = this.payingOut(SimulatorOutcome.Succeeded);
   }
 
   willRefund(outcome: SimulatorOutcome): void {
@@ -165,6 +185,44 @@ export class ScriptedProvider implements PaymentProvider {
     if (scripted) return Promise.resolve(scripted);
     return Promise.resolve(
       fromActionLedger(this.actionLedger.get(request.actionId)),
+    );
+  }
+
+  willPayOut(outcome: SimulatorOutcome): void {
+    this.payoutSubmission = this.payingOut(outcome);
+  }
+
+  // The provider sends the payout but its answer never arrives.
+  willPayOutThenTimeOut(outcome: SimulatorOutcome): void {
+    const payOut = this.payingOut(outcome);
+    this.payoutSubmission = async (request) => {
+      await payOut(request);
+      throw new ProviderTimeoutError();
+    };
+  }
+
+  willThrowOnPayout(error: Error): void {
+    this.payoutSubmission = () => Promise.reject(error);
+  }
+
+  willLookupPayout(...answers: (ProviderPayoutLookupResult | Error)[]): void {
+    this.scriptedPayoutLookups.push(...answers);
+  }
+
+  processPayout(request: ProviderPayoutRequest): Promise<ProviderPayoutResult> {
+    this.payoutSubmissions.push(request);
+    return this.payoutSubmission(request);
+  }
+
+  lookupPayout(
+    request: ProviderPayoutLookupRequest,
+  ): Promise<ProviderPayoutLookupResult> {
+    this.payoutLookups.push(request);
+    const scripted = this.scriptedPayoutLookups.shift();
+    if (scripted instanceof Error) return Promise.reject(scripted);
+    if (scripted) return Promise.resolve(scripted);
+    return Promise.resolve(
+      fromActionLedger(this.payoutLedger.get(request.payoutId)),
     );
   }
 
@@ -276,6 +334,20 @@ export class ScriptedProvider implements PaymentProvider {
           : await simulator.voidPayment(request);
       if (result.outcome !== 'unavailable') {
         this.actionLedger.set(request.actionId, result);
+      }
+      return result;
+    };
+  }
+
+  private payingOut(outcome: SimulatorOutcome): PayoutSubmission {
+    const simulator = new SimulatedPaymentProvider({
+      payment: SimulatorOutcome.Succeeded,
+      payout: outcome,
+    });
+    return async (request) => {
+      const result = await simulator.processPayout(request);
+      if (result.outcome !== 'unavailable') {
+        this.payoutLedger.set(request.payoutId, result);
       }
       return result;
     };

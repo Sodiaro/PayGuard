@@ -36,11 +36,19 @@ export function createPaymentProvider(
       const actionOutcome = config.get('PAYMENT_SIMULATOR_CAPTURE_OUTCOME', {
         infer: true,
       });
+      const payoutOutcome = config.get('PAYMENT_SIMULATOR_PAYOUT_OUTCOME', {
+        infer: true,
+      });
       new Logger('PaymentProviderModule').warn(
-        `Payments use the simulated provider (outcome: ${outcome}, refund outcome: ${refundOutcome}, capture/void outcome: ${actionOutcome}, ambiguous submissions: ${ambiguous}); no real money is moved`,
+        `Payments use the simulated provider (outcome: ${outcome}, refund outcome: ${refundOutcome}, capture/void outcome: ${actionOutcome}, payout outcome: ${payoutOutcome}, ambiguous submissions: ${ambiguous}); no real money is moved`,
       );
       return new SimulatedPaymentProvider(
-        { payment: outcome, refund: refundOutcome, action: actionOutcome },
+        {
+          payment: outcome,
+          refund: refundOutcome,
+          action: actionOutcome,
+          payout: payoutOutcome,
+        },
         ambiguous,
       );
     }

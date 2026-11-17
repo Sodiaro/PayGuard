@@ -7,7 +7,10 @@ import type { CoreEnvironment } from '../config/environment.js';
 import { ApiKeysService } from '../merchants/api-keys.service.js';
 import { MerchantsService } from '../merchants/merchants.service.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
-import { PaymentInvestigator } from '../payments/payment-investigation.js';
+import {
+  PaymentInvestigator,
+  PayoutInvestigator,
+} from '../payments/payment-investigation.js';
 import { AdminModule } from './admin.module.js';
 import { runAdminCli } from './admin-cli.js';
 import { SimulatedWebhookSender } from './simulated-webhook-sender.js';
@@ -28,6 +31,7 @@ try {
       audit: app.get(OperatorAuditLog),
       simulator: app.get(SimulatedWebhookSender),
       investigator: app.get(PaymentInvestigator),
+      payoutInvestigator: app.get(PayoutInvestigator),
       actor: resolveOperator(config.get('PAYGUARD_OPERATOR', { infer: true })),
     },
     {

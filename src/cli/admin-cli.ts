@@ -17,9 +17,16 @@ import type {
   MerchantsService,
 } from '../merchants/merchants.service.js';
 import type { OutboxStats, OutboxStore } from '../outbox/outbox-store.js';
-import type { PaymentInvestigator } from '../payments/payment-investigation.js';
+import type {
+  PaymentInvestigator,
+  PayoutInvestigator,
+} from '../payments/payment-investigation.js';
 import { renderPrometheusMetrics } from './ops-metrics.js';
-import { printInvestigation, printUnresolved } from './payment-reports.js';
+import {
+  printInvestigation,
+  printPayoutInvestigation,
+  printUnresolved,
+} from './payment-reports.js';
 import {
   SimulatorWebhookError,
   type SimulatedWebhookSender,
@@ -42,6 +49,7 @@ export interface AdminCliDependencies {
   audit: OperatorAuditLog;
   simulator: SimulatedWebhookSender;
   investigator: PaymentInvestigator;
+  payoutInvestigator: PayoutInvestigator;
   // Recorded on every state-changing command (see resolveOperator).
   actor: string;
 }
@@ -68,6 +76,7 @@ Operations:
   outbox:requeue      --job <id>
   payments:unresolved [--merchant <id|slug>] [--limit <1-200>]
   payment:inspect     --payment <id>
+  payout:inspect      --payout <id>
   audit:list          [--limit <1-200>]
   maintenance:prune   --completed-jobs-days <n> [--workers-days <n>] [--batch-size <n>]   (n >= ${MIN_RETENTION_DAYS})
 
@@ -94,6 +103,7 @@ const OPTIONS = {
   'batch-size': { type: 'string' },
   attempt: { type: 'string' },
   payment: { type: 'string' },
+  payout: { type: 'string' },
   type: { type: 'string' },
   url: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
@@ -163,6 +173,7 @@ async function execute(
     audit,
     simulator,
     investigator,
+    payoutInvestigator,
     actor,
   }: AdminCliDependencies,
   io: AdminCliOutput,
@@ -244,8 +255,11 @@ async function execute(
           'Dead jobs (oldest first; requeue with outbox:requeue --job <id>):',
         );
         for (const job of dead) {
+          const subject = job.payoutId
+            ? `payout=${job.payoutId}`
+            : `payment=${job.paymentId}  attempt=${job.attemptId}`;
           io.out(
-            `  ${job.id}  ${job.type}  payment=${job.paymentId}  attempt=${job.attemptId}  runs=${job.runCount}  lastError=${job.lastError ?? '-'}`,
+            `  ${job.id}  ${job.type}  ${subject}  runs=${job.runCount}  lastError=${job.lastError ?? '-'}`,
           );
         }
       }
@@ -268,11 +282,24 @@ async function execute(
         merchantId: merchant?.id,
       };
       printUnresolved(
-        await investigator.unresolved(filter),
-        await investigator.unresolvedRefunds(filter),
-        await investigator.unresolvedActions(filter),
+        {
+          attempts: await investigator.unresolved(filter),
+          refunds: await investigator.unresolvedRefunds(filter),
+          actions: await investigator.unresolvedActions(filter),
+          payouts: await payoutInvestigator.unresolved(filter),
+        },
         io,
       );
+      return;
+    }
+    case 'payout:inspect': {
+      const payoutId = required(options, 'payout');
+      if (!UUID_FORMAT.test(payoutId)) {
+        throw new UsageError('--payout must be a payout ID');
+      }
+      const payout = await payoutInvestigator.inspect(payoutId);
+      if (!payout) throw new CommandError(`No payout with id ${payoutId}`);
+      printPayoutInvestigation(payout, io);
       return;
     }
     case 'payment:inspect': {
@@ -403,6 +430,21 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
   io.out(
     `Captures/voids awaiting an operator: ${stats.paymentActionsAwaitingOperator}`,
   );
+  io.out('Payouts:');
+  if (stats.payouts.length === 0) io.out('  none');
+  for (const row of stats.payouts) {
+    io.out(
+      `  ${row.status.padEnd(10)} ${(row.failureCode ?? '-').padEnd(21)} ${row.count}`,
+    );
+  }
+  io.out(`Unresolved payouts:             ${stats.unresolvedPayouts}`);
+  io.out(
+    `Oldest unresolved payout (s):   ${stats.oldestUnresolvedPayoutAgeSeconds ?? '-'}`,
+  );
+  io.out(
+    `Payouts awaiting an operator:   ${stats.payoutsAwaitingOperator} (lookups exhausted; see payments:unresolved)`,
+  );
+  io.out(`Contradicting payout answers:   ${stats.payoutResultConflicts}`);
   io.out('Merchant events by delivery status:');
   if (stats.merchantEventDeliveries.length === 0) io.out('  none');
   for (const row of stats.merchantEventDeliveries) {
@@ -465,7 +507,7 @@ function formatSeconds(value: number | null): string {
 
 function required(
   options: Options,
-  name: 'name' | 'merchant' | 'key' | 'job' | 'attempt' | 'payment',
+  name: 'name' | 'merchant' | 'key' | 'job' | 'attempt' | 'payment' | 'payout',
 ): string {
   const value = options[name];
   if (!value) throw new UsageError(`Missing required option --${name}`);

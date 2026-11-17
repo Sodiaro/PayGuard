@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   fingerprintPaymentActionRequest,
   fingerprintPaymentRequest,
+  fingerprintPayoutRequest,
   fingerprintRefundRequest,
   idempotencyKeyProblem,
 } from './idempotency.js';
@@ -61,6 +62,41 @@ describe('fingerprintRefundRequest', () => {
     expect(fingerprintRefundRequest(paymentId, { amount: 100 })).toBe(
       fingerprints[1],
     );
+  });
+});
+
+describe('fingerprintPayoutRequest', () => {
+  const payout = {
+    amount: 200000,
+    currency: 'NGN',
+    destination: {
+      bankCode: '058',
+      accountNumber: '0123456789',
+      accountName: 'Test Merchant Ltd',
+    },
+  };
+
+  it('distinguishes amount, currency, every destination field and the reference', () => {
+    const fingerprints = [
+      fingerprintPayoutRequest(payout),
+      fingerprintPayoutRequest({ ...payout, amount: 200001 }),
+      fingerprintPayoutRequest({ ...payout, currency: 'GHS' }),
+      fingerprintPayoutRequest({
+        ...payout,
+        destination: { ...payout.destination, bankCode: '044' },
+      }),
+      fingerprintPayoutRequest({
+        ...payout,
+        destination: { ...payout.destination, accountNumber: '0123456780' },
+      }),
+      fingerprintPayoutRequest({
+        ...payout,
+        destination: { ...payout.destination, accountName: 'Other Ltd' },
+      }),
+      fingerprintPayoutRequest({ ...payout, reference: 'settlement_1' }),
+    ];
+    expect(new Set(fingerprints).size).toBe(fingerprints.length);
+    expect(fingerprintPayoutRequest({ ...payout })).toBe(fingerprints[0]);
   });
 });
 

@@ -10,6 +10,7 @@ import { MerchantsModule } from './merchants/merchants.module.js';
 import { InProcessWorkerStarter } from './payments/processing/in-process-worker.js';
 import { PaymentProcessingModule } from './payments/processing/payment-processing.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
+import { PayoutsModule } from './payouts/payouts.module.js';
 import { RefundsModule } from './refunds/refunds.module.js';
 import { WebhooksModule } from './webhooks/webhooks.module.js';
 
@@ -26,6 +27,7 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
     PaymentsModule,
     CapturesModule,
     RefundsModule,
+    PayoutsModule,
     MerchantWebhooksModule,
     PaymentProcessingModule,
     WebhooksModule,

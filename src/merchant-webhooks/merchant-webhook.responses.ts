@@ -75,7 +75,7 @@ export class MerchantEventResponse {
     type: 'object',
     additionalProperties: true,
     description:
-      'The payment or refund as the API returned it when the event happened',
+      'The payment, refund or payout as the API returned it when the event happened',
   })
   data: unknown;
 

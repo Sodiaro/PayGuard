@@ -3,6 +3,7 @@ import { DatabaseModule } from '../../database/database.module.js';
 import { OutboxModule } from '../../outbox/outbox.module.js';
 import { PaymentActionJobProcessor } from '../../captures/payment-action-job-processor.js';
 import { MerchantEventDeliveryProcessor } from '../../merchant-webhooks/merchant-event-delivery-processor.js';
+import { PayoutJobProcessor } from '../../payouts/payout-job-processor.js';
 import { RefundJobProcessor } from '../../refunds/refund-job-processor.js';
 import { ProviderWebhookProcessor } from '../../webhooks/provider-webhook-processor.js';
 import { PaymentProviderModule } from '../providers/payment-provider.module.js';
@@ -19,6 +20,7 @@ import { OutboxWorker } from './outbox-worker.js';
     RefundJobProcessor,
     MerchantEventDeliveryProcessor,
     PaymentActionJobProcessor,
+    PayoutJobProcessor,
     OutboxWorker,
   ],
   exports: [OutboxWorker],

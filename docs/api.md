@@ -1,7 +1,7 @@
 # API
 
-The HTTP contract of PayGuard: authentication, payments, idempotency, provider webhooks, rate
-limits and errors. With `SWAGGER_ENABLED=true` the same endpoints are browsable at `/docs` (use
+The HTTP contract of PayGuard: authentication, payments, refunds, balance and payouts,
+idempotency, webhooks, rate limits and errors. With `SWAGGER_ENABLED=true` the same endpoints are browsable at `/docs` (use
 **Authorize** to send a key). Why the behaviour is what it is is explained in
 [architecture.md](architecture.md).
 
@@ -12,6 +12,7 @@ limits and errors. With `SWAGGER_ENABLED=true` the same endpoints are browsable 
 - [Merchant endpoints](#merchant-endpoints)
 - [Payments](#payments)
 - [Refunds](#refunds)
+- [Balance and payouts](#balance-and-payouts)
 - [Idempotency](#idempotency)
 - [Currencies and amounts](#currencies-and-amounts)
 - [Merchant webhooks](#merchant-webhooks)
@@ -226,19 +227,107 @@ Request body, all optional. The currency is always the payment's and is not acce
 | `409`  | `Idempotency-Key` already used with a different request, or the refund is refused (above).         |
 | `429`  | Rate limit exceeded; refunds share the per-merchant limit with payment creations and retries.      |
 
+## Balance and payouts
+
+| Method and path       | Description                                                                         |
+| --------------------- | ----------------------------------------------------------------------------------- |
+| `GET /v1/balance`     | The caller's balance in each currency it has used                                   |
+| `POST /v1/payouts`    | Pay out part of the available balance to a bank account. Requires `Idempotency-Key` |
+| `GET /v1/payouts`     | The caller's payouts, newest first, filtered and paginated                          |
+| `GET /v1/payouts/:id` | A payout owned by the caller. 404 for anyone else's or none                         |
+
+**Balance.** Derived, per currency, from the merchant's own records whenever it is read, so it
+cannot drift from them:
+
+```json
+{
+  "balances": [
+    {
+      "currency": "NGN",
+      "available": 350000,
+      "captured": 800000,
+      "refunded": 150000,
+      "paidOut": 200000,
+      "inTransit": 100000
+    }
+  ]
+}
+```
+
+`captured` is what succeeded payments charged (the captured amount for manual capture),
+`refunded` is pending and succeeded refunds, `paidOut` succeeded payouts and `inTransit` pending
+ones. `available = captured - refunded - paidOut - inTransit`. Pending refunds and payouts are
+deducted at once, because their money may already be moving; a failed one releases its amount.
+Refunds are never refused for lack of balance, so a refund after a payout can make `available`
+negative, and payouts are refused until it recovers. Currencies are listed by code; a merchant
+with no activity gets an empty list.
+
+**Payouts** are processed asynchronously like payments: the `POST` returns `202` with the payout
+`PENDING`, a worker sends it to the provider (the simulator), and the outcome appears on
+`GET /v1/payouts/:id`. A payout whose answer was lost stays `PENDING` until a lookup establishes
+it; it is sent again, under the same payout ID, only if the provider has no record of it.
+
+| Field                       | Type    | Rules                                                                                    |
+| --------------------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `amount`                    | integer | Minor units, `1` to `1000000000000`, at most the available balance in that currency      |
+| `currency`                  | string  | One of the [supported codes](#currencies-and-amounts)                                    |
+| `destination.bankCode`      | string  | 2-11 digits or capital letters (a national bank code or a BIC)                           |
+| `destination.accountNumber` | string  | 6-34 digits or capital letters (up to IBAN length)                                       |
+| `destination.accountName`   | string  | 1-100 letters (any script), digits, spaces and `. , ' & ( ) / -`                         |
+| `reference`                 | string  | Optional, 1-64 of `A-Z a-z 0-9 . _ : / # -`. Your own label; not unique, not idempotency |
+
+```json
+{
+  "id": "01a1e9f9-3c2b-7d10-8f4e-6a0b2c4d6e81",
+  "amount": 200000,
+  "currency": "NGN",
+  "status": "SUCCEEDED",
+  "destination": {
+    "bankCode": "058",
+    "accountNumberLast4": "6789",
+    "accountName": "Acme Ltd"
+  },
+  "reference": "settlement_2026_11_17",
+  "providerReference": "simpo_9c1e4a7b2d5f8e0a3c6b9d2e",
+  "failureCode": null,
+  "createdAt": "2026-11-17T15:00:00.000Z",
+  "completedAt": "2026-11-17T15:00:01.012Z"
+}
+```
+
+- **Limit.** A payout above the available balance is refused with `409`
+  (`Payout exceeds the available balance: <amount> <currency> available`) and nothing is created.
+  Payouts of one merchant and currency are decided one at a time, in the API and again by a
+  database trigger, so concurrent payouts can never together exceed the balance.
+- **Statuses.** `PENDING`, `SUCCEEDED` or `FAILED` with `failureCode` `DECLINED` (the provider or
+  bank refused it) or `PROVIDER_UNAVAILABLE`. A failed payout is not retried: create a new one.
+- **Destination.** The full account number is sent to the provider but never returned, logged or
+  shown to operators; responses and events carry `accountNumberLast4`.
+- **Listing.** `GET /v1/payouts` takes `status`, `currency`, `limit` (1-100, default 20) and
+  `cursor`, paginated like `GET /v1/payments`.
+
+| Status | When                                                                                               |
+| ------ | -------------------------------------------------------------------------------------------------- |
+| `202`  | Payout created and queued, `PENDING`.                                                              |
+| `200`  | Replay of an earlier request with the same key; header `Idempotent-Replayed: true`. Current state. |
+| `400`  | Invalid body or `Idempotency-Key` (field-level `details`).                                         |
+| `409`  | Above the available balance, or `Idempotency-Key` already used with a different request.           |
+| `429`  | Rate limit exceeded; payouts share the per-merchant limit with payment creations.                  |
+
 ## Idempotency
 
 Every `POST` that creates something needs an `Idempotency-Key` header: 1-255 visible ASCII
-characters, unique per operation you intend to perform (a UUID is ideal). Creation, retry and
-refund keys are separate namespaces, so reusing a value across them never makes a request
-ambiguous.
+characters, unique per operation you intend to perform (a UUID is ideal). Creation, retry,
+refund, capture/void and payout keys are separate namespaces, so reusing a value across them
+never makes a request ambiguous.
 
-| Operation      | Stored in                                            | Unique per | Same request means                     |
-| -------------- | ---------------------------------------------------- | ---------- | -------------------------------------- |
-| Create         | `payments.idempotency_key`                           | merchant   | same `amount`, `currency`, `reference` |
-| Retry          | `payment_retry_requests` (one row per retry attempt) | merchant   | same payment ID                        |
-| Refund         | `refunds.idempotency_key`                            | merchant   | same payment ID, `amount`, `reference` |
-| Capture / void | `payment_actions.idempotency_key`                    | merchant   | same payment ID, action, `amount`      |
+| Operation      | Stored in                                            | Unique per | Same request means                                              |
+| -------------- | ---------------------------------------------------- | ---------- | --------------------------------------------------------------- |
+| Create         | `payments.idempotency_key`                           | merchant   | same `amount`, `currency`, `reference`                          |
+| Retry          | `payment_retry_requests` (one row per retry attempt) | merchant   | same payment ID                                                 |
+| Refund         | `refunds.idempotency_key`                            | merchant   | same payment ID, `amount`, `reference`                          |
+| Capture / void | `payment_actions.idempotency_key`                    | merchant   | same payment ID, action, `amount`                               |
+| Payout         | `payouts.idempotency_key`                            | merchant   | same `amount`, `currency`, every destination field, `reference` |
 
 - **Same key, same request:** `200` with `Idempotent-Replayed: true` and the payment's **current**
   state, which may have moved on since the first response (e.g. `PENDING` → `SUCCEEDED`). No
@@ -247,16 +336,18 @@ ambiguous.
   of a versioned canonical form built from the validated input:
   `["payments.create.v1", amount, currency, reference ?? null]` (with manual capture,
   `["payments.create.v2", amount, currency, reference ?? null, "MANUAL"]`),
-  `["payments.retry.v1", paymentId]`, `["payments.action.v1", paymentId, type, amount ?? null]` or
+  `["payments.retry.v1", paymentId]`, `["payments.action.v1", paymentId, type, amount ?? null]`,
   `["refunds.create.v1", paymentId, amount ?? null, reference ?? null]` (so a full refund, with no
-  amount, is a different request from any explicit amount). JSON key order and whitespace do not
-  matter.
+  amount, is a different request from any explicit amount) or
+  `["payouts.create.v1", amount, currency, bankCode, accountNumber, accountName, reference ?? null]`.
+  JSON key order and whitespace do not matter.
 - **Concurrency:** unique constraints on `(merchant_id, idempotency_key)` decide races. Concurrent
   creations with one key race on the insert; the losers hit the constraint and are answered from
   the winner's row. Retries and refunds additionally lock the payment row
   (`SELECT ... FOR UPDATE`), so concurrent retries or refunds of one payment run one at a time:
   with the same key the later ones replay, with different keys they see the effect of the earlier
-  ones (a payment no longer `FAILED`, less left to refund) and may get `409`.
+  ones (a payment no longer `FAILED`, less left to refund) and may get `409`. Payouts take a
+  transaction lock per merchant and currency instead, with the same effect on the balance.
 - **Retention:** keys never expire.
 
 ## Currencies and amounts
@@ -275,8 +366,8 @@ exact in JSON numbers.
 
 ## Merchant webhooks
 
-PayGuard notifies a merchant of every payment and refund outcome by POSTing a signed event to the
-merchant's own endpoint, so merchants need not poll. Requires `MERCHANT_WEBHOOK_ENCRYPTION_KEY`
+PayGuard notifies a merchant of every payment, refund and payout outcome by POSTing a signed event
+to the merchant's own endpoint, so merchants need not poll. Requires `MERCHANT_WEBHOOK_ENCRYPTION_KEY`
 on the server; without it the endpoint routes below that store a secret answer `503`.
 
 | Method and path                           | Description                                                              |
@@ -303,9 +394,9 @@ deploy the new secret without rejecting deliveries meanwhile.
 
 **Events.** `payment.succeeded`, `payment.failed`, `refund.succeeded` and `refund.failed`, and
 for manual capture `payment.authorized`, `payment.canceled` (voided), `payment.capture_failed` and
-`payment.void_failed` (the provider refused it; the payment stays `AUTHORIZED`). A capture's
-success is `payment.succeeded`. Each is recorded in the same transaction as the outcome. A
-delivery's body is the event:
+`payment.void_failed` (the provider refused it; the payment stays `AUTHORIZED`), and
+`payout.succeeded` and `payout.failed`. A capture's success is `payment.succeeded`. Each is
+recorded in the same transaction as the outcome. A delivery's body is the event:
 
 ```json
 {
@@ -321,8 +412,8 @@ delivery's body is the event:
 }
 ```
 
-`data` is the payment (or refund) exactly as `GET /v1/payments/:id` (or `GET /v1/refunds/:id`)
-returned it when the event happened. Headers: `PayGuard-Event-Id`, `PayGuard-Event-Type`, and
+`data` is the payment, refund or payout exactly as `GET /v1/payments/:id`, `GET /v1/refunds/:id` or
+`GET /v1/payouts/:id` returned it when the event happened. Headers: `PayGuard-Event-Id`, `PayGuard-Event-Type`, and
 `PayGuard-Signature`.
 
 **Verifying a delivery.** `PayGuard-Signature` is `t=<unix seconds>,v1=<hex>`, with a second
@@ -442,10 +533,10 @@ delayed lookup runs, which then finds nothing left to do.
 
 ## Rate limiting
 
-| Limit                                   | Key       | Default | Applies to                                                                                                                   |
-| --------------------------------------- | --------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks                                                                     |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments`, `/retry`, `/capture`, `/void`, `/refunds` and `/v1/events/:id/redeliver` combined, after authentication |
+| Limit                                   | Key       | Default | Applies to                                                                                                                                  |
+| --------------------------------------- | --------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks                                                                                    |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments`, `/retry`, `/capture`, `/void`, `/refunds`, `/v1/payouts` and `/v1/events/:id/redeliver` combined, after authentication |
 
 - Token buckets allow a burst up to the limit, then refill steadily. Over the limit, the response
   is `429` with `Retry-After: <seconds>` and the standard error body.

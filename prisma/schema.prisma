@@ -32,6 +32,7 @@ model Merchant {
   webhookEndpoint MerchantWebhookEndpoint?
   events          MerchantEvent[]
   paymentActions  PaymentAction[]
+  payouts         Payout[]
 
   @@map("merchants")
 }
@@ -264,6 +265,82 @@ model Refund {
   @@map("refunds")
 }
 
+// Allowed transitions live in src/payouts/payout-lifecycle.ts.
+enum PayoutStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+
+  @@map("payout_status")
+}
+
+enum PayoutFailureCode {
+  DECLINED
+  PROVIDER_UNAVAILABLE
+
+  @@map("payout_failure_code")
+}
+
+// Money sent from a merchant's available balance in one currency to its bank account. The
+// payouts_within_available_balance trigger refuses a payout larger than that balance, whatever
+// the caller; see src/payouts/balance.ts for how the balance is derived.
+model Payout {
+  id                String             @id @default(uuid(7)) @db.Uuid
+  merchantId        String             @map("merchant_id") @db.Uuid
+  amount            BigInt
+  currency          String             @db.Char(3)
+  status            PayoutStatus       @default(PENDING)
+  // The destination account as the merchant gave it; responses show only its last four digits.
+  bankCode          String             @map("bank_code") @db.VarChar(11)
+  accountNumber     String             @map("account_number") @db.VarChar(34)
+  accountName       String             @map("account_name") @db.VarChar(100)
+  reference         String?            @db.VarChar(64)
+  providerReference String?            @map("provider_reference") @db.VarChar(100)
+  failureCode       PayoutFailureCode? @map("failure_code")
+
+  idempotencyKey     String @map("idempotency_key") @db.VarChar(255)
+  requestFingerprint String @map("request_fingerprint") @db.Char(64)
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  // Set before the provider is first contacted; from then on the payout is only looked up.
+  submittedAt DateTime? @map("submitted_at") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant       Merchant        @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  outboxJobs     OutboxJob[]
+  events         PayoutEvent[]
+  merchantEvents MerchantEvent[]
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([merchantId, createdAt])
+  @@map("payouts")
+}
+
+// Append-only lifecycle history of a payout, like payment_events for payments. Event types are
+// listed in src/payouts/payout-events.ts.
+model PayoutEvent {
+  id           String             @id @default(uuid(7)) @db.Uuid
+  payoutId     String             @map("payout_id") @db.Uuid
+  type         String             @db.VarChar(64)
+  source       PaymentEventSource
+  statusBefore PayoutStatus?      @map("status_before")
+  statusAfter  PayoutStatus?      @map("status_after")
+  // Set only for operator events; self-declared, see src/audit/operator-audit.ts.
+  actor        String?            @db.VarChar(200)
+  requestId    String?            @map("request_id") @db.VarChar(128)
+  // No foreign key: completed jobs may be pruned, their history may not.
+  outboxJobId  String?            @map("outbox_job_id") @db.Uuid
+  details      Json               @default("{}")
+  createdAt    DateTime           @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(3)
+
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Restrict)
+
+  @@index([payoutId, createdAt])
+  @@index([type, createdAt])
+  @@map("payout_events")
+}
+
 // Where a merchant receives its event notifications. One per merchant, managed by the merchant
 // over the API.
 model MerchantWebhookEndpoint {
@@ -309,16 +386,17 @@ enum MerchantWebhookDeliveryError {
 }
 
 // An outcome a merchant is notified of, recorded in the transaction that produced it. data is the
-// payment or refund as the merchant API returned it at that moment. Event types are listed in
-// src/merchant-webhooks/merchant-events.ts.
+// payment, refund or payout as the merchant API returned it at that moment. Event types are listed
+// in src/merchant-webhooks/merchant-events.ts. Payout events have no payment or attempt.
 model MerchantEvent {
   id         String   @id @default(uuid(7)) @db.Uuid
   merchantId String   @map("merchant_id") @db.Uuid
   type       String   @db.VarChar(64)
-  paymentId  String   @map("payment_id") @db.Uuid
+  paymentId  String?  @map("payment_id") @db.Uuid
   // The resolved attempt, or for refund events the charge being refunded.
-  attemptId  String   @map("attempt_id") @db.Uuid
+  attemptId  String?  @map("attempt_id") @db.Uuid
   refundId   String?  @map("refund_id") @db.Uuid
+  payoutId   String?  @map("payout_id") @db.Uuid
   data       Json
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
@@ -330,14 +408,16 @@ model MerchantEvent {
   lastError          MerchantWebhookDeliveryError? @map("last_error")
   deliveredAt        DateTime?                     @map("delivered_at") @db.Timestamptz(3)
 
-  merchant  Merchant       @relation(fields: [merchantId], references: [id], onDelete: Restrict)
-  payment   Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
-  attempt   PaymentAttempt @relation(fields: [attemptId], references: [id], onDelete: Restrict)
-  refund    Refund?        @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  merchant  Merchant        @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  payment   Payment?        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt   PaymentAttempt? @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  refund    Refund?         @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  payout    Payout?         @relation(fields: [payoutId], references: [id], onDelete: Restrict)
   outboxJob OutboxJob?
 
   @@index([merchantId, createdAt])
   @@index([paymentId])
+  @@index([payoutId])
   @@map("merchant_events")
 }
 
@@ -368,6 +448,8 @@ enum OutboxJobType {
   DELIVER_MERCHANT_EVENT
   PROCESS_PAYMENT_ACTION
   RECONCILE_PAYMENT_ACTION
+  PROCESS_PAYOUT
+  RECONCILE_PAYOUT
 
   @@map("outbox_job_type")
 }
@@ -395,11 +477,12 @@ enum OutboxErrorCategory {
   @@map("outbox_error_category")
 }
 
+// Every job is about a payment (and one of its attempts) or about a payout, never both.
 model OutboxJob {
   id              String               @id @default(uuid(7)) @db.Uuid
   type            OutboxJobType
-  paymentId       String               @map("payment_id") @db.Uuid
-  attemptId       String               @map("attempt_id") @db.Uuid
+  paymentId       String?              @map("payment_id") @db.Uuid
+  attemptId       String?              @map("attempt_id") @db.Uuid
   status          OutboxJobStatus      @default(QUEUED)
   // Number of times the job has been claimed, including claims lost to a crash.
   runCount        Int                  @default(0) @map("run_count")
@@ -419,26 +502,29 @@ model OutboxJob {
   merchantEventId String?              @unique @map("merchant_event_id") @db.Uuid
   // Set only on capture and void jobs, whose attempt is the authorization acted on.
   paymentActionId String?              @map("payment_action_id") @db.Uuid
+  // Set on payout jobs and on deliveries of payout events.
+  payoutId        String?              @map("payout_id") @db.Uuid
   createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
   completedAt     DateTime?            @map("completed_at") @db.Timestamptz(3)
 
-  payment       Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
-  attempt       PaymentAttempt        @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  payment       Payment?              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt       PaymentAttempt?       @relation(fields: [attemptId], references: [id], onDelete: Restrict)
   webhookEvent  ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
   refund        Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
   merchantEvent MerchantEvent?        @relation(fields: [merchantEventId], references: [id], onDelete: Restrict)
   paymentAction PaymentAction?        @relation(fields: [paymentActionId], references: [id], onDelete: Restrict)
+  payout        Payout?               @relation(fields: [payoutId], references: [id], onDelete: Restrict)
 
-  // One job of each type per attempt (attempt jobs), per refund (refund jobs) or per payment action
-  // (capture and void jobs), so re-enqueueing is a no-op: enforced by the partial unique indexes
-  // outbox_jobs_attempt_id_type_key, outbox_jobs_refund_id_type_key and
-  // outbox_jobs_payment_action_id_type_key, created in migrations because Prisma cannot express
-  // them. Webhook and delivery jobs are unique per provider event or merchant event instead.
+  // One job of each type per attempt (attempt jobs), per refund (refund jobs), per payment action
+  // (capture and void jobs) or per payout (payout jobs), so re-enqueueing is a no-op: enforced by
+  // partial unique indexes created in migrations, because Prisma cannot express them. Webhook and
+  // delivery jobs are unique per provider event or merchant event instead.
   @@index([attemptId])
   @@index([paymentId])
   @@index([refundId])
   @@index([paymentActionId])
+  @@index([payoutId])
   @@map("outbox_jobs")
 }
 

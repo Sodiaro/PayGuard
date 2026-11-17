@@ -12,7 +12,8 @@ import {
   PaymentAttemptStatus,
   PaymentEventSource,
 } from '../../generated/prisma/enums.js';
-import type { ClaimedJob } from '../../outbox/outbox-store.js';
+import type { ClaimedJob, PaymentJob } from '../../outbox/outbox-store.js';
+import { PayoutJobProcessor } from '../../payouts/payout-job-processor.js';
 import { OutboxStore } from '../../outbox/outbox-store.js';
 import { MerchantEventDeliveryProcessor } from '../../merchant-webhooks/merchant-event-delivery-processor.js';
 import { RefundJobProcessor } from '../../refunds/refund-job-processor.js';
@@ -70,6 +71,7 @@ export class AttemptJobProcessor {
     private readonly refunds: RefundJobProcessor,
     private readonly deliveries: MerchantEventDeliveryProcessor,
     private readonly actions: PaymentActionJobProcessor,
+    private readonly payouts: PayoutJobProcessor,
     config: ConfigService<CoreEnvironment, true>,
   ) {
     this.reconciliationDelaySeconds = config.get(
@@ -115,6 +117,14 @@ export class AttemptJobProcessor {
   }
 
   private async dispatch(job: ClaimedJob): Promise<void> {
+    if (job.type === OutboxJobType.DELIVER_MERCHANT_EVENT) {
+      await this.deliveries.process(job);
+      return;
+    }
+    if (job.payoutId !== null) {
+      await this.payouts.process(job);
+      return;
+    }
     // Webhook events must be classified even when the attempt already has an outcome.
     if (job.type === OutboxJobType.APPLY_WEBHOOK_EVENT) {
       await this.webhooks.process(job);
@@ -125,10 +135,6 @@ export class AttemptJobProcessor {
       job.type === OutboxJobType.RECONCILE_REFUND
     ) {
       await this.refunds.process(job);
-      return;
-    }
-    if (job.type === OutboxJobType.DELIVER_MERCHANT_EVENT) {
-      await this.deliveries.process(job);
       return;
     }
     if (
@@ -173,7 +179,7 @@ export class AttemptJobProcessor {
   }
 
   private async processAttempt(
-    job: ClaimedJob,
+    job: PaymentJob,
     attempt: PendingAttempt,
   ): Promise<void> {
     // Once submission may have happened, the provider might hold an outcome; submitting again
@@ -217,7 +223,7 @@ export class AttemptJobProcessor {
   }
 
   private async reconcileAttempt(
-    job: ClaimedJob,
+    job: PaymentJob,
     attempt: PendingAttempt,
   ): Promise<void> {
     let lookup: ProviderLookupResult;
@@ -287,7 +293,7 @@ export class AttemptJobProcessor {
   }
 
   private async submit(
-    job: ClaimedJob,
+    job: PaymentJob,
     attempt: PendingAttempt,
     onUnknownOutcome: UnknownOutcomeHandler,
   ): Promise<void> {
@@ -323,7 +329,7 @@ export class AttemptJobProcessor {
   }
 
   private async recordAndComplete(
-    job: ClaimedJob,
+    job: PaymentJob,
     resolution: AttemptResolution,
     source: PaymentEventSource,
     providerDurationMs?: number,
@@ -379,7 +385,7 @@ export class AttemptJobProcessor {
   // investigation and never applied.
   private async recordIfContradicted(
     tx: Prisma.TransactionClient,
-    job: ClaimedJob,
+    job: PaymentJob,
     resolution: AttemptResolution,
     source: PaymentEventSource,
   ): Promise<boolean> {
@@ -412,7 +418,7 @@ export class AttemptJobProcessor {
   }
 
   private async handOverToReconciliation(
-    job: ClaimedJob,
+    job: PaymentJob,
     delaySeconds: number,
     category?: OutboxErrorCategory,
   ): Promise<void> {

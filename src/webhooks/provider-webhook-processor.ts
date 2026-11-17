@@ -7,7 +7,7 @@ import {
   ProviderWebhookEventResult,
   ProviderWebhookEventStatus,
 } from '../generated/prisma/enums.js';
-import type { ClaimedJob } from '../outbox/outbox-store.js';
+import type { PaymentJob } from '../outbox/outbox-store.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import { applyAttemptResolution } from '../payments/attempt-outcomes.js';
 import {
@@ -42,7 +42,7 @@ export class ProviderWebhookProcessor {
     private readonly outbox: OutboxStore,
   ) {}
 
-  async process(job: ClaimedJob): Promise<void> {
+  async process(job: PaymentJob): Promise<void> {
     if (!job.webhookEventId) {
       throw new Error(`Webhook job ${job.id} has no webhook event`);
     }
@@ -88,7 +88,7 @@ export class ProviderWebhookProcessor {
 
   private async decideAndApply(
     tx: Prisma.TransactionClient,
-    job: ClaimedJob,
+    job: PaymentJob,
     event: StoredWebhookEvent & { attemptId: string },
   ): Promise<ProviderWebhookEventResult> {
     const webhookEventId = job.webhookEventId!;
@@ -164,13 +164,13 @@ export class ProviderWebhookProcessor {
 
   private async completeOrRollBack(
     tx: Prisma.TransactionClient,
-    job: ClaimedJob,
+    job: PaymentJob,
   ): Promise<void> {
     if (!(await this.outbox.complete(tx, job))) throw new LeaseLostError();
   }
 
   private log(
-    job: ClaimedJob,
+    job: PaymentJob,
     result: ProviderWebhookEventResult,
     repeated: boolean,
   ): void {
@@ -194,7 +194,7 @@ const NEEDS_ATTENTION: ReadonlySet<ProviderWebhookEventResult> = new Set([
   ProviderWebhookEventResult.PAYLOAD_CONFLICT,
 ]);
 
-function fields(job: ClaimedJob) {
+function fields(job: PaymentJob) {
   return {
     jobId: job.id,
     webhookEventId: job.webhookEventId,

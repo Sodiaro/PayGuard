@@ -12,7 +12,10 @@ import {
   encodePaymentCursor,
 } from '../payments/payment-cursor.js';
 import { DEFAULT_PAGE_SIZE } from '../payments/payment.requests.js';
-import { merchantEventEnvelope } from './merchant-events.js';
+import {
+  merchantEventEnvelope,
+  merchantEventSubject,
+} from './merchant-events.js';
 import type { ListMerchantEventsQuery } from './merchant-webhook.requests.js';
 import type {
   MerchantEventListResponse,
@@ -112,9 +115,8 @@ export class MerchantEventsService {
           WHERE id = ${event.outboxJob.id}::uuid AND status IN ('COMPLETED', 'DEAD')`;
       } else {
         await enqueueOutboxJob(tx, {
+          ...merchantEventSubject(event),
           type: OutboxJobType.DELIVER_MERCHANT_EVENT,
-          paymentId: event.paymentId,
-          attemptId: event.attemptId,
           merchantEventId: event.id,
           requestId: currentRequestId(),
         });

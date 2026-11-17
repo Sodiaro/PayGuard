@@ -39,7 +39,12 @@ moves; see [Limitations](#limitations).
   through the same outbox, submission marker and lookups as payments. Pending and succeeded
   refunds together are kept within the payment's amount by a row lock in the API and, independently,
   by a database trigger, so concurrent refunds cannot over-refund.
-- **Signed merchant notifications.** Every payment and refund outcome is recorded as an event in
+- **Payouts that cannot exceed the balance.** A merchant's balance per currency is derived from
+  its payments, refunds and payouts rather than stored, so it cannot drift from them. Payouts to a
+  bank account go through the same outbox and lookups; a transaction lock per merchant and
+  currency, held by the API and again by a database trigger, means concurrent payouts can never
+  together exceed the available balance.
+- **Signed merchant notifications.** Every payment, refund and payout outcome is recorded as an event in
   the transaction that produces it and delivered to the merchant's endpoint through the outbox,
   signed with a per-merchant secret (stored encrypted, rotatable with an overlap). Deliveries are
   retried with backoff and can be redelivered; merchant URLs are restricted to public `https`
@@ -146,10 +151,16 @@ A succeeded payment can be refunded in full or in part with `POST /v1/payments/{
 `Idempotency-Key`. The refund is processed asynchronously like a payment; its outcome is on
 `GET /v1/refunds/{id}`, and the payment reports `amountRefunded`.
 
+`GET /v1/balance` shows, per currency, what succeeded payments captured, less refunds and payouts.
+`POST /v1/payouts` (`{"amount": 200000, "currency": "NGN", "destination": {"bankCode": "058",
+"accountNumber": "0123456789", "accountName": "Acme Ltd"}}`, with an `Idempotency-Key`) sends part
+of the available balance to a bank account; it is refused with `409` above it, and its outcome is
+on `GET /v1/payouts/{id}`.
+
 Instead of polling, a merchant can register an endpoint with `PUT /v1/webhook-endpoint`
 (`{"url": "https://..."}`; the response carries the signing secret, once). Each outcome is then
-POSTed there as a `payment.succeeded`, `payment.failed`, `refund.succeeded` or `refund.failed`
-event with a `PayGuard-Signature` header, and `GET /v1/events` shows every event and its delivery
+POSTed there as an event such as `payment.succeeded`, `refund.failed` or `payout.succeeded`,
+with a `PayGuard-Signature` header, and `GET /v1/events` shows every event and its delivery
 state. Full contract: [docs/api.md](docs/api.md).
 
 ## Testing and reliability
@@ -181,9 +192,10 @@ any real provider behaves. Details: [docs/testing.md](docs/testing.md).
 
 ## Limitations
 
-- **Simulated payments only.** There is no real provider integration, card handling or payout;
-  refunds, captures and voids go to the simulator too, and no money moves. Authorizations never
-  expire in the simulator. The simulator is refused when `NODE_ENV=production`, so
+- **Simulated payments only.** There is no real provider integration or card handling; refunds,
+  captures, voids and payouts go to the simulator too, and no money moves. Authorizations never
+  expire in the simulator. Payouts have no schedule, fees or saved bank accounts, and the balance
+  is recomputed from the merchant's full history on each read. The simulator is refused when `NODE_ENV=production`, so
   the API and worker cannot run in production until a real provider is implemented.
 - **At most one charge per attempt depends on the provider** deduplicating by attempt ID and
   answering lookups consistently. The simulator does by construction; a real provider would have
@@ -202,8 +214,8 @@ The full list is in [docs/architecture.md](docs/architecture.md#limitations).
 
 - [Architecture](docs/architecture.md): modules, payment lifecycle, processing and recovery,
   webhook processing, API keys, database roles, conventions
-- [API](docs/api.md): authentication, payments, idempotency, currencies, webhooks, rate limits,
-  errors
+- [API](docs/api.md): authentication, payments, refunds, balance and payouts, idempotency,
+  currencies, webhooks, rate limits, errors
 - [Configuration](docs/configuration.md): environment variables, environments, simulator, proxies
 - [Development](docs/development.md): detailed setup, Docker Compose stack, commands
 - [Operations](docs/operations.md): operator CLI, investigating payments, health, metrics,

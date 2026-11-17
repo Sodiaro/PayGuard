@@ -228,4 +228,58 @@ describe('SimulatedPaymentProvider', () => {
       ).resolves.toMatchObject({ status: 'succeeded' });
     });
   });
+
+  describe('payouts', () => {
+    const payout = {
+      payoutId: '0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a6d',
+      merchantId: request.merchantId,
+      amount: 200000,
+      currency: 'NGN',
+      destination: {
+        bankCode: '058',
+        accountNumber: '0123456789',
+        accountName: 'Test Merchant Ltd',
+      },
+    };
+
+    it('follows the payout outcome with a payout-derived reference, and looks it up the same way', async () => {
+      const provider = new SimulatedPaymentProvider({
+        payment: SimulatorOutcome.Succeeded,
+        payout: SimulatorOutcome.Declined,
+      });
+      const processed = await provider.processPayout(payout);
+
+      expect(processed).toEqual({
+        outcome: 'declined',
+        providerReference: expect.stringMatching(/^simpo_[0-9a-f]{24}$/),
+      });
+      await expect(
+        provider.lookupPayout({ payoutId: payout.payoutId }),
+      ).resolves.toEqual({
+        status: 'declined',
+        providerReference: (processed as { providerReference: string })
+          .providerReference,
+      });
+    });
+
+    it('reports a refused payout as unknown to lookup, and loses answers when ambiguous', async () => {
+      await expect(
+        new SimulatedPaymentProvider({
+          payment: SimulatorOutcome.Succeeded,
+          payout: SimulatorOutcome.Unavailable,
+        }).lookupPayout({ payoutId: payout.payoutId }),
+      ).resolves.toEqual({ status: 'not_found' });
+
+      const ambiguous = new SimulatedPaymentProvider(
+        SimulatorOutcome.Succeeded,
+        true,
+      );
+      await expect(ambiguous.processPayout(payout)).rejects.toBeInstanceOf(
+        ProviderTimeoutError,
+      );
+      await expect(
+        ambiguous.lookupPayout({ payoutId: payout.payoutId }),
+      ).resolves.toMatchObject({ status: 'succeeded' });
+    });
+  });
 });

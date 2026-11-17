@@ -114,6 +114,25 @@ export type ProviderActionLookupResult =
   | { status: 'not_found' }
   | { status: 'unavailable' };
 
+// Sending money from the merchant's balance to a bank account. payoutId is the provider's
+// idempotency key for the payout.
+export interface ProviderPayoutRequest {
+  payoutId: string;
+  merchantId: string;
+  amount: number;
+  currency: string;
+  destination: { bankCode: string; accountNumber: string; accountName: string };
+}
+
+// `declined` means the provider or the receiving bank refused the payout and no money left.
+export type ProviderPayoutResult = ProviderActionResult;
+
+export interface ProviderPayoutLookupRequest {
+  payoutId: string;
+}
+
+export type ProviderPayoutLookupResult = ProviderActionLookupResult;
+
 export interface PaymentProvider {
   readonly id: string;
   processPayment(
@@ -131,4 +150,8 @@ export interface PaymentProvider {
   lookupPaymentAction(
     request: ProviderActionLookupRequest,
   ): Promise<ProviderActionLookupResult>;
+  processPayout(request: ProviderPayoutRequest): Promise<ProviderPayoutResult>;
+  lookupPayout(
+    request: ProviderPayoutLookupRequest,
+  ): Promise<ProviderPayoutLookupResult>;
 }

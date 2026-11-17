@@ -11,7 +11,7 @@ import {
   RefundStatus,
 } from '../generated/prisma/enums.js';
 import { recordRefundOutcomeEvent } from '../merchant-webhooks/merchant-events.js';
-import type { ClaimedJob } from '../outbox/outbox-store.js';
+import type { PaymentJob } from '../outbox/outbox-store.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import {
   PaymentEventType,
@@ -69,7 +69,7 @@ export class RefundJobProcessor {
     );
   }
 
-  async process(job: ClaimedJob): Promise<void> {
+  async process(job: PaymentJob): Promise<void> {
     if (!job.refundId) throw new Error(`Refund job ${job.id} has no refund`);
 
     const refund = await this.prisma.refund.findFirst({
@@ -101,7 +101,7 @@ export class RefundJobProcessor {
   }
 
   private async processRefund(
-    job: ClaimedJob,
+    job: PaymentJob,
     refund: PendingRefund,
   ): Promise<void> {
     // Once submission may have happened, the provider might already be returning the money;
@@ -143,7 +143,7 @@ export class RefundJobProcessor {
   }
 
   private async reconcileRefund(
-    job: ClaimedJob,
+    job: PaymentJob,
     refund: PendingRefund,
   ): Promise<void> {
     let lookup: ProviderRefundLookupResult;
@@ -201,7 +201,7 @@ export class RefundJobProcessor {
   }
 
   private async submit(
-    job: ClaimedJob,
+    job: PaymentJob,
     refund: PendingRefund,
     onUnknownOutcome: UnknownOutcomeHandler,
   ): Promise<void> {
@@ -242,7 +242,7 @@ export class RefundJobProcessor {
   }
 
   private async recordAndComplete(
-    job: ClaimedJob,
+    job: PaymentJob,
     resolution: RefundResolution,
     source: PaymentEventSource,
     providerDurationMs?: number,
@@ -295,7 +295,7 @@ export class RefundJobProcessor {
 
   private async recordIfContradicted(
     tx: Prisma.TransactionClient,
-    job: ClaimedJob,
+    job: PaymentJob,
     resolution: RefundResolution,
     source: PaymentEventSource,
   ): Promise<boolean> {
@@ -326,7 +326,7 @@ export class RefundJobProcessor {
   }
 
   private async handOverToReconciliation(
-    job: ClaimedJob,
+    job: PaymentJob,
     delaySeconds: number,
     category?: OutboxErrorCategory,
   ): Promise<void> {
@@ -360,7 +360,7 @@ export class RefundJobProcessor {
   }
 
   private retryLater(
-    job: ClaimedJob,
+    job: PaymentJob,
     category: OutboxErrorCategory,
   ): Promise<void> {
     return retryLater(this.outbox, this.logger, job, category);
@@ -371,7 +371,7 @@ export class RefundJobProcessor {
 // never overwrites a terminal state. The payment's own status is untouched by refunds.
 async function applyRefundResolution(
   tx: Prisma.TransactionClient,
-  job: ClaimedJob,
+  job: PaymentJob,
   resolution: RefundResolution,
   source: PaymentEventSource,
 ): Promise<boolean> {
@@ -402,7 +402,7 @@ async function applyRefundResolution(
   return true;
 }
 
-function eventFor(job: ClaimedJob) {
+function eventFor(job: PaymentJob) {
   return {
     paymentId: job.paymentId,
     attemptId: job.attemptId,

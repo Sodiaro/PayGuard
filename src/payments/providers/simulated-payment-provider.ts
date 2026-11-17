@@ -10,6 +10,10 @@ import {
   type ProviderLookupResult,
   type ProviderPaymentRequest,
   type ProviderPaymentResult,
+  type ProviderPayoutLookupRequest,
+  type ProviderPayoutLookupResult,
+  type ProviderPayoutRequest,
+  type ProviderPayoutResult,
   type ProviderRefundLookupRequest,
   type ProviderRefundLookupResult,
   type ProviderRefundRequest,
@@ -28,19 +32,22 @@ export interface SimulatorOutcomes {
   refund?: SimulatorOutcome;
   // Captures and voids of authorizations.
   action?: SimulatorOutcome;
+  payout?: SimulatorOutcome;
 }
 
 // The outcome comes from operator configuration, never from the merchant's request. The simulated
-// ledger is a pure function of that configuration and the attempt, refund or action ID, so lookups
-// give the same answer after a restart; it assumes everything it is asked about was submitted.
+// ledger is a pure function of that configuration and the attempt, refund, action or payout ID, so
+// lookups give the same answer after a restart; it assumes everything it is asked about was
+// submitted.
 export class SimulatedPaymentProvider implements PaymentProvider {
   readonly id = 'simulator';
   private readonly paymentOutcome: SimulatorOutcome;
   private readonly refundOutcome: SimulatorOutcome;
   private readonly actionOutcome: SimulatorOutcome;
+  private readonly payoutOutcome: SimulatorOutcome;
 
-  // With ambiguousSubmissions, every submission (payment, refund, capture or void) is processed
-  // but its answer is lost to a timeout, leaving the outcome to be recovered through a lookup.
+  // With ambiguousSubmissions, every submission (payment, refund, capture, void or payout) is
+  // processed but its answer is lost to a timeout, leaving the outcome to a lookup.
   constructor(
     outcomes: SimulatorOutcome | SimulatorOutcomes,
     private readonly ambiguousSubmissions = false,
@@ -50,6 +57,7 @@ export class SimulatedPaymentProvider implements PaymentProvider {
     this.paymentOutcome = resolved.payment;
     this.refundOutcome = resolved.refund ?? SimulatorOutcome.Succeeded;
     this.actionOutcome = resolved.action ?? SimulatorOutcome.Succeeded;
+    this.payoutOutcome = resolved.payout ?? SimulatorOutcome.Succeeded;
   }
 
   processPayment(
@@ -123,6 +131,21 @@ export class SimulatedPaymentProvider implements PaymentProvider {
     );
   }
 
+  processPayout(request: ProviderPayoutRequest): Promise<ProviderPayoutResult> {
+    return this.submitAction(
+      this.payoutOutcome,
+      payoutReferenceFor(request.payoutId),
+    );
+  }
+
+  lookupPayout(
+    request: ProviderPayoutLookupRequest,
+  ): Promise<ProviderPayoutLookupResult> {
+    return Promise.resolve(
+      lookupResult(this.payoutOutcome, payoutReferenceFor(request.payoutId)),
+    );
+  }
+
   private submitAction(
     outcome: SimulatorOutcome,
     providerReference: string,
@@ -176,4 +199,8 @@ export function actionReferenceFor(
 ): string {
   const prefix = type === 'capture' ? 'simcp' : 'simvd';
   return `${prefix}_${createHash('sha256').update(actionId).digest('hex').slice(0, 24)}`;
+}
+
+export function payoutReferenceFor(payoutId: string): string {
+  return `simpo_${createHash('sha256').update(payoutId).digest('hex').slice(0, 24)}`;
 }

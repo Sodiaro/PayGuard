@@ -29,7 +29,8 @@ API-only settings and the CLI needs no provider.
 | `PAYMENT_SIMULATOR_OUTCOME`                                                      | all                   | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                     |
 | `PAYMENT_SIMULATOR_REFUND_OUTCOME`                                               | all                   | `SUCCEEDED`     | Simulator result for every refund: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                      |
 | `PAYMENT_SIMULATOR_CAPTURE_OUTCOME`                                              | all                   | `SUCCEEDED`     | Simulator result for every capture and void: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`            |
-| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: submissions (payments and refunds) are processed but time out; lookups decide          |
+| `PAYMENT_SIMULATOR_PAYOUT_OUTCOME`                                               | all                   | `SUCCEEDED`     | Simulator result for every payout: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                      |
+| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: every submission is processed but its answer times out; lookups decide                 |
 | `OUTBOX_POLL_INTERVAL_MS`                                                        | all                   | `1000`          | Idle delay between outbox polls (100-60000)                                                    |
 | `OUTBOX_LEASE_SECONDS`                                                           | all                   | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)                       |
 | `OUTBOX_MAX_RUNS`                                                                | all                   | `10`            | Runs per job before it is parked as `DEAD` for investigation                                   |
@@ -95,11 +96,15 @@ authorized (the payment becomes `AUTHORIZED`), and its webhook is `payment.autho
 and voids then follow `PAYMENT_SIMULATOR_CAPTURE_OUTCOME` (references `simcp_` and `simvd_`); a
 declined or unavailable one leaves the payment `AUTHORIZED`.
 
-With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, every submission, payment or refund, is
-treated as processed but its answer times out. Payments and refunds then stay `PENDING` until
-reconciliation looks them up, after `RECONCILIATION_DELAY_SECONDS` (set it low, e.g. `5`, for
+Payouts follow `PAYMENT_SIMULATOR_PAYOUT_OUTCOME` (reference `simpo_<24 hex>`); a declined or
+unavailable payout is `FAILED` and its amount is available again. The simulator accepts any
+well-formed bank code and account number: nothing is checked against a real bank.
+
+With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, every submission (payment, refund, capture,
+void or payout) is treated as processed but its answer times out. It then stays `PENDING` until
+reconciliation looks it up, after `RECONCILIATION_DELAY_SECONDS` (set it low, e.g. `5`, for
 demos), and records the outcome. The simulated ledger is a pure function of the configuration and
-the attempt or refund ID, so lookups give the same answer after a restart. It assumes everything
+the attempt, refund, action or payout ID, so lookups give the same answer after a restart. It assumes everything
 it is asked about was submitted, so it cannot reproduce "never received" except in `UNAVAILABLE`
 mode.
 
