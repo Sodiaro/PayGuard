@@ -37,6 +37,14 @@ sql_as() {
     psql -h 127.0.0.1 -U "$role" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -At "$@"
 }
 json() { node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).$1"; }
+# output_has <grep options> <pattern> <command...>: runs the command to completion before matching;
+# piping into grep -q under pipefail fails when grep exits early and the writer gets SIGPIPE.
+output_has() {
+  local options=$1 pattern=$2 output
+  shift 2
+  output=$("$@") || return 1
+  grep -q "$options" -- "$pattern" <<<"$output"
+}
 step() { echo "== $*"; }
 fail() {
   echo "FAIL: $*" >&2
@@ -78,9 +86,10 @@ wait_for 90 "API liveness" curl -fsS "$api/health/live"
 
 step "Migrations applied to the fresh database"
 expected=$(find prisma/migrations -mindepth 1 -maxdepth 1 -type d | wc -l)
-applied=$(compose logs --no-color migrate | grep -c "Applying migration" || true)
+migrate_logs=$(compose logs --no-color migrate)
+applied=$(grep -c "Applying migration" <<<"$migrate_logs" || true)
 [ "$applied" -eq "$expected" ] || fail "applied $applied migrations, expected $expected"
-compose logs --no-color migrate | grep -q "All migrations have been successfully applied" ||
+grep -q "All migrations have been successfully applied" <<<"$migrate_logs" ||
   fail "migrate job did not finish"
 
 step "Provisioning a merchant"
@@ -97,12 +106,12 @@ step "Payment resolved by webhook, with a duplicate delivery"
 first=$(create_payment smoke-webhook)
 first_id=$(echo "$first" | json id)
 first_attempt=$(echo "$first" | json 'attempts[0].id')
-cli simulator:webhook --attempt "$first_attempt" --url http://api:3000 | grep -q "HTTP 202 accepted" ||
+output_has -F "HTTP 202 accepted" cli simulator:webhook --attempt "$first_attempt" --url http://api:3000 ||
   fail "webhook not accepted"
-cli simulator:webhook --attempt "$first_attempt" --url http://api:3000 | grep -q "HTTP 200 duplicate" ||
+output_has -F "HTTP 200 duplicate" cli simulator:webhook --attempt "$first_attempt" --url http://api:3000 ||
   fail "duplicate webhook not recognised"
 wait_for 30 "webhook payment SUCCEEDED" payment_is "$first_id" SUCCEEDED
-cli payment:inspect --payment "$first_id" | grep -qE 'PROVIDER_WEBHOOK +attempt\.resolved' ||
+output_has -E 'PROVIDER_WEBHOOK +attempt\.resolved' cli payment:inspect --payment "$first_id" ||
   fail "webhook resolution missing from history"
 
 step "Forged and unsigned webhooks rejected; simulator refused in production"
@@ -122,16 +131,16 @@ step "Payment resolved by the reconciliation lookup"
 second_id=$(create_payment smoke-lookup | json id)
 [ "$(payment_status "$second_id")" = PENDING ] || fail "second payment not PENDING"
 wait_for 60 "reconciled payment SUCCEEDED" payment_is "$second_id" SUCCEEDED
-cli payment:inspect --payment "$second_id" | grep -qE 'PROVIDER_LOOKUP +attempt\.resolved' ||
+output_has -E 'PROVIDER_LOOKUP +attempt\.resolved' cli payment:inspect --payment "$second_id" ||
   fail "lookup resolution missing from history"
 
 step "Operational state"
-cli payments:unresolved | grep -qx "No unresolved attempts." || fail "unresolved attempts remain"
+output_has -Fx "No unresolved attempts." cli payments:unresolved || fail "unresolved attempts remain"
 status=$(cli ops:status)
-echo "$status" | grep -qE 'PROCESSED +APPLIED +1' || fail "webhook result not in ops:status"
-echo "$status" | grep -qE 'Awaiting an operator: +0' || fail "attempts awaiting an operator"
-echo "$status" | grep -qE 'active +heartbeat' || fail "no active worker reported"
-cli ops:metrics | grep -q '^payguard_workers_active 1$' || fail "metrics do not show the worker"
+grep -qE 'PROCESSED +APPLIED +1' <<<"$status" || fail "webhook result not in ops:status"
+grep -qE 'Awaiting an operator: +0' <<<"$status" || fail "attempts awaiting an operator"
+grep -qE 'active +heartbeat' <<<"$status" || fail "no active worker reported"
+output_has -Fx 'payguard_workers_active 1' cli ops:metrics || fail "metrics do not show the worker"
 
 step "Production configuration fails closed before any work"
 payments_before=$(sql_as payguard_cli "$PAYGUARD_CLI_PASSWORD" -c 'SELECT count(*) FROM payments')
