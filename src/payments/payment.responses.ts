@@ -71,3 +71,15 @@ export class PaymentResponse {
   @ApiProperty()
   updatedAt: Date;
 }
+
+export class PaymentListResponse {
+  @ApiProperty({ type: [PaymentResponse], description: 'Newest first' })
+  data: PaymentResponse[];
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'Pass as cursor to read the next page; null on the last page',
+  })
+  nextCursor: string | null;
+}

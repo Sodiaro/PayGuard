@@ -30,8 +30,9 @@ No database. They cover:
 - Key usage tracking: the per-process throttle, its memory bound, and that a failed write never
   fails authentication.
 - Payments: payment and attempt transitions, retry eligibility, provider-result mapping,
-  request validation through the real `ValidationPipe`, idempotency keys and fingerprints, the
-  simulator (including lookups and ambiguous submissions), and controller status-code mapping.
+  request and listing-query validation through the real `ValidationPipe`, listing cursors,
+  idempotency keys and fingerprints, the simulator (including lookups and ambiguous submissions),
+  and controller status-code mapping.
 - Processing: backoff, worker polling through failures, heartbeats, graceful shutdown waiting
   for the batch in flight, and the in-process starter honouring `OUTBOX_WORKER_ENABLED`.
 - Health: queue and worker reasons, and `unavailable` when their queries fail.
@@ -52,7 +53,9 @@ Against **real PostgreSQL**, with the deployed database privileges:
 - Merchants and keys: provisioning (including concurrent duplicates), revocation, expiry,
   suspension, the CLI, and checks that no key reaches logs or responses.
 - Payments: asynchronous creation and every provider outcome, replays and `409` conflicts, and
-  genuinely concurrent requests sharing a key (`Promise.all`).
+  genuinely concurrent requests sharing a key (`Promise.all`). Listing: merchant scoping, every
+  filter, cursor pages that neither skip nor repeat a payment (including ones created in the same
+  millisecond, and while new payments arrive), and invalid queries.
 - Outbox: atomic creation (a database trigger forces a failure mid-transaction), competing
   workers, a claim skipping a locked row instead of waiting, lease recovery after a worker
   dies, lease fencing, duplicate delivery, internal-failure backoff, dead-lettering and requeue.

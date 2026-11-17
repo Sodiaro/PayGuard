@@ -26,8 +26,16 @@ import {
   resolveAttempt,
   retryEligibility,
 } from './payment-lifecycle.js';
-import type { CreatePaymentRequest } from './payment.requests.js';
-import type { PaymentResponse } from './payment.responses.js';
+import { decodePaymentCursor, encodePaymentCursor } from './payment-cursor.js';
+import {
+  DEFAULT_PAGE_SIZE,
+  type CreatePaymentRequest,
+  type ListPaymentsQuery,
+} from './payment.requests.js';
+import type {
+  PaymentListResponse,
+  PaymentResponse,
+} from './payment.responses.js';
 import {
   PAYMENT_PROVIDER,
   type PaymentProvider,
@@ -230,6 +238,47 @@ export class PaymentsService {
       include: WITH_ATTEMPTS,
     });
     return payment && toResponse(payment);
+  }
+
+  // Keyset pagination on (createdAt, id), newest first, so pages stay stable while payments arrive.
+  async listForMerchant(
+    merchantId: string,
+    query: ListPaymentsQuery,
+  ): Promise<PaymentListResponse> {
+    const limit = query.limit ?? DEFAULT_PAGE_SIZE;
+    const cursor = query.cursor ? decodePaymentCursor(query.cursor) : null;
+    const createdAt: Prisma.DateTimeFilter = {};
+    if (query.createdFrom) createdAt.gte = new Date(query.createdFrom);
+    if (query.createdTo) createdAt.lt = new Date(query.createdTo);
+
+    const where: Prisma.PaymentWhereInput = {
+      merchantId,
+      status: query.status,
+      reference: query.reference,
+      createdAt,
+    };
+    if (cursor) {
+      where.OR = [
+        { createdAt: { lt: cursor.createdAt } },
+        { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+      ];
+    }
+
+    const rows = await this.prisma.payment.findMany({
+      where,
+      include: WITH_ATTEMPTS,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+    });
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      data: page.map(toResponse),
+      nextCursor:
+        rows.length > limit && last
+          ? encodePaymentCursor({ createdAt: last.createdAt, id: last.id })
+          : null,
+    };
   }
 
   // A definite provider answer arriving outside the worker. Returns false when the attempt

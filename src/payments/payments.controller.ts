@@ -9,6 +9,7 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Query,
   Res,
   UseGuards,
 } from '@nestjs/common';
@@ -36,8 +37,8 @@ import {
   PaymentNotFoundError,
   PaymentNotRetryableError,
 } from './payment-errors.js';
-import { CreatePaymentRequest } from './payment.requests.js';
-import { PaymentResponse } from './payment.responses.js';
+import { CreatePaymentRequest, ListPaymentsQuery } from './payment.requests.js';
+import { PaymentListResponse, PaymentResponse } from './payment.responses.js';
 import {
   PaymentsService,
   type PaymentCommandResult,
@@ -122,6 +123,22 @@ export class PaymentsController {
     return respond(response, () =>
       this.payments.retry(auth.merchantId, id, idempotencyKey),
     );
+  }
+
+  @Get()
+  @ApiOperation({
+    summary: "List the authenticated merchant's payments, newest first",
+    description:
+      'Filters combine with AND. Pages hold at most limit payments; pass nextCursor as cursor to read ' +
+      'the next one, with the same filters.',
+  })
+  @ApiOkResponse({ type: PaymentListResponse })
+  @ApiBadRequestResponse({ type: ErrorResponse })
+  async list(
+    @CurrentMerchant() auth: AuthenticatedMerchant,
+    @Query() query: ListPaymentsQuery,
+  ): Promise<PaymentListResponse> {
+    return this.payments.listForMerchant(auth.merchantId, query);
   }
 
   @Get(':id')

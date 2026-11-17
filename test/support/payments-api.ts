@@ -37,6 +37,12 @@ export function paymentsApi(app: INestApplication<App>) {
       }
       return req.send();
     },
+    list(merchant: Merchant, query: Record<string, string | number> = {}) {
+      return request(server())
+        .get('/v1/payments')
+        .query(query)
+        .set('Authorization', `Bearer ${merchant.apiKey}`);
+    },
     get(merchant: Merchant, paymentId: string) {
       return request(server())
         .get(`/v1/payments/${paymentId}`)

@@ -122,7 +122,9 @@ the outcome.
 Sending the same request again with the same `Idempotency-Key` creates nothing and returns the
 payment's current state with `Idempotent-Replayed: true`. Reusing the key for a different request
 returns `409`. A failed payment can be retried with `POST /v1/payments/{id}/retry`, which adds an
-attempt under its own idempotency key. Full contract: [docs/api.md](docs/api.md).
+attempt under its own idempotency key. `GET /v1/payments` lists a merchant's payments, newest
+first, filtered by status, reference or creation time and paginated by cursor. Full contract:
+[docs/api.md](docs/api.md).
 
 ## Testing and reliability
 

@@ -46,6 +46,7 @@ There are deliberately no HTTP endpoints for registering merchants or managing k
 | ----------------------------- | --------------------------------------------------------------------------------- |
 | `POST /v1/payments`           | Create a payment and queue its first attempt. Requires `Idempotency-Key`.         |
 | `POST /v1/payments/:id/retry` | Queue a new attempt for an eligible `FAILED` payment. Requires `Idempotency-Key`. |
+| `GET /v1/payments`            | The caller's payments, newest first, filtered and paginated (see below).          |
 | `GET /v1/payments/:id`        | A payment owned by the caller, with its attempts. 404 for anyone else's or none.  |
 
 Processing is asynchronous: both `POST` operations return `202 Accepted` with the payment
@@ -107,6 +108,23 @@ returned.
 **Statuses.** Payments and attempts are `PENDING`, `SUCCEEDED` or `FAILED`; see
 [the lifecycle](architecture.md#payment-lifecycle). A failed payment carries `failureCode`
 `DECLINED` (the provider refused the payment) or `PROVIDER_UNAVAILABLE` (nothing was attempted).
+
+**Listing.** `GET /v1/payments` returns `{ "data": [...], "nextCursor": "..." }`, where each item
+has the same shape as `GET /v1/payments/:id`. Query parameters, all optional and combined with AND:
+
+| Parameter     | Rules                                                                             |
+| ------------- | --------------------------------------------------------------------------------- |
+| `status`      | `PENDING`, `SUCCEEDED` or `FAILED`                                                |
+| `reference`   | Exact match on the merchant's reference                                           |
+| `createdFrom` | ISO 8601; payments created at or after this time                                  |
+| `createdTo`   | ISO 8601; payments created before this time                                       |
+| `limit`       | `1` to `100`, default `20`                                                        |
+| `cursor`      | The previous page's `nextCursor`; send it with the same filters for the next page |
+
+Payments are ordered by creation time, then ID, newest first. The cursor marks the last payment
+returned, so payments created while you page appear on a fresh listing, not between pages, and no
+payment is skipped or repeated. `nextCursor` is `null` on the last page. Cursors are opaque; a
+malformed one, an unknown parameter or a repeated one is a `400` with field `details`.
 
 **Retries.** Only a `FAILED` payment with no attempt in flight and fewer than 3 attempts can be
 retried. Otherwise the retry is refused with `409` and one of the reasons `payment_not_failed`,

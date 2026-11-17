@@ -12,7 +12,10 @@ import type { App } from 'supertest/types.js';
 import type { ErrorResponse } from '../src/common/http/error-response.js';
 import type { PrismaService } from '../src/database/prisma.service.js';
 import { MAX_PAYMENT_AMOUNT } from '../src/payments/currencies.js';
-import type { PaymentResponse } from '../src/payments/payment.responses.js';
+import type {
+  PaymentListResponse,
+  PaymentResponse,
+} from '../src/payments/payment.responses.js';
 import { PaymentsService } from '../src/payments/payments.service.js';
 import { OutboxWorker } from '../src/payments/processing/outbox-worker.js';
 import { SimulatorOutcome } from '../src/payments/providers/simulated-payment-provider.js';
@@ -24,7 +27,7 @@ import {
   prismaOf,
   provisionMerchant,
 } from './support/test-app.js';
-import { resetDatabase } from './support/test-database.js';
+import { ownerDatabase, resetDatabase } from './support/test-database.js';
 
 describe('Payments API (PostgreSQL)', () => {
   const provider = new ScriptedProvider();
@@ -459,6 +462,148 @@ describe('Payments API (PostgreSQL)', () => {
       await request(app.getHttpServer())
         .get('/v1/payments/01890000-0000-7000-8000-000000000000')
         .expect(401);
+    });
+  });
+
+  describe('listing payments', () => {
+    // Creation times one second apart, so newest-first order is the reverse of creation order.
+    const createMany = async (merchant: Merchant, count: number) => {
+      const ids: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const response = await api
+          .create(merchant, `list-${i}`, { ...ORDER, reference: `order_${i}` })
+          .expect(202);
+        const id = (response.body as PaymentResponse).id;
+        await ownerDatabase().$executeRaw`
+          UPDATE payments
+          SET created_at = '2026-10-20T00:00:00Z'::timestamptz + ${i} * interval '1 second'
+          WHERE id = ${id}::uuid`;
+        ids.push(id);
+      }
+      return ids;
+    };
+
+    const readAllPages = async (
+      merchant: Merchant,
+      query: Record<string, string | number>,
+    ) => {
+      const pages: PaymentListResponse[] = [];
+      let cursor: string | null = null;
+      do {
+        const response = await api
+          .list(merchant, cursor ? { ...query, cursor } : query)
+          .expect(200);
+        const page = response.body as PaymentListResponse;
+        pages.push(page);
+        cursor = page.nextCursor;
+      } while (cursor && pages.length < 20);
+      return pages;
+    };
+
+    it("lists only the caller's payments, newest first, in the same shape as GET", async () => {
+      const ids = await createMany(acme, 3);
+      await createMany(globex, 2);
+      await drainOutbox(app, prisma);
+
+      const response = await api.list(acme).expect(200);
+      const body = response.body as PaymentListResponse;
+
+      expect(body.data.map((p) => p.id)).toEqual([...ids].reverse());
+      expect(body.nextCursor).toBeNull();
+      await expect(api.read(acme, ids[0])).resolves.toEqual(body.data[2]);
+    });
+
+    it('returns an empty page for a merchant without payments', async () => {
+      await createMany(globex, 2);
+
+      await expect(api.list(acme)).resolves.toMatchObject({
+        body: { data: [], nextCursor: null },
+      });
+    });
+
+    it('pages through every payment exactly once', async () => {
+      const ids = await createMany(acme, 7);
+
+      const pages = await readAllPages(acme, { limit: 3 });
+
+      expect(pages.map((p) => p.data.length)).toEqual([3, 3, 1]);
+      expect(pages.at(-1)!.nextCursor).toBeNull();
+      expect(pages.flatMap((p) => p.data.map((d) => d.id))).toEqual(
+        [...ids].reverse(),
+      );
+    });
+
+    it('orders payments created in the same millisecond by id, without skipping any', async () => {
+      const ids = await createMany(acme, 5);
+      await ownerDatabase().$executeRaw`
+        UPDATE payments SET created_at = '2026-10-24T01:00:00.000Z'`;
+
+      const pages = await readAllPages(acme, { limit: 2 });
+
+      expect(pages.flatMap((p) => p.data.map((d) => d.id))).toEqual(
+        [...ids].sort().reverse(),
+      );
+    });
+
+    it('keeps a page boundary stable while newer payments arrive', async () => {
+      const ids = await createMany(acme, 4);
+      const first = (await api.list(acme, { limit: 2 }).expect(200))
+        .body as PaymentListResponse;
+
+      await api.create(acme, 'list-new').expect(202);
+      const second = (
+        await api
+          .list(acme, { limit: 2, cursor: first.nextCursor! })
+          .expect(200)
+      ).body as PaymentListResponse;
+
+      expect(second.data.map((p) => p.id)).toEqual([ids[1], ids[0]]);
+    });
+
+    it('filters by status, reference and creation time', async () => {
+      const ids = await createMany(acme, 4);
+      provider.willReturn(SimulatorOutcome.Declined);
+      await drainOutbox(app, prisma);
+      provider.willReturn(SimulatorOutcome.Succeeded);
+      const pending = (await api.create(acme, 'list-pending').expect(202))
+        .body as PaymentResponse;
+      await ownerDatabase().$executeRaw`
+        UPDATE payments SET created_at = '2026-10-01T00:00:00.000Z'
+        WHERE id IN (${ids[0]}::uuid, ${ids[1]}::uuid)`;
+
+      const listed = async (query: Record<string, string | number>) =>
+        (
+          (await api.list(acme, query).expect(200)).body as PaymentListResponse
+        ).data.map((p) => p.id);
+
+      await expect(listed({ status: 'PENDING' })).resolves.toEqual([
+        pending.id,
+      ]);
+      await expect(listed({ status: 'FAILED' })).resolves.toHaveLength(4);
+      await expect(listed({ reference: 'order_2' })).resolves.toEqual([ids[2]]);
+      await expect(
+        listed({ createdTo: '2026-10-02T00:00:00.000Z' }),
+      ).resolves.toEqual([ids[1], ids[0]]);
+      await expect(
+        listed({ createdFrom: '2026-10-02T00:00:00.000Z', status: 'FAILED' }),
+      ).resolves.toEqual([ids[3], ids[2]]);
+      await expect(
+        listed({
+          createdFrom: '2026-10-01T00:00:00.000Z',
+          createdTo: '2026-10-01T00:00:00.000Z',
+        }),
+      ).resolves.toEqual([]);
+    });
+
+    it('rejects invalid queries with field details and requires authentication', async () => {
+      const response = await api
+        .list(acme, { limit: 500, status: 'DONE', cursor: 'forged' })
+        .expect(400);
+
+      expect(
+        (response.body as ErrorResponse).details?.map((d) => d.field).sort(),
+      ).toEqual(['cursor', 'limit', 'status']);
+      await request(app.getHttpServer()).get('/v1/payments').expect(401);
     });
   });
 
