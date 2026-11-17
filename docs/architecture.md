@@ -43,6 +43,8 @@ src/
 │   └── providers/          # PaymentProvider port, the simulated provider and its webhooks
 ├── refunds/                # /v1/payments/:id/refunds and /v1/refunds, refund lifecycle, and the
 │                           # refund job processor the worker runs
+├── merchant-webhooks/      # /v1/webhook-endpoint and /v1/events, event recording, secret
+│                           # encryption, target policy, and the delivery processor the worker runs
 ├── webhooks/               # /v1/webhooks intake: raw body, signature, event schema, inbox, and
 │                           # the processor and policy the worker uses to apply stored events
 ├── outbox/                 # Outbox job store: enqueue, claim, fencing, heartbeats, stats, pruning
@@ -239,6 +241,43 @@ worker ──► marks refund submitted ──► provider.processRefund(refundI
   and `refund.result_conflict` go to the payment's history with the refund's ID, alongside the
   generic deferred, scheduled, dead and requeued events; refund statuses are in their details.
 
+## Merchant notifications
+
+Every payment and refund outcome becomes a **merchant event** (`merchant_events`), written by the
+same guarded write that records the outcome (`applyAttemptResolution`, the refund processor's
+resolution), so an outcome and its event commit or roll back together. If the merchant's endpoint
+is enabled at that moment, a `DELIVER_MERCHANT_EVENT` outbox job is created in the same
+transaction.
+
+```
+outcome recorded ──► same transaction: merchant event (+ delivery job if the endpoint is enabled)
+worker ──► decrypt secret(s) ──► signed POST (10 s, no redirects, public addresses only)
+       ──► 2xx: event DELIVERED, job COMPLETED
+       ──► failure: attempt recorded, retried after 30 s doubling to 1 h
+       ──► OUTBOX_MAX_RUNS failures: event FAILED, job COMPLETED (never DEAD)
+```
+
+- **A merchant's outage is not PayGuard's.** A delivery that runs out of attempts marks the event
+  `FAILED` and completes its job, so a broken merchant endpoint never shows up as a dead job,
+  degraded health or an operator page. Merchants see the state on `GET /v1/events` and redeliver.
+  A delivery job that crashes its workers is still parked as `DEAD`, like any poison job.
+- **At least once, unordered.** The HTTP call happens outside any transaction; its result, the
+  event's delivery state and the job's next step commit together, fenced by the lease. A crash
+  after the merchant accepted a delivery but before it was recorded sends it again under the same
+  event ID. A fenced-out worker that did deliver still records the delivery.
+- **Snapshots.** An event's `data` is the payment or refund as the API returned it when the event
+  was recorded; later changes produce later events and never rewrite earlier ones.
+- **Secrets.** Signing needs the secret itself, so it cannot be hashed like an API key. It is
+  stored encrypted with AES-256-GCM under `MERCHANT_WEBHOOK_ENCRYPTION_KEY`, with the merchant's ID
+  as associated data, so a ciphertext copied to another merchant's endpoint fails to decrypt. The
+  operator role cannot read the ciphertext columns at all. After a rotation the previous secret
+  signs alongside the new one for 24 hours.
+- **Server-side request forgery.** Merchant URLs are untrusted input pointing the worker at
+  arbitrary hosts. Outside local testing, only public `https` targets are allowed: the URL is
+  checked when saved, and when connecting every address the host resolves to must be public, with
+  the connection made to an address that passed the check, which also defeats DNS rebinding.
+  Redirects are not followed and response bodies are discarded unread beyond 64 KiB.
+
 ## Worker deployment
 
 The same worker code runs in one of two places:
@@ -377,12 +416,12 @@ type lookup prefix    secret: 32 random bytes, base64url
 Each process connects with only the privileges it needs. None of these roles is a superuser, can
 create roles or databases, replicate, or bypass row security:
 
-| Role                           | Kind                         | Used by                            | Can                                                                                                                                 |
-| ------------------------------ | ---------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                                     |
-| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, refunds, jobs, events; update only the columns its state changes touch |
-| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                           |
-| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                                    |
+| Role                           | Kind                         | Used by                            | Can                                                                                                                                            |
+| ------------------------------ | ---------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                                                |
+| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, refunds, endpoints, jobs, events; update only the columns its state changes touch |
+| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                                      |
+| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                                               |
 
 What the roles cannot do is the point:
 
@@ -462,8 +501,11 @@ the history to write-once storage if tamper evidence is required.
   payment stays `PENDING` and needs an operator. The window is about 13 minutes with the defaults.
 - **The in-process worker shares the API process** (the default outside Compose). A heavy backlog
   then competes with HTTP traffic; run the standalone worker in production.
-- **No notifications to merchants.** Provider webhooks come in, but nothing goes out: merchants
-  poll `GET /v1/payments/:id` for outcomes.
+- **Merchant notifications are best effort beyond the retry window.** One endpoint per merchant;
+  deliveries are at least once and unordered, retried for about three hours by default, then left
+  `FAILED` for the merchant to redeliver. A worker waits for its whole batch before claiming more,
+  so a slow endpoint (up to the 10 s timeout) delays that worker's next batch. The encryption key for
+  webhook secrets cannot be rotated; changing it requires every merchant to rotate their secret.
 - **Webhook secrets cannot be rotated without a gap.** One secret is verified at a time, so
   changing it must coincide with the sender's change; deliveries rejected meanwhile are retried
   by the sender. The secret is shared with the operator CLI's simulator sender.

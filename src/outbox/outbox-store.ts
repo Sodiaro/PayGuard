@@ -4,6 +4,7 @@ import type { CoreEnvironment } from '../config/environment.js';
 import { PrismaService } from '../database/prisma.service.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import {
+  MerchantEventDeliveryStatus,
   OutboxErrorCategory,
   OutboxJobStatus,
   OutboxJobType,
@@ -33,6 +34,7 @@ export interface ClaimedJob {
   requestId: string | null;
   webhookEventId: string | null;
   refundId: string | null;
+  merchantEventId: string | null;
   // The previous claim's lease expired without the job finishing, i.e. a worker died or stalled.
   reclaimed: boolean;
 }
@@ -46,6 +48,39 @@ export interface EnqueueJob {
   requestId?: string | null;
   webhookEventId?: string;
   refundId?: string;
+  merchantEventId?: string;
+}
+
+// A no-op when the attempt (or refund) already has a job of this type, or, for webhook and
+// delivery jobs, the event already has one: re-enqueueing never duplicates work. Returns whether
+// a job was created.
+//
+// Every time that decides when a job may run (available_at here and in reschedule/requeue,
+// locked_until in claim) is computed by PostgreSQL, which also judges it in claim. An application
+// clock out of step with the database's would otherwise make new work look not yet due, or
+// delayed work look overdue.
+export async function enqueueOutboxJob(
+  db: Prisma.TransactionClient,
+  job: EnqueueJob,
+): Promise<boolean> {
+  const created = await db.$executeRaw`
+    INSERT INTO outbox_jobs
+      (id, type, payment_id, attempt_id, available_at, request_id, webhook_event_id, refund_id,
+       merchant_event_id, updated_at)
+    VALUES (
+      uuidv7(),
+      ${job.type}::outbox_job_type,
+      ${job.paymentId}::uuid,
+      ${job.attemptId}::uuid,
+      now() + ${job.delaySeconds ?? 0} * interval '1 second',
+      ${job.requestId ?? null},
+      ${job.webhookEventId ?? null}::uuid,
+      ${job.refundId ?? null}::uuid,
+      ${job.merchantEventId ?? null}::uuid,
+      now()
+    )
+    ON CONFLICT DO NOTHING`;
+  return created === 1;
 }
 
 const LOOKUP_JOB_TYPES: ReadonlySet<OutboxJobType> = new Set([
@@ -94,6 +129,10 @@ export interface OutboxStats {
   oldestUnresolvedRefundAgeSeconds: number | null;
   refundsAwaitingOperator: number;
   refundResultConflicts: number;
+  merchantEventDeliveries: {
+    status: MerchantEventDeliveryStatus | null;
+    count: number;
+  }[];
 }
 
 type Db = Prisma.TransactionClient;
@@ -117,31 +156,8 @@ export class OutboxStore {
     });
   }
 
-  // A no-op when the attempt (or refund) already has a job of this type, or, for webhook jobs, the
-  // event already has one: re-enqueueing never duplicates work. Returns whether a job was created.
-  //
-  // Every time that decides when a job may run (available_at here and in reschedule/requeue,
-  // locked_until in claim) is computed by PostgreSQL, which also judges it in claim. An
-  // application clock out of step with the database's would otherwise make new work look not yet
-  // due, or delayed work look overdue.
-  async enqueue(db: Db, job: EnqueueJob): Promise<boolean> {
-    const created = await db.$executeRaw`
-      INSERT INTO outbox_jobs
-        (id, type, payment_id, attempt_id, available_at, request_id, webhook_event_id, refund_id,
-         updated_at)
-      VALUES (
-        uuidv7(),
-        ${job.type}::outbox_job_type,
-        ${job.paymentId}::uuid,
-        ${job.attemptId}::uuid,
-        now() + ${job.delaySeconds ?? 0} * interval '1 second',
-        ${job.requestId ?? null},
-        ${job.webhookEventId ?? null}::uuid,
-        ${job.refundId ?? null}::uuid,
-        now()
-      )
-      ON CONFLICT DO NOTHING`;
-    return created === 1;
+  enqueue(db: Db, job: EnqueueJob): Promise<boolean> {
+    return enqueueOutboxJob(db, job);
   }
 
   // SKIP LOCKED lets concurrent workers claim disjoint jobs; the fresh lease token fences every
@@ -158,6 +174,7 @@ export class OutboxStore {
         request_id: string | null;
         webhook_event_id: string | null;
         refund_id: string | null;
+        merchant_event_id: string | null;
         reclaimed: boolean;
       }[]
     >`
@@ -187,7 +204,7 @@ export class OutboxStore {
       WHERE job.id = due.id
       RETURNING job.id, job.type, job.payment_id, job.attempt_id, job.run_count,
                 job.lease_token, job.request_id, job.webhook_event_id, job.refund_id,
-                due.previous_status = 'PROCESSING' AS reclaimed`;
+                job.merchant_event_id, due.previous_status = 'PROCESSING' AS reclaimed`;
 
     return rows.map((row) => ({
       id: row.id,
@@ -199,6 +216,7 @@ export class OutboxStore {
       requestId: row.request_id,
       webhookEventId: row.webhook_event_id,
       refundId: row.refund_id,
+      merchantEventId: row.merchant_event_id,
       reclaimed: row.reclaimed,
     }));
   }
@@ -559,58 +577,70 @@ export class OutboxStore {
   }
 
   async stats(): Promise<OutboxStats> {
-    const [jobs, pendingErrors, attempts, webhookEvents, refunds, [timing]] =
-      await Promise.all([
-        this.prisma.outboxJob.groupBy({
-          by: ['type', 'status'],
-          _count: { _all: true },
-          orderBy: [{ type: 'asc' }, { status: 'asc' }],
-        }),
-        this.prisma.outboxJob.groupBy({
-          by: ['lastError'],
-          where: {
-            status: { not: OutboxJobStatus.COMPLETED },
-            lastError: { not: null },
-          },
-          _count: { _all: true },
-          orderBy: { lastError: 'asc' },
-        }),
-        this.prisma.paymentAttempt.groupBy({
-          by: ['status', 'failureCode'],
-          _count: { _all: true },
-          orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
-        }),
-        this.prisma.providerWebhookEvent.groupBy({
-          by: ['status', 'result'],
-          _count: { _all: true },
-          _sum: { duplicateDeliveries: true, conflictingDeliveries: true },
-          orderBy: [{ status: 'asc' }, { result: 'asc' }],
-        }),
-        this.prisma.refund.groupBy({
-          by: ['status', 'failureCode'],
-          _count: { _all: true },
-          orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
-        }),
-        this.prisma.$queryRaw<
-          {
-            dead_jobs: number;
-            expired_leases: number;
-            oldest_due_job_age_seconds: number | null;
-            reconciliation_lookups: number;
-            lease_recoveries: number;
-            unresolved_attempts: number;
-            oldest_unresolved_attempt_age_seconds: number | null;
-            payment_retries: number;
-            settle_p50_seconds: number | null;
-            settle_p95_seconds: number | null;
-            attempts_awaiting_operator: number;
-            attempt_result_conflicts: number;
-            unresolved_refunds: number;
-            oldest_unresolved_refund_age_seconds: number | null;
-            refunds_awaiting_operator: number;
-            refund_result_conflicts: number;
-          }[]
-        >`
+    const [
+      jobs,
+      pendingErrors,
+      attempts,
+      webhookEvents,
+      refunds,
+      deliveries,
+      [timing],
+    ] = await Promise.all([
+      this.prisma.outboxJob.groupBy({
+        by: ['type', 'status'],
+        _count: { _all: true },
+        orderBy: [{ type: 'asc' }, { status: 'asc' }],
+      }),
+      this.prisma.outboxJob.groupBy({
+        by: ['lastError'],
+        where: {
+          status: { not: OutboxJobStatus.COMPLETED },
+          lastError: { not: null },
+        },
+        _count: { _all: true },
+        orderBy: { lastError: 'asc' },
+      }),
+      this.prisma.paymentAttempt.groupBy({
+        by: ['status', 'failureCode'],
+        _count: { _all: true },
+        orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
+      }),
+      this.prisma.providerWebhookEvent.groupBy({
+        by: ['status', 'result'],
+        _count: { _all: true },
+        _sum: { duplicateDeliveries: true, conflictingDeliveries: true },
+        orderBy: [{ status: 'asc' }, { result: 'asc' }],
+      }),
+      this.prisma.refund.groupBy({
+        by: ['status', 'failureCode'],
+        _count: { _all: true },
+        orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
+      }),
+      this.prisma.merchantEvent.groupBy({
+        by: ['deliveryStatus'],
+        _count: { _all: true },
+        orderBy: { deliveryStatus: 'asc' },
+      }),
+      this.prisma.$queryRaw<
+        {
+          dead_jobs: number;
+          expired_leases: number;
+          oldest_due_job_age_seconds: number | null;
+          reconciliation_lookups: number;
+          lease_recoveries: number;
+          unresolved_attempts: number;
+          oldest_unresolved_attempt_age_seconds: number | null;
+          payment_retries: number;
+          settle_p50_seconds: number | null;
+          settle_p95_seconds: number | null;
+          attempts_awaiting_operator: number;
+          attempt_result_conflicts: number;
+          unresolved_refunds: number;
+          oldest_unresolved_refund_age_seconds: number | null;
+          refunds_awaiting_operator: number;
+          refund_result_conflicts: number;
+        }[]
+      >`
         SELECT
           (SELECT count(*)::int FROM outbox_jobs WHERE status = 'DEAD') AS dead_jobs,
           (SELECT coalesce(sum(lease_recoveries), 0)::int FROM outbox_jobs) AS lease_recoveries,
@@ -649,7 +679,7 @@ export class OutboxStore {
                   AND job.status = 'DEAD')) AS refunds_awaiting_operator,
           (SELECT count(*)::int FROM payment_events
             WHERE type = ${PaymentEventType.REFUND_RESULT_CONFLICT}) AS refund_result_conflicts`,
-      ]);
+    ]);
 
     return {
       jobs: jobs.map((row) => ({
@@ -689,6 +719,10 @@ export class OutboxStore {
         timing.oldest_unresolved_refund_age_seconds,
       refundsAwaitingOperator: timing.refunds_awaiting_operator,
       refundResultConflicts: timing.refund_result_conflicts,
+      merchantEventDeliveries: deliveries.map((row) => ({
+        status: row.deliveryStatus,
+        count: row._count._all,
+      })),
       webhookEvents: webhookEvents.map((row) => ({
         status: row.status,
         result: row.result,

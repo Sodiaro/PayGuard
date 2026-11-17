@@ -19,37 +19,39 @@ The **Used by** column says which processes read a variable: `all` means the API
 worker and the operator CLI; `api` means the HTTP process only. A worker container needs no
 API-only settings and the CLI needs no provider.
 
-| Variable                                                                         | Used by               | Default         | Description                                                                                 |
-| -------------------------------------------------------------------------------- | --------------------- | --------------- | ------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                                                                       | all                   | required        | `development` (readable logs), `test` or `production` (JSON logs). No default               |
-| `PAYMENT_PROVIDER`                                                               | api, worker           | required        | The payment provider. Only `simulator` exists, and it is refused when `NODE_ENV=production` |
-| `DATABASE_URL`                                                                   | api, worker           | required        | Connection as the runtime role (`payguard_app`)                                             |
-| `OPERATOR_DATABASE_URL`                                                          | CLI                   | required        | Connection as the operator role (`payguard_cli`); the CLI never uses `DATABASE_URL`         |
-| `MIGRATION_DATABASE_URL`                                                         | migrations            | required        | Connection as the schema owner (`payguard_owner`), used only by `npm run db:migrate:*`      |
-| `PAYMENT_SIMULATOR_OUTCOME`                                                      | all                   | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                  |
-| `PAYMENT_SIMULATOR_REFUND_OUTCOME`                                               | all                   | `SUCCEEDED`     | Simulator result for every refund: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                   |
-| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: submissions (payments and refunds) are processed but time out; lookups decide       |
-| `OUTBOX_POLL_INTERVAL_MS`                                                        | all                   | `1000`          | Idle delay between outbox polls (100-60000)                                                 |
-| `OUTBOX_LEASE_SECONDS`                                                           | all                   | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)                    |
-| `OUTBOX_MAX_RUNS`                                                                | all                   | `10`            | Runs per job before it is parked as `DEAD` for investigation                                |
-| `OUTBOX_BACKOFF_MAX_SECONDS`                                                     | all                   | `300`           | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                                    |
-| `RECONCILIATION_DELAY_SECONDS`                                                   | all                   | `60`            | Wait before the first lookup of an unknown outcome; also the stale-attempt age              |
-| `PAYGUARD_OPERATOR`                                                              | CLI                   | `<user>@<host>` | Actor recorded in the audit trail for CLI actions (printable ASCII, ≤ 200)                  |
-| `SIMULATOR_WEBHOOK_SECRET`                                                       | api, CLI              | unset           | Webhook signing secret, 32-256 visible ASCII, not an API key; unset disables webhooks       |
-| `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`                                            | api                   | `300`           | Allowed difference between a webhook's signed timestamp and the clock (30-900)              |
-| `PORT`                                                                           | api                   | `3000`          | HTTP port                                                                                   |
-| `SWAGGER_ENABLED`                                                                | api                   | `false`         | `true` serves Swagger UI at `/docs`                                                         |
-| `CORS_ALLOWED_ORIGINS`                                                           | api                   | empty           | Comma-separated exact origins; empty sends no CORS headers                                  |
-| `OUTBOX_WORKER_ENABLED`                                                          | api                   | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs           |
-| `RATE_LIMIT_IP_PER_MINUTE`                                                       | api                   | `300`           | Requests per client IP per minute, all routes except health checks                          |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`                                          | api                   | `60`            | Payment creations, retries and refunds per merchant per minute                              |
-| `TRUSTED_PROXIES`                                                                | api                   | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [below](#client-ip-behind-a-proxy))   |
-| `HEALTH_QUEUE_BACKLOG_SECONDS`                                                   | api                   | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)        |
-| `HEALTH_WORKER_TIMEOUT_SECONDS`                                                  | api                   | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)            |
-| `TEST_DATABASE_URL`, `TEST_OPERATOR_DATABASE_URL`, `TEST_MIGRATION_DATABASE_URL` | tests                 | required        | The three connections for `npm run test:e2e`, to one database whose name ends with `_test`  |
-| `POSTGRES_USER` / `_PASSWORD` / `_DB`                                            | Compose               | required        | The container's bootstrap superuser, used only to provision the roles                       |
-| `PAYGUARD_OWNER_PASSWORD` / `_APP_` / `_CLI_`                                    | Compose, provisioning | required        | Passwords given to `payguard_owner`, `payguard_app` and `payguard_cli`                      |
-| `POSTGRES_HOST_PORT` / `API_HOST_PORT`                                           | Compose               | `5432`/`3000`   | Host ports published by Compose (bound to 127.0.0.1)                                        |
+| Variable                                                                         | Used by               | Default         | Description                                                                                    |
+| -------------------------------------------------------------------------------- | --------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                                                                       | all                   | required        | `development` (readable logs), `test` or `production` (JSON logs). No default                  |
+| `PAYMENT_PROVIDER`                                                               | api, worker           | required        | The payment provider. Only `simulator` exists, and it is refused when `NODE_ENV=production`    |
+| `DATABASE_URL`                                                                   | api, worker           | required        | Connection as the runtime role (`payguard_app`)                                                |
+| `OPERATOR_DATABASE_URL`                                                          | CLI                   | required        | Connection as the operator role (`payguard_cli`); the CLI never uses `DATABASE_URL`            |
+| `MIGRATION_DATABASE_URL`                                                         | migrations            | required        | Connection as the schema owner (`payguard_owner`), used only by `npm run db:migrate:*`         |
+| `PAYMENT_SIMULATOR_OUTCOME`                                                      | all                   | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                     |
+| `PAYMENT_SIMULATOR_REFUND_OUTCOME`                                               | all                   | `SUCCEEDED`     | Simulator result for every refund: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                      |
+| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: submissions (payments and refunds) are processed but time out; lookups decide          |
+| `OUTBOX_POLL_INTERVAL_MS`                                                        | all                   | `1000`          | Idle delay between outbox polls (100-60000)                                                    |
+| `OUTBOX_LEASE_SECONDS`                                                           | all                   | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)                       |
+| `OUTBOX_MAX_RUNS`                                                                | all                   | `10`            | Runs per job before it is parked as `DEAD` for investigation                                   |
+| `OUTBOX_BACKOFF_MAX_SECONDS`                                                     | all                   | `300`           | Cap for the exponential retry delay (2 s, 4 s, 8 s, ...)                                       |
+| `RECONCILIATION_DELAY_SECONDS`                                                   | all                   | `60`            | Wait before the first lookup of an unknown outcome; also the stale-attempt age                 |
+| `PAYGUARD_OPERATOR`                                                              | CLI                   | `<user>@<host>` | Actor recorded in the audit trail for CLI actions (printable ASCII, ≤ 200)                     |
+| `SIMULATOR_WEBHOOK_SECRET`                                                       | api, CLI              | unset           | Webhook signing secret, 32-256 visible ASCII, not an API key; unset disables webhooks          |
+| `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`                                            | api                   | `300`           | Allowed difference between a webhook's signed timestamp and the clock (30-900)                 |
+| `MERCHANT_WEBHOOK_ENCRYPTION_KEY`                                                | api, worker           | unset           | 64 hex characters; encrypts merchant webhook secrets. Unset disables merchant endpoints        |
+| `MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS`                                         | api, worker           | `false`         | `true` allows `http://` and private/loopback targets, for local testing. Refused in production |
+| `PORT`                                                                           | api                   | `3000`          | HTTP port                                                                                      |
+| `SWAGGER_ENABLED`                                                                | api                   | `false`         | `true` serves Swagger UI at `/docs`                                                            |
+| `CORS_ALLOWED_ORIGINS`                                                           | api                   | empty           | Comma-separated exact origins; empty sends no CORS headers                                     |
+| `OUTBOX_WORKER_ENABLED`                                                          | api                   | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs              |
+| `RATE_LIMIT_IP_PER_MINUTE`                                                       | api                   | `300`           | Requests per client IP per minute, all routes except health checks                             |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`                                          | api                   | `60`            | Payment creations, retries, refunds and event redeliveries per merchant per minute             |
+| `TRUSTED_PROXIES`                                                                | api                   | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [below](#client-ip-behind-a-proxy))      |
+| `HEALTH_QUEUE_BACKLOG_SECONDS`                                                   | api                   | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)           |
+| `HEALTH_WORKER_TIMEOUT_SECONDS`                                                  | api                   | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)               |
+| `TEST_DATABASE_URL`, `TEST_OPERATOR_DATABASE_URL`, `TEST_MIGRATION_DATABASE_URL` | tests                 | required        | The three connections for `npm run test:e2e`, to one database whose name ends with `_test`     |
+| `POSTGRES_USER` / `_PASSWORD` / `_DB`                                            | Compose               | required        | The container's bootstrap superuser, used only to provision the roles                          |
+| `PAYGUARD_OWNER_PASSWORD` / `_APP_` / `_CLI_`                                    | Compose, provisioning | required        | Passwords given to `payguard_owner`, `payguard_app` and `payguard_cli`                         |
+| `POSTGRES_HOST_PORT` / `API_HOST_PORT`                                           | Compose               | `5432`/`3000`   | Host ports published by Compose (bound to 127.0.0.1)                                           |
 
 Each role's password must match in `PAYGUARD_*_PASSWORD` and in every URL that uses that role.
 URL-encode special characters in passwords (e.g. `@` → `%40`). The roles themselves are described
@@ -60,6 +62,12 @@ in [architecture.md](architecture.md#database-roles).
 - **Development:** `NODE_ENV=development` and `PAYMENT_PROVIDER=simulator`, as in `.env.example`.
 - **Tests:** `test/setup-env.ts` sets `NODE_ENV=test` and `PAYMENT_PROVIDER=simulator` itself, and
   points all three connections at the `_test` database.
+- **Merchant webhooks:** set `MERCHANT_WEBHOOK_ENCRYPTION_KEY` (the same value for the API and the
+  worker) to let merchants configure endpoints. To receive deliveries on your own machine, also set
+  `MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS=true`; otherwise only public `https://` URLs are
+  accepted. There is no key rotation: changing the key makes existing endpoint secrets
+  undecryptable, their deliveries fail and are retried, and each merchant must rotate its secret
+  (`POST /v1/webhook-endpoint/rotate-secret`) to resume.
 - **Production:** `NODE_ENV=production` must be set explicitly, and `PAYMENT_PROVIDER` must name a
   real provider. None exists yet, so a production configuration of the API or worker exits at
   startup, before accepting work, with an error naming the variable. The simulator has no

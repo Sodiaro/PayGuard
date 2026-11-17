@@ -8,7 +8,6 @@ import {
   PaymentAttemptStatus,
   PaymentEventSource,
   PaymentStatus,
-  RefundStatus,
 } from '../generated/prisma/enums.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import { applyAttemptResolution } from './attempt-outcomes.js';
@@ -30,6 +29,11 @@ import {
 } from './payment-lifecycle.js';
 import { decodePaymentCursor, encodePaymentCursor } from './payment-cursor.js';
 import {
+  PAYMENT_VIEW_INCLUDE,
+  toPaymentResponse,
+  type PaymentViewRecord,
+} from './payment-view.js';
+import {
   DEFAULT_PAGE_SIZE,
   type CreatePaymentRequest,
   type ListPaymentsQuery,
@@ -43,18 +47,6 @@ import {
   type PaymentProvider,
   type ProviderPaymentResult,
 } from './providers/payment-provider.js';
-
-const WITH_ATTEMPTS = {
-  attempts: { orderBy: { attemptNumber: 'asc' } },
-  refunds: {
-    where: { status: RefundStatus.SUCCEEDED },
-    select: { amount: true },
-  },
-} satisfies Prisma.PaymentInclude;
-
-type PaymentRecord = Prisma.PaymentGetPayload<{
-  include: typeof WITH_ATTEMPTS;
-}>;
 
 type RetryRequestRecord = Prisma.PaymentRetryRequestGetPayload<object>;
 
@@ -101,7 +93,7 @@ export class PaymentsService {
               create: { attemptNumber: 1, provider: this.provider.id },
             },
           },
-          include: WITH_ATTEMPTS,
+          include: PAYMENT_VIEW_INCLUDE,
         });
         await this.outbox.enqueue(tx, {
           type: OutboxJobType.PROCESS_ATTEMPT,
@@ -165,7 +157,7 @@ export class PaymentsService {
 
         const payment = await tx.payment.findUniqueOrThrow({
           where: { id: paymentId },
-          include: WITH_ATTEMPTS,
+          include: PAYMENT_VIEW_INCLUDE,
         });
         const eligibility = retryEligibility(payment, payment.attempts);
         if (!eligibility.eligible) {
@@ -241,9 +233,9 @@ export class PaymentsService {
   ): Promise<PaymentResponse | null> {
     const payment = await this.prisma.payment.findFirst({
       where: { id: paymentId, merchantId },
-      include: WITH_ATTEMPTS,
+      include: PAYMENT_VIEW_INCLUDE,
     });
-    return payment && toResponse(payment);
+    return payment && toPaymentResponse(payment);
   }
 
   // Keyset pagination on (createdAt, id), newest first, so pages stay stable while payments arrive.
@@ -272,14 +264,14 @@ export class PaymentsService {
 
     const rows = await this.prisma.payment.findMany({
       where,
-      include: WITH_ATTEMPTS,
+      include: PAYMENT_VIEW_INCLUDE,
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
     });
     const page = rows.slice(0, limit);
     const last = page.at(-1);
     return {
-      data: page.map(toResponse),
+      data: page.map(toPaymentResponse),
       nextCursor:
         rows.length > limit && last
           ? encodePaymentCursor({ createdAt: last.createdAt, id: last.id })
@@ -312,10 +304,10 @@ export class PaymentsService {
   private findByIdempotencyKey(
     merchantId: string,
     idempotencyKey: string,
-  ): Promise<PaymentRecord | null> {
+  ): Promise<PaymentViewRecord | null> {
     return this.prisma.payment.findUnique({
       where: { merchantId_idempotencyKey: { merchantId, idempotencyKey } },
-      include: WITH_ATTEMPTS,
+      include: PAYMENT_VIEW_INCLUDE,
     });
   }
 
@@ -330,13 +322,13 @@ export class PaymentsService {
 
   // Replays return the current state, which may have progressed since the original response.
   private replayCreate(
-    payment: PaymentRecord,
+    payment: PaymentViewRecord,
     requestFingerprint: string,
   ): PaymentCommandResult {
     if (payment.requestFingerprint !== requestFingerprint) {
       throw new IdempotencyKeyReusedError();
     }
-    return { payment: toResponse(payment), replayed: true };
+    return { payment: toPaymentResponse(payment), replayed: true };
   }
 
   private async replayRetry(
@@ -351,34 +343,4 @@ export class PaymentsService {
       replayed: true,
     };
   }
-}
-
-function toResponse(payment: PaymentRecord): PaymentResponse {
-  const latest = payment.attempts.at(-1);
-  return {
-    id: payment.id,
-    amount: Number(payment.amount),
-    currency: payment.currency,
-    status: payment.status,
-    reference: payment.reference,
-    failureCode:
-      payment.status === PaymentStatus.FAILED
-        ? (latest?.failureCode ?? null)
-        : null,
-    amountRefunded: Number(
-      payment.refunds.reduce((total, refund) => total + refund.amount, 0n),
-    ),
-    attempts: payment.attempts.map((attempt) => ({
-      id: attempt.id,
-      attemptNumber: attempt.attemptNumber,
-      provider: attempt.provider,
-      status: attempt.status,
-      providerReference: attempt.providerReference,
-      failureCode: attempt.failureCode,
-      createdAt: attempt.createdAt,
-      completedAt: attempt.completedAt,
-    })),
-    createdAt: payment.createdAt,
-    updatedAt: payment.updatedAt,
-  };
 }

@@ -95,6 +95,21 @@ function NotSimulatedInProduction(): PropertyDecorator {
   });
 }
 
+function NotInProduction(message: string): PropertyDecorator {
+  return ValidateBy({
+    name: 'notInProduction',
+    validator: {
+      validate: (value: unknown, args) =>
+        !(
+          value === true &&
+          (args?.object as { NODE_ENV?: unknown }).NODE_ENV ===
+            NodeEnvironment.Production
+        ),
+      defaultMessage: () => message,
+    },
+  });
+}
+
 // Settings every process shares, apart from how it connects to the database. NODE_ENV has no
 // default: a deployment that forgets it must not silently run with development behaviour.
 class SharedEnvironment {
@@ -174,6 +189,27 @@ class SharedEnvironment {
       'SIMULATOR_WEBHOOK_SECRET must be 32-256 visible ASCII characters and must not be an API key',
   })
   SIMULATOR_WEBHOOK_SECRET?: string;
+
+  // Encrypts merchant webhook signing secrets at rest: 32 bytes as 64 hex characters, e.g. the
+  // output of `openssl rand -hex 32`. Unset disables merchant webhook endpoints.
+  @Expose()
+  @EmptyAsUnset()
+  @IsOptional()
+  @Matches(/^[0-9a-f]{64}$/, {
+    message:
+      'MERCHANT_WEBHOOK_ENCRYPTION_KEY must be 64 lowercase hex characters (32 bytes)',
+  })
+  MERCHANT_WEBHOOK_ENCRYPTION_KEY?: string;
+
+  // Lets merchant webhooks target http:// URLs and private, loopback or link-local addresses, for
+  // local development. Refused in production, where it would let a merchant reach internal hosts.
+  @Expose()
+  @StrictBoolean()
+  @IsBoolean()
+  @NotInProduction(
+    'MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS=true is not allowed when NODE_ENV=production: it would let merchant webhooks reach internal hosts',
+  )
+  MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS: boolean = false;
 }
 
 // Shared settings plus the runtime database connection, which has the application's privileges

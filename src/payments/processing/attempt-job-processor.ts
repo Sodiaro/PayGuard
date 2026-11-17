@@ -12,6 +12,7 @@ import {
 } from '../../generated/prisma/enums.js';
 import type { ClaimedJob } from '../../outbox/outbox-store.js';
 import { OutboxStore } from '../../outbox/outbox-store.js';
+import { MerchantEventDeliveryProcessor } from '../../merchant-webhooks/merchant-event-delivery-processor.js';
 import { RefundJobProcessor } from '../../refunds/refund-job-processor.js';
 import { ProviderWebhookProcessor } from '../../webhooks/provider-webhook-processor.js';
 import {
@@ -60,6 +61,7 @@ export class AttemptJobProcessor {
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
     private readonly webhooks: ProviderWebhookProcessor,
     private readonly refunds: RefundJobProcessor,
+    private readonly deliveries: MerchantEventDeliveryProcessor,
     config: ConfigService<CoreEnvironment, true>,
   ) {
     this.reconciliationDelaySeconds = config.get(
@@ -115,6 +117,10 @@ export class AttemptJobProcessor {
       job.type === OutboxJobType.RECONCILE_REFUND
     ) {
       await this.refunds.process(job);
+      return;
+    }
+    if (job.type === OutboxJobType.DELIVER_MERCHANT_EVENT) {
+      await this.deliveries.process(job);
       return;
     }
 

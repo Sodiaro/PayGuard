@@ -4,6 +4,7 @@ import { RateLimitModule } from './common/rate-limit/rate-limit.module.js';
 import { apiConfigModule } from './config/app-config.module.js';
 import { DatabaseModule } from './database/database.module.js';
 import { HealthModule } from './health/health.module.js';
+import { MerchantWebhooksModule } from './merchant-webhooks/merchant-webhooks.module.js';
 import { MerchantsModule } from './merchants/merchants.module.js';
 import { InProcessWorkerStarter } from './payments/processing/in-process-worker.js';
 import { PaymentProcessingModule } from './payments/processing/payment-processing.module.js';
@@ -23,6 +24,7 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
     MerchantsModule,
     PaymentsModule,
     RefundsModule,
+    MerchantWebhooksModule,
     PaymentProcessingModule,
     WebhooksModule,
   ],

@@ -14,6 +14,7 @@ limits and errors. With `SWAGGER_ENABLED=true` the same endpoints are browsable 
 - [Refunds](#refunds)
 - [Idempotency](#idempotency)
 - [Currencies and amounts](#currencies-and-amounts)
+- [Merchant webhooks](#merchant-webhooks)
 - [Provider webhooks](#provider-webhooks)
 - [Rate limiting](#rate-limiting)
 - [Errors](#errors)
@@ -234,6 +235,94 @@ The number of decimals differs by currency, so never convert by assuming two dec
 The list lives in `src/payments/currencies.ts`. The maximum amount (10^12 minor units) keeps values
 exact in JSON numbers.
 
+## Merchant webhooks
+
+PayGuard notifies a merchant of every payment and refund outcome by POSTing a signed event to the
+merchant's own endpoint, so merchants need not poll. Requires `MERCHANT_WEBHOOK_ENCRYPTION_KEY`
+on the server; without it the endpoint routes below that store a secret answer `503`.
+
+| Method and path                           | Description                                                              |
+| ----------------------------------------- | ------------------------------------------------------------------------ |
+| `GET /v1/webhook-endpoint`                | The merchant's endpoint, without its secret. 404 when none is configured |
+| `PUT /v1/webhook-endpoint`                | Create it (`201`, with the secret) or update it (`200`, without)         |
+| `POST /v1/webhook-endpoint/rotate-secret` | Replace the secret; returns the new one                                  |
+| `GET /v1/events`                          | The merchant's events, newest first, with their delivery state           |
+| `GET /v1/events/:id`                      | One event                                                                |
+| `POST /v1/events/:id/redeliver`           | Queue an event for delivery again (`202`)                                |
+
+**Endpoint.** One per merchant. Body `{"url": "https://...", "enabled": true}`; `enabled` is
+optional. The URL must be `https`, without credentials or fragment, and must not point to a
+private, loopback, link-local or other non-public address; this is checked again, against every
+address the host resolves to, each time a delivery connects. Redirects are not followed.
+(`MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS=true` lifts these address rules for local testing.)
+`enabled: false` stops new deliveries; events are still recorded.
+
+**Secret.** `whsec_` followed by 43 characters, returned only by the create and by
+`rotate-secret`; PayGuard stores it encrypted and never shows it again. A repeated create (for
+example after a lost response) is an update and returns no secret: rotate to get one. After a
+rotation, deliveries are signed with both the new and the previous secret for 24 hours, so you can
+deploy the new secret without rejecting deliveries meanwhile.
+
+**Events.** `payment.succeeded`, `payment.failed`, `refund.succeeded` and `refund.failed`, recorded
+in the same transaction as the outcome. A delivery's body is the event:
+
+```json
+{
+  "id": "01a19d40-5e2b-7c1a-9f3e-2b8d4c6a0e17",
+  "type": "payment.succeeded",
+  "createdAt": "2026-11-17T09:30:01.204Z",
+  "data": {
+    "id": "01a16b6d-...",
+    "amount": 500000,
+    "status": "SUCCEEDED",
+    "...": "..."
+  }
+}
+```
+
+`data` is the payment (or refund) exactly as `GET /v1/payments/:id` (or `GET /v1/refunds/:id`)
+returned it when the event happened. Headers: `PayGuard-Event-Id`, `PayGuard-Event-Type`, and
+`PayGuard-Signature`.
+
+**Verifying a delivery.** `PayGuard-Signature` is `t=<unix seconds>,v1=<hex>`, with a second
+`v1=` during a rotation. Each `v1` is the HMAC-SHA256, keyed with a secret, of `<t>.` followed by
+the raw request body. Accept the delivery if any `v1` matches your secret (compare in constant
+time) and `t` is within a few minutes of your clock. Verify the raw bytes before parsing JSON.
+
+```js
+const [t, ...signatures] = header.split(',');
+const timestamp = Number(t.slice(2));
+const expected = createHmac('sha256', secret)
+  .update(`${timestamp}.`)
+  .update(rawBody)
+  .digest();
+const valid =
+  Math.abs(Date.now() / 1000 - timestamp) < 300 &&
+  signatures.some(
+    (s) =>
+      /^v1=[0-9a-f]{64}$/.test(s) &&
+      timingSafeEqual(Buffer.from(s.slice(3), 'hex'), expected),
+  );
+```
+
+**Delivery.** A `2xx` answer within 10 seconds counts as delivered; anything else is retried after
+30 s, doubling to at most an hour, for `OUTBOX_MAX_RUNS` attempts in all (10 by default, about
+three hours), after which the event's delivery is `FAILED`. Deliveries are **at least once** and
+**unordered**: the same event may arrive twice (deduplicate by `id`), and a later event may arrive
+before an earlier one (use `createdAt` and the object's own status). An event recorded while no
+endpoint was enabled has delivery status `null` and is not sent unless you redeliver it.
+
+**Delivery state** on every event: `status` (`PENDING`, `DELIVERED`, `FAILED` or `null`),
+`attempts`, `lastAttemptAt`, `lastResponseStatus`, `lastError` (`TIMEOUT`, `CONNECTION_FAILED`,
+`HTTP_STATUS`, `TARGET_BLOCKED`, `ENDPOINT_DISABLED`) and `deliveredAt`. Response bodies are never
+stored.
+
+**Listing and redelivery.** `GET /v1/events` takes `type`, `paymentId`, `limit` (1-100, default 20)
+and `cursor`, paginated like `GET /v1/payments`. `POST /v1/events/:id/redeliver` sends the event
+again, under the same `id`, to the endpoint as configured now, with a fresh retry budget; one
+already queued is left as it is. It answers `409` when no endpoint is enabled, and counts toward
+the per-merchant rate limit.
+
 ## Provider webhooks
 
 Only the simulator's endpoint exists. How stored events are applied is described in
@@ -312,10 +401,10 @@ delayed lookup runs, which then finds nothing left to do.
 
 ## Rate limiting
 
-| Limit                                   | Key       | Default | Applies to                                                                  |
-| --------------------------------------- | --------- | ------- | --------------------------------------------------------------------------- |
-| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks                    |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments`, `/retry` and `/refunds` combined, after authentication |
+| Limit                                   | Key       | Default | Applies to                                                                                              |
+| --------------------------------------- | --------- | ------- | ------------------------------------------------------------------------------------------------------- |
+| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks                                                |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments`, `/retry`, `/refunds` and `/v1/events/:id/redeliver` combined, after authentication |
 
 - Token buckets allow a burst up to the limit, then refill steadily. Over the limit, the response
   is `429` with `Retry-After: <seconds>` and the standard error body.

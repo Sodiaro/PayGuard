@@ -20,6 +20,7 @@ import {
 } from '../payments/payment-events.js';
 import { RefundNotAllowedError } from './refund-errors.js';
 import { refundEligibility } from './refund-lifecycle.js';
+import { toRefundResponse } from './refund-view.js';
 import type { CreateRefundRequest } from './refund.requests.js';
 import type { RefundResponse } from './refund.responses.js';
 
@@ -183,19 +184,4 @@ function replay(
     throw new IdempotencyKeyReusedError();
   }
   return { refund: toRefundResponse(refund), replayed: true };
-}
-
-export function toRefundResponse(refund: RefundRecord): RefundResponse {
-  return {
-    id: refund.id,
-    paymentId: refund.paymentId,
-    amount: Number(refund.amount),
-    currency: refund.currency,
-    status: refund.status,
-    reference: refund.reference,
-    providerReference: refund.providerReference,
-    failureCode: refund.failureCode,
-    createdAt: refund.createdAt,
-    completedAt: refund.completedAt,
-  };
 }

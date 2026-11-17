@@ -4,6 +4,7 @@ import type {
   PaymentEventSource,
   PaymentFailureCode,
 } from '../generated/prisma/enums.js';
+import { recordPaymentOutcomeEvent } from '../merchant-webhooks/merchant-events.js';
 import { PaymentStateConflictError } from './payment-errors.js';
 import { PaymentEventType, recordPaymentEvent } from './payment-events.js';
 import {
@@ -20,7 +21,7 @@ export interface ResolutionProvenance {
 }
 
 // Applies a definite outcome to an attempt and its payment within the caller's transaction, and
-// records it in the payment's history in the same transaction. Returns false when the attempt
+// records it in the payment's history and as a merchant event in the same transaction. Returns false when the attempt
 // already has an outcome, so a late, duplicate or racing result never overwrites a terminal state.
 export async function applyAttemptResolution(
   tx: Prisma.TransactionClient,
@@ -66,6 +67,7 @@ export async function applyAttemptResolution(
       failureCode: resolution.failureCode,
     },
   });
+  await recordPaymentOutcomeEvent(tx, attempt.paymentId, attemptId);
   return true;
 }
 

@@ -57,14 +57,16 @@ request. `merchant:suspend` blocks all of a merchant's keys at once while you in
 # failure code, oldest unresolved attempt, lookup runs, retries, settle-time p50/p95 over the last
 # hour, the last error category of unfinished jobs, attempts awaiting an operator, contradicting
 # provider answers, refunds by status and failure code with the unresolved ones and those awaiting
-# an operator, webhook events by status and result with duplicate and conflicting deliveries,
-# every known worker (active, silent or stopped), and the dead jobs.
+# an operator, merchant events by delivery status, webhook events by status and result with
+# duplicate and conflicting deliveries, every known worker (active, silent or stopped), and the
+# dead jobs.
 npm run admin -- ops:status
 
 # Every unresolved attempt and refund, oldest first, with why it is not progressing (see below).
 npm run admin -- payments:unresolved [--merchant acme] [--limit 50]
 
-# One payment: attempts, refunds, their jobs, webhook events, full history and a verdict.
+# One payment: attempts, refunds, merchant events and their delivery, their jobs, webhook
+# events, full history and a verdict.
 npm run admin -- payment:inspect --payment <payment-id>
 
 # Put a DEAD job back in the queue with a fresh run budget (after fixing the cause). Audited.
@@ -84,6 +86,13 @@ provider calls. Provider error messages and payloads are never logged or stored.
   against the payment's refundable amount. Confirm it with the provider by refund ID, then requeue
   the job. A dead `PROCESS_REFUND` job is handled like a dead `PROCESS_ATTEMPT` job; the stale
   sweep queues a lookup for its refund.
+- **Merchant webhook deliveries that fail** are the merchant's to fix: after its retries the event
+  is `FAILED` and its job `COMPLETED`, never `DEAD`, and the merchant redelivers it with
+  `POST /v1/events/:id/redeliver`. `payment:inspect` shows each event's delivery status, attempts,
+  last HTTP status and last error (`TARGET_BLOCKED` means the URL resolved to a non-public
+  address). A `DEAD` `DELIVER_MERCHANT_EVENT` job means the job itself crashed its workers, or
+  the worker could not decrypt the secret (check that the API and worker share
+  `MERCHANT_WEBHOOK_ENCRYPTION_KEY`); fix that, then requeue it.
 - **A `refund.result_conflict` in a payment's history** means a provider answer disagreed with a
   refund outcome already recorded. The recorded outcome stands; compare with the provider by refund
   ID, especially if a refund recorded as failed may have returned money.
@@ -219,6 +228,7 @@ short-window increases rather than on lifetime totals.
 | `payguard_refunds_oldest_unresolved_age_seconds`          |                            | Age of the oldest `PENDING` refund                                   |
 | `payguard_refunds_awaiting_operator`                      |                            | Unresolved refunds whose lookups are exhausted                       |
 | `payguard_refund_result_conflicts`                        |                            | Provider answers that contradicted a recorded refund outcome         |
+| `payguard_merchant_events`                                | `status`                   | Merchant events by delivery status (`none`: no endpoint enabled)     |
 | `payguard_payment_attempt_settle_seconds`                 | `quantile` (`0.5`, `0.95`) | Creation-to-outcome time of attempts settled in the last hour        |
 | `payguard_workers_active`                                 |                            | Workers with a heartbeat in the last 30 s                            |
 | `payguard_worker_last_heartbeat_age_seconds`              |                            | Newest heartbeat age (`-1`: no worker has ever reported)             |
@@ -283,16 +293,16 @@ npm run admin -- audit:list [--limit 50]   # newest first, default 20, at most 2
 
 Nothing is deleted automatically. The defaults keep everything:
 
-| Data                                                     | Retention                                                                                                                                                    |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Payments, attempts, refunds, idempotency keys, retries   | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment.                                     |
-| Audit events                                             | Indefinitely, and the table rejects deletes                                                                                                                  |
-| Payment history (`payment_events`)                       | Indefinitely, and the table rejects deletes. Grows by a few rows per attempt, plus one per inconclusive lookup (bounded by `OUTBOX_MAX_RUNS` per run budget) |
-| Provider webhook events                                  | Indefinitely: deduplication depends on them, so deleting one would let a replayed delivery be accepted again                                                 |
-| Merchants and API keys                                   | Indefinitely; merchants are suspended and keys revoked, never deleted                                                                                        |
-| `COMPLETED` outbox jobs of attempts with a final outcome | Prunable on demand                                                                                                                                           |
-| Worker heartbeat rows                                    | Prunable on demand                                                                                                                                           |
-| `DEAD` jobs and jobs of `PENDING` attempts               | Never pruned: they are the evidence for unresolved work                                                                                                      |
+| Data                                                                    | Retention                                                                                                                                                    |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Payments, attempts, refunds, merchant events, idempotency keys, retries | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment.                                     |
+| Audit events                                                            | Indefinitely, and the table rejects deletes                                                                                                                  |
+| Payment history (`payment_events`)                                      | Indefinitely, and the table rejects deletes. Grows by a few rows per attempt, plus one per inconclusive lookup (bounded by `OUTBOX_MAX_RUNS` per run budget) |
+| Provider webhook events                                                 | Indefinitely: deduplication depends on them, so deleting one would let a replayed delivery be accepted again                                                 |
+| Merchants and API keys                                                  | Indefinitely; merchants are suspended and keys revoked, never deleted                                                                                        |
+| `COMPLETED` outbox jobs of attempts with a final outcome                | Prunable on demand                                                                                                                                           |
+| Worker heartbeat rows                                                   | Prunable on demand                                                                                                                                           |
+| `DEAD` jobs and jobs of `PENDING` attempts                              | Never pruned: they are the evidence for unresolved work                                                                                                      |
 
 ```bash
 npm run admin -- maintenance:prune --completed-jobs-days 30 [--workers-days 30] [--batch-size 1000]
@@ -360,6 +370,8 @@ Alternatively, recreate the volume with `docker compose down -v`, which deletes 
 | `TRUST_PROXY_HOPS` has no effect                                              | It is not a PayGuard setting; use `TRUSTED_PROXIES`.                                                                                                                                                                                                                                                                                                                |
 | `maintenance:prune` refuses a value                                           | Retention must be at least 7 days and the batch size 1-10000.                                                                                                                                                                                                                                                                                                       |
 | Webhooks answer `503 Webhooks are not configured`                             | Set `SIMULATOR_WEBHOOK_SECRET` for the API (Compose passes it through from your shell or `.env`).                                                                                                                                                                                                                                                                   |
+| `PUT /v1/webhook-endpoint` answers `503 Merchant webhooks are not configured` | Set `MERCHANT_WEBHOOK_ENCRYPTION_KEY` (64 hex characters) for the API and the worker.                                                                                                                                                                                                                                                                               |
+| `PUT /v1/webhook-endpoint` refuses a `localhost` or `http://` URL             | Intended outside local testing. To receive deliveries on your own machine, set `MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS=true` (refused in production).                                                                                                                                                                                                               |
 | Webhooks answer `401 Invalid webhook signature`                               | The server log names the reason: `signature_missing`, `signature_malformed`, `signature_mismatch`, `signature_timestamp_too_old` or `signature_timestamp_in_future`. Sign the exact bytes you send with the same secret, and check both clocks.                                                                                                                     |
 | Webhooks answer `409`                                                         | The event ID was stored earlier with different content. A redelivery must carry the same event (formatting may differ); a new event needs a new ID.                                                                                                                                                                                                                 |
 | `simulator:webhook` says it is disabled                                       | It refuses to run with `NODE_ENV=production`. The Compose stack runs in development: `docker compose run --rm cli simulator:webhook --attempt <id> --url http://api:3000`.                                                                                                                                                                                          |

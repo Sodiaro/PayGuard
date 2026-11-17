@@ -126,6 +126,31 @@ export function printInvestigation(
   }
 
   io.out('');
+  io.out('Merchant events:');
+  if (payment.merchantEvents.length === 0) io.out('  none');
+  for (const event of payment.merchantEvents) {
+    io.out(
+      [
+        `  ${event.id}  ${event.type.padEnd(16)}`,
+        event.refundId && `refund R${refundNumber.get(event.refundId) ?? '?'}`,
+        `delivery=${event.deliveryStatus ?? 'not sent (no endpoint)'}`,
+        `attempts=${event.deliveryAttempts}`,
+        `lastStatus=${event.lastResponseStatus ?? '-'}`,
+        `lastError=${event.lastError ?? '-'}`,
+        `created ${iso(event.createdAt)}`,
+        `delivered ${iso(event.deliveredAt)}`,
+      ]
+        .filter(Boolean)
+        .join('  '),
+    );
+    if (event.outboxJob) {
+      io.out(
+        `      job ${event.outboxJob.id}  ${describeJob(event.outboxJob)}`,
+      );
+    }
+  }
+
+  io.out('');
   io.out('Provider webhook events:');
   if (payment.webhookEvents.length === 0) io.out('  none');
   for (const event of payment.webhookEvents) {

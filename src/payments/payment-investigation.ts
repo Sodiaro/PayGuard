@@ -214,7 +214,7 @@ export class PaymentInvestigator {
             submittedAt: true,
             completedAt: true,
             outboxJobs: {
-              where: { refundId: null },
+              where: { refundId: null, merchantEventId: null },
               orderBy: { createdAt: 'asc' },
               select: JOB_FIELDS,
             },
@@ -237,6 +237,22 @@ export class PaymentInvestigator {
               orderBy: { createdAt: 'asc' },
               select: JOB_FIELDS,
             },
+          },
+        },
+        merchantEvents: {
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: {
+            id: true,
+            type: true,
+            refundId: true,
+            createdAt: true,
+            deliveryStatus: true,
+            deliveryAttempts: true,
+            lastAttemptAt: true,
+            lastResponseStatus: true,
+            lastError: true,
+            deliveredAt: true,
+            outboxJob: { select: JOB_FIELDS },
           },
         },
         events: {

@@ -30,6 +30,7 @@ const CORE_DEFAULTS = {
   OUTBOX_MAX_RUNS: 10,
   OUTBOX_BACKOFF_MAX_SECONDS: 300,
   RECONCILIATION_DELAY_SECONDS: 60,
+  MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS: false,
 };
 
 describe('validateApiEnvironment', () => {
@@ -86,10 +87,14 @@ describe('validateApiEnvironment', () => {
       HEALTH_WORKER_TIMEOUT_SECONDS: '60',
       WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: '120',
       PAYGUARD_OPERATOR: 'alice (on-call)',
+      MERCHANT_WEBHOOK_ENCRYPTION_KEY: 'ab'.repeat(32),
+      MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS: 'true',
       PATH: '/usr/bin',
     });
 
     expect(environment).toEqual({
+      MERCHANT_WEBHOOK_ENCRYPTION_KEY: 'ab'.repeat(32),
+      MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS: true,
       NODE_ENV: NodeEnvironment.Test,
       PAYMENT_PROVIDER: PaymentProviderName.Simulator,
       DATABASE_URL,
@@ -145,6 +150,9 @@ describe('validateApiEnvironment', () => {
     ],
     ['WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS', '0'],
     ['WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS', '3600'],
+    ['MERCHANT_WEBHOOK_ENCRYPTION_KEY', 'ab'.repeat(16)],
+    ['MERCHANT_WEBHOOK_ENCRYPTION_KEY', 'AB'.repeat(32)],
+    ['MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS', 'yes'],
   ])('rejects %s=%s', (name, value) => {
     expect(() =>
       validateApiEnvironment({ ...REQUIRED, [name]: value }),
@@ -233,6 +241,22 @@ describe('payment provider selection', () => {
     expect(() =>
       validate({ ...PRODUCTION, PAYMENT_PROVIDER: undefined }),
     ).toThrow(/PAYMENT_PROVIDER must be one of/);
+  });
+
+  it('refuses private merchant webhook targets in production', () => {
+    expect(() =>
+      validateOperatorEnvironment({
+        NODE_ENV: 'production',
+        OPERATOR_DATABASE_URL: DATABASE_URL,
+        MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS: 'true',
+      }),
+    ).toThrow(/MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS=true is not allowed/);
+    expect(
+      validateApiEnvironment({
+        ...REQUIRED,
+        MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS: 'true',
+      }).MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS,
+    ).toBe(true);
   });
 
   it.each(['development', 'test'])(

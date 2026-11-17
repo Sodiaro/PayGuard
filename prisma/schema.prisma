@@ -26,9 +26,11 @@ model Merchant {
   createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  apiKeys  MerchantApiKey[]
-  payments Payment[]
-  refunds  Refund[]
+  apiKeys         MerchantApiKey[]
+  payments        Payment[]
+  refunds         Refund[]
+  webhookEndpoint MerchantWebhookEndpoint?
+  events          MerchantEvent[]
 
   @@map("merchants")
 }
@@ -94,12 +96,13 @@ model Payment {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  merchant      Merchant              @relation(fields: [merchantId], references: [id], onDelete: Restrict)
-  attempts      PaymentAttempt[]
-  retryRequests PaymentRetryRequest[]
-  refunds       Refund[]
-  outboxJobs    OutboxJob[]
-  events        PaymentEvent[]
+  merchant       Merchant              @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  attempts       PaymentAttempt[]
+  retryRequests  PaymentRetryRequest[]
+  refunds        Refund[]
+  outboxJobs     OutboxJob[]
+  events         PaymentEvent[]
+  merchantEvents MerchantEvent[]
 
   // The idempotency guarantee: one payment per (merchant, key), enforced by the database.
   @@unique([merchantId, idempotencyKey])
@@ -123,11 +126,12 @@ model PaymentAttempt {
   // Null while the outcome is unknown; set when the attempt reaches a terminal status.
   completedAt       DateTime?            @map("completed_at") @db.Timestamptz(3)
 
-  payment      Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
-  retryRequest PaymentRetryRequest?
-  refunds      Refund[]
-  outboxJobs   OutboxJob[]
-  events       PaymentEvent[]
+  payment        Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  retryRequest   PaymentRetryRequest?
+  refunds        Refund[]
+  outboxJobs     OutboxJob[]
+  events         PaymentEvent[]
+  merchantEvents MerchantEvent[]
 
   @@unique([paymentId, attemptNumber])
   @@map("payment_attempts")
@@ -173,15 +177,93 @@ model Refund {
   completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
   updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  merchant   Merchant       @relation(fields: [merchantId], references: [id], onDelete: Restrict)
-  payment    Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
-  attempt    PaymentAttempt @relation(fields: [attemptId], references: [id], onDelete: Restrict)
-  outboxJobs OutboxJob[]
-  events     PaymentEvent[]
+  merchant       Merchant        @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  payment        Payment         @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt        PaymentAttempt  @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  outboxJobs     OutboxJob[]
+  events         PaymentEvent[]
+  merchantEvents MerchantEvent[]
 
   @@unique([merchantId, idempotencyKey])
   @@index([paymentId])
   @@map("refunds")
+}
+
+// Where a merchant receives its event notifications. One per merchant, managed by the merchant
+// over the API.
+model MerchantWebhookEndpoint {
+  id         String  @id @default(uuid(7)) @db.Uuid
+  merchantId String  @unique @map("merchant_id") @db.Uuid
+  url        String  @db.VarChar(2048)
+  enabled    Boolean @default(true)
+
+  // AES-256-GCM under MERCHANT_WEBHOOK_ENCRYPTION_KEY, bound to the merchant; see
+  // src/merchant-webhooks/webhook-secrets.ts. Signing needs the secret itself, so it cannot be
+  // hashed like an API key.
+  secretCiphertext         Bytes     @map("secret_ciphertext")
+  // Still signed with after a rotation, until it expires, so the merchant can switch over.
+  previousSecretCiphertext Bytes?    @map("previous_secret_ciphertext")
+  previousSecretExpiresAt  DateTime? @map("previous_secret_expires_at") @db.Timestamptz(3)
+  secretRotatedAt          DateTime  @default(now()) @map("secret_rotated_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  @@map("merchant_webhook_endpoints")
+}
+
+enum MerchantEventDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+
+  @@map("merchant_event_delivery_status")
+}
+
+// Why the latest delivery of an event did not succeed. Response bodies are never stored.
+enum MerchantWebhookDeliveryError {
+  TIMEOUT
+  CONNECTION_FAILED
+  HTTP_STATUS
+  TARGET_BLOCKED
+  ENDPOINT_DISABLED
+
+  @@map("merchant_webhook_delivery_error")
+}
+
+// An outcome a merchant is notified of, recorded in the transaction that produced it. data is the
+// payment or refund as the merchant API returned it at that moment. Event types are listed in
+// src/merchant-webhooks/merchant-events.ts.
+model MerchantEvent {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  merchantId String   @map("merchant_id") @db.Uuid
+  type       String   @db.VarChar(64)
+  paymentId  String   @map("payment_id") @db.Uuid
+  // The resolved attempt, or for refund events the charge being refunded.
+  attemptId  String   @map("attempt_id") @db.Uuid
+  refundId   String?  @map("refund_id") @db.Uuid
+  data       Json
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  // Null: no endpoint was enabled when the event happened, so nothing was sent.
+  deliveryStatus     MerchantEventDeliveryStatus?  @map("delivery_status")
+  deliveryAttempts   Int                           @default(0) @map("delivery_attempts")
+  lastAttemptAt      DateTime?                     @map("last_attempt_at") @db.Timestamptz(3)
+  lastResponseStatus Int?                          @map("last_response_status")
+  lastError          MerchantWebhookDeliveryError? @map("last_error")
+  deliveredAt        DateTime?                     @map("delivered_at") @db.Timestamptz(3)
+
+  merchant  Merchant       @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  payment   Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt   PaymentAttempt @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  refund    Refund?        @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  outboxJob OutboxJob?
+
+  @@index([merchantId, createdAt])
+  @@index([paymentId])
+  @@map("merchant_events")
 }
 
 // Idempotency record for POST /v1/payments/:id/retry, separate from the creation key on payments.
@@ -208,6 +290,7 @@ enum OutboxJobType {
   APPLY_WEBHOOK_EVENT
   PROCESS_REFUND
   RECONCILE_REFUND
+  DELIVER_MERCHANT_EVENT
 
   @@map("outbox_job_type")
 }
@@ -229,6 +312,8 @@ enum OutboxErrorCategory {
   OUTCOME_PROCESSING
   LEASE_EXPIRED
   INTERNAL_ERROR
+  // A merchant endpoint did not accept a delivery; the reason is on the merchant event.
+  DELIVERY_FAILED
 
   @@map("outbox_error_category")
 }
@@ -253,19 +338,22 @@ model OutboxJob {
   webhookEventId  String?              @unique @map("webhook_event_id") @db.Uuid
   // Set only on refund jobs, whose attempt is the charge being refunded.
   refundId        String?              @map("refund_id") @db.Uuid
+  // Set only on DELIVER_MERCHANT_EVENT jobs: the event the job delivers.
+  merchantEventId String?              @unique @map("merchant_event_id") @db.Uuid
   createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
   completedAt     DateTime?            @map("completed_at") @db.Timestamptz(3)
 
-  payment      Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
-  attempt      PaymentAttempt        @relation(fields: [attemptId], references: [id], onDelete: Restrict)
-  webhookEvent ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
-  refund       Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  payment       Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt       PaymentAttempt        @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  webhookEvent  ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
+  refund        Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  merchantEvent MerchantEvent?        @relation(fields: [merchantEventId], references: [id], onDelete: Restrict)
 
   // One job of each type per attempt (attempt jobs) or per refund (refund jobs), so re-enqueueing
   // is a no-op: enforced by the partial unique indexes outbox_jobs_attempt_id_type_key and
   // outbox_jobs_refund_id_type_key, created in migrations because Prisma cannot express them.
-  // Webhook jobs are unique per event instead.
+  // Webhook and delivery jobs are unique per provider event or merchant event instead.
   @@index([attemptId])
   @@index([paymentId])
   @@index([refundId])

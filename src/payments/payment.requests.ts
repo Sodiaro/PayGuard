@@ -59,7 +59,8 @@ export class CreatePaymentRequest {
   reference?: string;
 }
 
-function IsPaymentCursor(): PropertyDecorator {
+// The cursor format is shared by every keyset listing on (createdAt, id).
+export function IsPaymentCursor(): PropertyDecorator {
   return ValidateBy({
     name: 'isPaymentCursor',
     validator: {

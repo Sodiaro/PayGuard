@@ -21,6 +21,7 @@ const job: ClaimedJob = {
   requestId: null,
   webhookEventId: null,
   refundId: null,
+  merchantEventId: null,
   reclaimed: false,
 };
 

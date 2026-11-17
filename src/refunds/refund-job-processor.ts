@@ -10,6 +10,7 @@ import {
   PaymentEventSource,
   RefundStatus,
 } from '../generated/prisma/enums.js';
+import { recordRefundOutcomeEvent } from '../merchant-webhooks/merchant-events.js';
 import type { ClaimedJob } from '../outbox/outbox-store.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import {
@@ -397,6 +398,7 @@ async function applyRefundResolution(
       failureCode: resolution.failureCode,
     },
   });
+  await recordRefundOutcomeEvent(tx, job.refundId!);
   return true;
 }
 

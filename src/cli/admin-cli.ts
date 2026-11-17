@@ -392,6 +392,13 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
     `Refunds awaiting an operator:   ${stats.refundsAwaitingOperator} (lookups exhausted; see payments:unresolved)`,
   );
   io.out(`Contradicting refund answers:   ${stats.refundResultConflicts}`);
+  io.out('Merchant events by delivery status:');
+  if (stats.merchantEventDeliveries.length === 0) io.out('  none');
+  for (const row of stats.merchantEventDeliveries) {
+    io.out(
+      `  ${(row.status ?? 'not sent (no endpoint)').padEnd(22)} ${row.count}`,
+    );
+  }
   if (stats.pendingErrors.length > 0) {
     io.out('Last error of unfinished jobs:');
     for (const row of stats.pendingErrors) {

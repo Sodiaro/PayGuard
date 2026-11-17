@@ -1,5 +1,6 @@
 import { describe, expect, it } from '@jest/globals';
 import {
+  MerchantEventDeliveryStatus,
   OutboxErrorCategory,
   OutboxJobStatus,
   OutboxJobType,
@@ -71,6 +72,10 @@ const stats: OutboxStats = {
   oldestUnresolvedRefundAgeSeconds: 30,
   refundsAwaitingOperator: 0,
   refundResultConflicts: 0,
+  merchantEventDeliveries: [
+    { status: MerchantEventDeliveryStatus.DELIVERED, count: 9 },
+    { status: null, count: 2 },
+  ],
 };
 
 describe('renderPrometheusMetrics', () => {
@@ -114,6 +119,8 @@ describe('renderPrometheusMetrics', () => {
       'payguard_refunds{status="FAILED",failure_code="DECLINED"} 1',
     );
     expect(output).toContain('payguard_refunds_unresolved 1');
+    expect(output).toContain('payguard_merchant_events{status="DELIVERED"} 9');
+    expect(output).toContain('payguard_merchant_events{status="none"} 2');
   });
 
   it('uses only bounded labels, never identifiers', () => {

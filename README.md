@@ -35,6 +35,11 @@ moves; see [Limitations](#limitations).
   through the same outbox, submission marker and lookups as payments. Pending and succeeded
   refunds together are kept within the payment's amount by a row lock in the API and, independently,
   by a database trigger, so concurrent refunds cannot over-refund.
+- **Signed merchant notifications.** Every payment and refund outcome is recorded as an event in
+  the transaction that produces it and delivered to the merchant's endpoint through the outbox,
+  signed with a per-merchant secret (stored encrypted, rotatable with an overlap). Deliveries are
+  retried with backoff and can be redelivered; merchant URLs are restricted to public `https`
+  addresses, checked again on every connection, so they cannot reach internal hosts.
 - **Webhooks treated as signed claims, not commands.** The HMAC-SHA256 signature is verified over
   the raw bytes before parsing, with a timestamp tolerance. Events are deduplicated on
   `(provider, event_id)` plus a canonical content hash, stored together with their processing job
@@ -132,8 +137,13 @@ first, filtered by status, reference or creation time and paginated by cursor.
 A succeeded payment can be refunded in full or in part with `POST /v1/payments/{id}/refunds`
 (body `{"amount": 150000}`, or empty for everything still refundable), again with an
 `Idempotency-Key`. The refund is processed asynchronously like a payment; its outcome is on
-`GET /v1/refunds/{id}`, and the payment reports `amountRefunded`. Full contract:
-[docs/api.md](docs/api.md).
+`GET /v1/refunds/{id}`, and the payment reports `amountRefunded`.
+
+Instead of polling, a merchant can register an endpoint with `PUT /v1/webhook-endpoint`
+(`{"url": "https://..."}`; the response carries the signing secret, once). Each outcome is then
+POSTed there as a `payment.succeeded`, `payment.failed`, `refund.succeeded` or `refund.failed`
+event with a `PayGuard-Signature` header, and `GET /v1/events` shows every event and its delivery
+state. Full contract: [docs/api.md](docs/api.md).
 
 ## Testing and reliability
 
@@ -172,7 +182,8 @@ any real provider behaves. Details: [docs/testing.md](docs/testing.md).
   to be verified.
 - **Automatic reconciliation is bounded.** An outcome still unknown after the configured lookups
   stays `PENDING` and needs an operator, who can only requeue the lookup.
-- **No outbound notifications.** Merchants poll for outcomes.
+- **Merchant notifications are at least once and unordered,** retried for about three hours and
+  then left for the merchant to redeliver. One endpoint per merchant.
 - **Rate limits are per process**, and capacity has not been measured.
 - **History is append-only, not tamper-proof.** Application roles cannot change it; the schema
   owner and superusers can.

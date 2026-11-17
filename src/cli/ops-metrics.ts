@@ -139,6 +139,14 @@ export function renderPrometheusMetrics(
     single(stats.refundResultConflicts),
   );
   gauge(
+    'payguard_merchant_events',
+    'Merchant events by delivery status (none: no endpoint was enabled).',
+    stats.merchantEventDeliveries.map((row) => ({
+      labels: { status: row.status ?? 'none' },
+      value: row.count,
+    })),
+  );
+  gauge(
     'payguard_webhook_events',
     'Retained provider webhook events by status and processing result.',
     stats.webhookEvents.map((row) => ({

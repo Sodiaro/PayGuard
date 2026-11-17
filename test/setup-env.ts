@@ -21,3 +21,7 @@ process.env.OUTBOX_WORKER_ENABLED = 'false';
 // A dedicated secret, so tests never depend on (or reveal) one configured in .env.
 process.env.SIMULATOR_WEBHOOK_SECRET =
   'payguard-e2e-only-webhook-secret-5f0c2a9e7d41';
+
+// Merchant webhooks are delivered to a receiver the tests run on 127.0.0.1.
+process.env.MERCHANT_WEBHOOK_ENCRYPTION_KEY = '7e'.repeat(32);
+process.env.MERCHANT_WEBHOOK_ALLOW_PRIVATE_TARGETS = 'true';

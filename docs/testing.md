@@ -35,6 +35,11 @@ No database. They cover:
   submissions), and controller status-code mapping.
 - Refunds: transitions, provider-result mapping, contradiction checks, the refundable amount and
   every eligibility refusal, and diagnosis of an unresolved refund from its own jobs.
+- Merchant webhooks: secret generation and encryption (tampering, another merchant, another key),
+  the target policy for every non-public range and URL form, the delivery client against a local
+  server (status mapping, timeouts, refused connections, no redirects, blocked addresses and host
+  names resolving to them), delivery backoff, and signatures that verify with either secret
+  during a rotation.
 - Processing: backoff, worker polling through failures, heartbeats, graceful shutdown waiting
   for the batch in flight, and the in-process starter honouring `OUTBOX_WORKER_ENABLED`.
 - Health: queue and worker reasons, and `unavailable` when their queries fail.
@@ -67,6 +72,14 @@ Against **real PostgreSQL**, with the deployed database privileges:
   flagged for an operator and resolved after a requeue, the stale sweep, pruning that keeps a
   pending refund's jobs, history and CLI output, and the database trigger and constraints that
   enforce the limit and tie refund jobs to their refund.
+- Merchant webhooks, against a receiver on 127.0.0.1: endpoint creation with a secret shown once
+  and stored encrypted, updates, URL validation, rotation with both secrets signing during the
+  overlap and only the new one after it, merchant isolation; events recorded without delivery when
+  no endpoint is enabled; signed deliveries (verified as a merchant would) for payment and refund
+  outcomes, with the exact body and headers; retries with backoff, giving up as `FAILED` without
+  a dead job, an endpoint disabled after the event; redelivery (including of events recorded
+  before any endpoint existed); event listing, filtering and pagination; CLI output; and `503`
+  without an encryption key.
 - Outbox: atomic creation (a database trigger forces a failure mid-transaction), competing
   workers, a claim skipping a locked row instead of waiting, lease recovery after a worker
   dies, lease fencing, duplicate delivery, internal-failure backoff, dead-lettering and requeue.
