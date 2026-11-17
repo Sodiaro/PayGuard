@@ -1,8 +1,33 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   fingerprintPaymentRequest,
+  fingerprintRefundRequest,
   idempotencyKeyProblem,
 } from './idempotency.js';
+
+describe('fingerprintRefundRequest', () => {
+  const paymentId = '01a16b6d-bf6d-765f-98fb-39c95d75fe23';
+
+  it('distinguishes payment, amount, reference, and a full refund from any explicit amount', () => {
+    const fingerprints = [
+      fingerprintRefundRequest(paymentId, {}),
+      fingerprintRefundRequest(paymentId, { amount: 100 }),
+      fingerprintRefundRequest(paymentId, { amount: 101 }),
+      fingerprintRefundRequest(paymentId, { amount: 100, reference: 'r1' }),
+      fingerprintRefundRequest('01a16b6d-bf6d-765f-98fb-39c95d75fe24', {
+        amount: 100,
+      }),
+    ];
+
+    expect(new Set(fingerprints).size).toBe(fingerprints.length);
+    for (const fingerprint of fingerprints) {
+      expect(fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    }
+    expect(fingerprintRefundRequest(paymentId, { amount: 100 })).toBe(
+      fingerprints[1],
+    );
+  });
+});
 
 describe('idempotencyKeyProblem', () => {
   it.each([

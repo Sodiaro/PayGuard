@@ -6,3 +6,7 @@ export interface RequestContext {
 }
 
 export const requestContext = new AsyncLocalStorage<RequestContext>();
+
+export function currentRequestId(): string | null {
+  return requestContext.getStore()?.requestId ?? null;
+}

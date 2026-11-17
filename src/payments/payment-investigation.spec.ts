@@ -20,6 +20,37 @@ const job = (overrides: Partial<JobView>): JobView => ({
 const completedSubmission = job({ status: OutboxJobStatus.COMPLETED });
 
 describe('diagnoseUnresolved', () => {
+  it("diagnoses a refund from its own jobs, ignoring its charge's attempt jobs", () => {
+    const refundLookup = job({
+      type: OutboxJobType.RECONCILE_REFUND,
+      status: OutboxJobStatus.DEAD,
+      runCount: 10,
+    });
+    const jobs = [
+      job({
+        type: OutboxJobType.PROCESS_REFUND,
+        status: OutboxJobStatus.COMPLETED,
+      }),
+      refundLookup,
+      job({
+        type: OutboxJobType.RECONCILE_ATTEMPT,
+        status: OutboxJobStatus.PROCESSING,
+      }),
+    ];
+
+    expect(diagnoseUnresolved(jobs, 'refund')).toMatchObject({
+      state: 'reconciliation_exhausted',
+      needsOperator: true,
+    });
+    expect(
+      diagnoseUnresolved([
+        completedSubmission,
+        refundLookup,
+        job({ type: OutboxJobType.PROCESS_REFUND }),
+      ]),
+    ).toMatchObject({ state: 'awaiting_sweep', needsOperator: false });
+  });
+
   it('reports work a worker holds right now', () => {
     expect(
       diagnoseUnresolved([

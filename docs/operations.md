@@ -56,14 +56,15 @@ request. `merchant:suspend` blocks all of a merchant's keys at once while you in
 # Job counts by type and status, dead and stalled jobs, lease recoveries, attempts by status and
 # failure code, oldest unresolved attempt, lookup runs, retries, settle-time p50/p95 over the last
 # hour, the last error category of unfinished jobs, attempts awaiting an operator, contradicting
-# provider answers, webhook events by status and result with duplicate and conflicting
-# deliveries, every known worker (active, silent or stopped), and the dead jobs.
+# provider answers, refunds by status and failure code with the unresolved ones and those awaiting
+# an operator, webhook events by status and result with duplicate and conflicting deliveries,
+# every known worker (active, silent or stopped), and the dead jobs.
 npm run admin -- ops:status
 
-# Every unresolved attempt, oldest first, with why it is not progressing (see below).
+# Every unresolved attempt and refund, oldest first, with why it is not progressing (see below).
 npm run admin -- payments:unresolved [--merchant acme] [--limit 50]
 
-# One payment: attempts, their jobs, webhook events, full history and a verdict.
+# One payment: attempts, refunds, their jobs, webhook events, full history and a verdict.
 npm run admin -- payment:inspect --payment <payment-id>
 
 # Put a DEAD job back in the queue with a fresh run budget (after fixing the cause). Audited.
@@ -71,13 +72,21 @@ npm run admin -- outbox:requeue --job <job-id>
 ```
 
 All figures come from the database, so they are correct across any number of API and worker
-processes. Worker log lines carry `jobId`, `jobType`, `paymentId`, `attemptId`, the originating
+processes. Worker log lines carry `jobId`, `jobType`, `paymentId`, `attemptId`, `refundId` for
+refund jobs, the originating
 `requestId` (or `job:<id>` for swept work), a sanitized `category`, and `providerDurationMs` for
 provider calls. Provider error messages and payloads are never logged or stored.
 
 - **A dead `RECONCILE_ATTEMPT` job** means the provider could not give a definite outcome within
   the automatic window. The payment stays `PENDING`. Confirm the attempt's state with the provider
   (by attempt ID), then requeue the job so the outcome is recorded through the normal guarded path.
+- **A dead `RECONCILE_REFUND` job** is the same for a refund: it stays `PENDING` and still counts
+  against the payment's refundable amount. Confirm it with the provider by refund ID, then requeue
+  the job. A dead `PROCESS_REFUND` job is handled like a dead `PROCESS_ATTEMPT` job; the stale
+  sweep queues a lookup for its refund.
+- **A `refund.result_conflict` in a payment's history** means a provider answer disagreed with a
+  refund outcome already recorded. The recorded outcome stands; compare with the provider by refund
+  ID, especially if a refund recorded as failed may have returned money.
 - **A dead `PROCESS_ATTEMPT` job** failed internally repeatedly, or crashed its workers (see
   poison jobs in [architecture.md](architecture.md#processing-and-recovery)). Check the logs for
   its `jobId` before requeueing. The stale sweep queues a lookup for its attempt, which resubmits
@@ -113,6 +122,15 @@ for operators only: the merchant API does not expose it.
 | `webhook.not_applied`      | `PROVIDER_WEBHOOK`                                           | A distrusted webhook (`OUTCOME_CONFLICT`, `DATA_MISMATCH`, `PAYLOAD_CONFLICT`) and whether a lookup was queued |
 | `outbox_job.dead`          | `WORKER`                                                     | A job given up on: its type, last error and runs. Never a resolution                                           |
 | `outbox_job.requeued`      | `OPERATOR`                                                   | An operator requeue, with the (self-declared) actor                                                            |
+| `refund.created`           | `MERCHANT`                                                   | A refund created `PENDING` against the succeeded attempt, and whether it was a full refund                     |
+| `refund.submitted`         | `WORKER`                                                     | The refund marked as possibly sent, just before the provider call                                              |
+| `refund.outcome_unknown`   | `WORKER`                                                     | No definite answer (or redelivered after submission); lookup scheduled                                         |
+| `refund.resolved`          | `PROVIDER_RESPONSE` or `PROVIDER_LOOKUP`                     | The refund's outcome, with its before/after statuses, provider reference and failure code in details           |
+| `refund.result_conflict`   | `PROVIDER_RESPONSE` or `PROVIDER_LOOKUP`                     | A definite answer contradicting the recorded refund outcome: both, nothing changed                             |
+
+Refund events, and the deferred, scheduled, dead and requeued events of refund jobs, carry the
+refund's ID and, as their attempt, the charge being refunded. Refunds never change the payment's
+status, so their payment status columns are empty.
 
 Each event carries the request ID that started the work, and the outbox job or webhook event
 involved, so it can be joined to logs. Details hold identifiers, statuses, codes and counts:
@@ -121,7 +139,8 @@ constraint allows an actor only on `OPERATOR` events and requires one there, so 
 and human actions cannot be confused. Operator actions are still recorded in
 `operator_audit_events` as well; `payment_events` places them in the payment's timeline.
 
-`payments:unresolved` lists `PENDING` attempts with a state derived from their jobs:
+`payments:unresolved` lists `PENDING` attempts, then `PENDING` refunds, each with a state derived
+from its own jobs:
 
 | State                      | Meaning                                                                  | Operator action                       |
 | -------------------------- | ------------------------------------------------------------------------ | ------------------------------------- |
@@ -195,6 +214,11 @@ short-window increases rather than on lifetime totals.
 | `payguard_payment_attempts_awaiting_operator`             |                            | Unresolved attempts whose lookups are exhausted                      |
 | `payguard_payment_attempt_result_conflicts`               |                            | Provider answers that contradicted a recorded outcome (all time)     |
 | `payguard_payment_retries`                                |                            | Accepted retry requests                                              |
+| `payguard_refunds`                                        | `status`, `failure_code`   | Refunds by status and failure code (`none` when unset)               |
+| `payguard_refunds_unresolved`                             |                            | Refunds still `PENDING`                                              |
+| `payguard_refunds_oldest_unresolved_age_seconds`          |                            | Age of the oldest `PENDING` refund                                   |
+| `payguard_refunds_awaiting_operator`                      |                            | Unresolved refunds whose lookups are exhausted                       |
+| `payguard_refund_result_conflicts`                        |                            | Provider answers that contradicted a recorded refund outcome         |
 | `payguard_payment_attempt_settle_seconds`                 | `quantile` (`0.5`, `0.95`) | Creation-to-outcome time of attempts settled in the last hour        |
 | `payguard_workers_active`                                 |                            | Workers with a heartbeat in the last 30 s                            |
 | `payguard_worker_last_heartbeat_age_seconds`              |                            | Newest heartbeat age (`-1`: no worker has ever reported)             |
@@ -226,6 +250,8 @@ to observed traffic.
 | Increase in `payguard_webhook_conflicting_deliveries`                                           | > 0                  | Event IDs reused with other content: provider fault or leaked secret   |
 | `payguard_webhook_events{status="RECEIVED"}`                                                    | > 0 for 10 minutes   | Stored events are not being processed                                  |
 | `payguard_payment_attempts_awaiting_operator > 0`                                               | immediately          | Outcomes nothing automatic will establish; see `payments:unresolved`   |
+| `payguard_refunds_awaiting_operator > 0`                                                        | immediately          | The same for refunds                                                   |
+| Increase in `payguard_refund_result_conflicts`                                                  | > 0                  | The provider contradicted a recorded refund; investigate the payment   |
 | Increase in `payguard_payment_attempt_result_conflicts`                                         | > 0                  | The provider contradicted itself or a webhook; investigate the payment |
 
 ## Audit trail
@@ -259,7 +285,7 @@ Nothing is deleted automatically. The defaults keep everything:
 
 | Data                                                     | Retention                                                                                                                                                    |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Payments, attempts, idempotency keys, retry requests     | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment.                                     |
+| Payments, attempts, refunds, idempotency keys, retries   | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment.                                     |
 | Audit events                                             | Indefinitely, and the table rejects deletes                                                                                                                  |
 | Payment history (`payment_events`)                       | Indefinitely, and the table rejects deletes. Grows by a few rows per attempt, plus one per inconclusive lookup (bounded by `OUTBOX_MAX_RUNS` per run budget) |
 | Provider webhook events                                  | Indefinitely: deduplication depends on them, so deleting one would let a replayed delivery be accepted again                                                 |

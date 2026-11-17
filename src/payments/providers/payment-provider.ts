@@ -54,10 +54,34 @@ export type ProviderLookupResult =
   | { status: 'not_found' }
   | { status: 'unavailable' };
 
+export interface ProviderRefundRequest {
+  // Sent as the provider's idempotency key for the refund, like attemptId for payments.
+  refundId: string;
+  // The charge being refunded: the succeeded attempt and the provider's reference for it.
+  attemptId: string;
+  providerReference: string;
+  amount: number;
+  currency: string;
+}
+
+// The same contract as payments: only definite answers are results, and anything thrown or timed
+// out leaves the refund's outcome unknown.
+export type ProviderRefundResult = ProviderPaymentResult;
+
+export interface ProviderRefundLookupRequest {
+  refundId: string;
+}
+
+export type ProviderRefundLookupResult = ProviderLookupResult;
+
 export interface PaymentProvider {
   readonly id: string;
   processPayment(
     request: ProviderPaymentRequest,
   ): Promise<ProviderPaymentResult>;
   lookupPayment(request: ProviderLookupRequest): Promise<ProviderLookupResult>;
+  processRefund(request: ProviderRefundRequest): Promise<ProviderRefundResult>;
+  lookupRefund(
+    request: ProviderRefundLookupRequest,
+  ): Promise<ProviderRefundLookupResult>;
 }

@@ -1,12 +1,14 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { requestContext } from '../common/logging/request-context.js';
+import { currentRequestId } from '../common/logging/request-context.js';
+import { isUniqueViolation } from '../database/prisma-errors.js';
 import { PrismaService } from '../database/prisma.service.js';
-import { Prisma } from '../generated/prisma/client.js';
+import type { Prisma } from '../generated/prisma/client.js';
 import {
   OutboxJobType,
   PaymentAttemptStatus,
   PaymentEventSource,
   PaymentStatus,
+  RefundStatus,
 } from '../generated/prisma/enums.js';
 import { OutboxStore } from '../outbox/outbox-store.js';
 import { applyAttemptResolution } from './attempt-outcomes.js';
@@ -44,6 +46,10 @@ import {
 
 const WITH_ATTEMPTS = {
   attempts: { orderBy: { attemptNumber: 'asc' } },
+  refunds: {
+    where: { status: RefundStatus.SUCCEEDED },
+    select: { amount: true },
+  },
 } satisfies Prisma.PaymentInclude;
 
 type PaymentRecord = Prisma.PaymentGetPayload<{
@@ -347,17 +353,6 @@ export class PaymentsService {
   }
 }
 
-function currentRequestId(): string | null {
-  return requestContext.getStore()?.requestId ?? null;
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === 'P2002'
-  );
-}
-
 function toResponse(payment: PaymentRecord): PaymentResponse {
   const latest = payment.attempts.at(-1);
   return {
@@ -370,6 +365,9 @@ function toResponse(payment: PaymentRecord): PaymentResponse {
       payment.status === PaymentStatus.FAILED
         ? (latest?.failureCode ?? null)
         : null,
+    amountRefunded: Number(
+      payment.refunds.reduce((total, refund) => total + refund.amount, 0n),
+    ),
     attempts: payment.attempts.map((attempt) => ({
       id: attempt.id,
       attemptNumber: attempt.attemptNumber,

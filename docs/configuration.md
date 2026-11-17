@@ -27,7 +27,8 @@ API-only settings and the CLI needs no provider.
 | `OPERATOR_DATABASE_URL`                                                          | CLI                   | required        | Connection as the operator role (`payguard_cli`); the CLI never uses `DATABASE_URL`         |
 | `MIGRATION_DATABASE_URL`                                                         | migrations            | required        | Connection as the schema owner (`payguard_owner`), used only by `npm run db:migrate:*`      |
 | `PAYMENT_SIMULATOR_OUTCOME`                                                      | all                   | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                  |
-| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: submissions are processed but time out; outcomes come from lookup                   |
+| `PAYMENT_SIMULATOR_REFUND_OUTCOME`                                               | all                   | `SUCCEEDED`     | Simulator result for every refund: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                   |
+| `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: submissions (payments and refunds) are processed but time out; lookups decide       |
 | `OUTBOX_POLL_INTERVAL_MS`                                                        | all                   | `1000`          | Idle delay between outbox polls (100-60000)                                                 |
 | `OUTBOX_LEASE_SECONDS`                                                           | all                   | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)                    |
 | `OUTBOX_MAX_RUNS`                                                                | all                   | `10`            | Runs per job before it is parked as `DEAD` for investigation                                |
@@ -41,7 +42,7 @@ API-only settings and the CLI needs no provider.
 | `CORS_ALLOWED_ORIGINS`                                                           | api                   | empty           | Comma-separated exact origins; empty sends no CORS headers                                  |
 | `OUTBOX_WORKER_ENABLED`                                                          | api                   | `true`          | Also run the worker inside the API process; `false` when a standalone worker runs           |
 | `RATE_LIMIT_IP_PER_MINUTE`                                                       | api                   | `300`           | Requests per client IP per minute, all routes except health checks                          |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`                                          | api                   | `60`            | Payment creations and retries per merchant per minute                                       |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE`                                          | api                   | `60`            | Payment creations, retries and refunds per merchant per minute                              |
 | `TRUSTED_PROXIES`                                                                | api                   | empty           | Proxy addresses allowed to set `X-Forwarded-For` (see [below](#client-ip-behind-a-proxy))   |
 | `HEALTH_QUEUE_BACKLOG_SECONDS`                                                   | api                   | `120`           | `/health` queue check: age at which due jobs or expired leases count as stuck (≥ 10)        |
 | `HEALTH_WORKER_TIMEOUT_SECONDS`                                                  | api                   | `30`            | `/health` worker check: heartbeat age after which a worker counts as gone (≥ 20)            |
@@ -76,12 +77,17 @@ in [architecture.md](architecture.md#database-roles).
 | `DECLINED`    | `FAILED`, `failureCode: DECLINED`             | `FAILED`, reference `sim_<24 hex>`    | declined  |
 | `UNAVAILABLE` | `FAILED`, `failureCode: PROVIDER_UNAVAILABLE` | `FAILED`, no reference                | not found |
 
-With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, every submission is treated as processed but
-its answer times out. Payments then stay `PENDING` until reconciliation looks them up, after
-`RECONCILIATION_DELAY_SECONDS` (set it low, e.g. `5`, for demos), and records the outcome. The
-simulated ledger is a pure function of the configuration and the attempt ID, so lookups give the
-same answer after a restart. It assumes every attempt it is asked about was submitted, so it
-cannot reproduce "never received" except in `UNAVAILABLE` mode.
+Refunds follow `PAYMENT_SIMULATOR_REFUND_OUTCOME` the same way, independently of the payment
+outcome: `SUCCEEDED` (reference `simrf_<24 hex>`), `DECLINED` (`FAILED`, `failureCode: DECLINED`)
+or `UNAVAILABLE` (`FAILED`, `failureCode: PROVIDER_UNAVAILABLE`, no reference).
+
+With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, every submission, payment or refund, is
+treated as processed but its answer times out. Payments and refunds then stay `PENDING` until
+reconciliation looks them up, after `RECONCILIATION_DELAY_SECONDS` (set it low, e.g. `5`, for
+demos), and records the outcome. The simulated ledger is a pure function of the configuration and
+the attempt or refund ID, so lookups give the same answer after a restart. It assumes everything
+it is asked about was submitted, so it cannot reproduce "never received" except in `UNAVAILABLE`
+mode.
 
 To reproduce an outcome, set the variables and restart, e.g.
 `PAYMENT_SIMULATOR_OUTCOME=DECLINED npm run start:dev`, or in Compose

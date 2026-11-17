@@ -28,6 +28,7 @@ model Merchant {
 
   apiKeys  MerchantApiKey[]
   payments Payment[]
+  refunds  Refund[]
 
   @@map("merchants")
 }
@@ -96,6 +97,7 @@ model Payment {
   merchant      Merchant              @relation(fields: [merchantId], references: [id], onDelete: Restrict)
   attempts      PaymentAttempt[]
   retryRequests PaymentRetryRequest[]
+  refunds       Refund[]
   outboxJobs    OutboxJob[]
   events        PaymentEvent[]
 
@@ -123,11 +125,63 @@ model PaymentAttempt {
 
   payment      Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   retryRequest PaymentRetryRequest?
+  refunds      Refund[]
   outboxJobs   OutboxJob[]
   events       PaymentEvent[]
 
   @@unique([paymentId, attemptNumber])
   @@map("payment_attempts")
+}
+
+// Allowed transitions live in src/refunds/refund-lifecycle.ts.
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+
+  @@map("refund_status")
+}
+
+enum RefundFailureCode {
+  DECLINED
+  PROVIDER_UNAVAILABLE
+
+  @@map("refund_failure_code")
+}
+
+// Money returned against a payment's succeeded attempt. The refunds_within_payment_amount trigger
+// keeps the pending and succeeded refunds of a payment within its amount, whatever the caller.
+model Refund {
+  id                String             @id @default(uuid(7)) @db.Uuid
+  merchantId        String             @map("merchant_id") @db.Uuid
+  paymentId         String             @map("payment_id") @db.Uuid
+  // The succeeded attempt whose charge is refunded.
+  attemptId         String             @map("attempt_id") @db.Uuid
+  amount            BigInt
+  currency          String             @db.Char(3)
+  status            RefundStatus       @default(PENDING)
+  reference         String?            @db.VarChar(64)
+  providerReference String?            @map("provider_reference") @db.VarChar(100)
+  failureCode       RefundFailureCode? @map("failure_code")
+
+  idempotencyKey     String @map("idempotency_key") @db.VarChar(255)
+  requestFingerprint String @map("request_fingerprint") @db.Char(64)
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  // Set before the provider is first contacted; from then on the refund is only looked up.
+  submittedAt DateTime? @map("submitted_at") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant   Merchant       @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  payment    Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt    PaymentAttempt @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  outboxJobs OutboxJob[]
+  events     PaymentEvent[]
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([paymentId])
+  @@map("refunds")
 }
 
 // Idempotency record for POST /v1/payments/:id/retry, separate from the creation key on payments.
@@ -152,6 +206,8 @@ enum OutboxJobType {
   PROCESS_ATTEMPT
   RECONCILE_ATTEMPT
   APPLY_WEBHOOK_EVENT
+  PROCESS_REFUND
+  RECONCILE_REFUND
 
   @@map("outbox_job_type")
 }
@@ -195,6 +251,8 @@ model OutboxJob {
   requestId       String?              @map("request_id") @db.VarChar(128)
   // Set only on APPLY_WEBHOOK_EVENT jobs: the provider event the job applies.
   webhookEventId  String?              @unique @map("webhook_event_id") @db.Uuid
+  // Set only on refund jobs, whose attempt is the charge being refunded.
+  refundId        String?              @map("refund_id") @db.Uuid
   createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
   completedAt     DateTime?            @map("completed_at") @db.Timestamptz(3)
@@ -202,12 +260,15 @@ model OutboxJob {
   payment      Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   attempt      PaymentAttempt        @relation(fields: [attemptId], references: [id], onDelete: Restrict)
   webhookEvent ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
+  refund       Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
 
-  // One attempt job of each type per attempt, so re-enqueueing is a no-op: enforced by the partial
-  // unique index outbox_jobs_attempt_id_type_key (attempt jobs only), created in the migration
-  // because Prisma cannot express it. Webhook jobs are unique per event instead.
+  // One job of each type per attempt (attempt jobs) or per refund (refund jobs), so re-enqueueing
+  // is a no-op: enforced by the partial unique indexes outbox_jobs_attempt_id_type_key and
+  // outbox_jobs_refund_id_type_key, created in migrations because Prisma cannot express them.
+  // Webhook jobs are unique per event instead.
   @@index([attemptId])
   @@index([paymentId])
+  @@index([refundId])
   @@map("outbox_jobs")
 }
 
@@ -317,6 +378,7 @@ model PaymentEvent {
   id                  String                @id @default(uuid(7)) @db.Uuid
   paymentId           String                @map("payment_id") @db.Uuid
   attemptId           String?               @map("attempt_id") @db.Uuid
+  refundId            String?               @map("refund_id") @db.Uuid
   type                String                @db.VarChar(64)
   source              PaymentEventSource
   paymentStatusBefore PaymentStatus?        @map("payment_status_before")
@@ -335,10 +397,12 @@ model PaymentEvent {
 
   payment      Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   attempt      PaymentAttempt?       @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  refund       Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
   webhookEvent ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
 
   @@index([paymentId, createdAt])
   @@index([attemptId])
+  @@index([refundId])
   @@index([type, createdAt])
   @@map("payment_events")
 }

@@ -111,6 +111,34 @@ export function renderPrometheusMetrics(
     ],
   );
   gauge(
+    'payguard_refunds',
+    'Refunds by status and failure code.',
+    stats.refunds.map((row) => ({
+      labels: { status: row.status, failure_code: row.failureCode ?? 'none' },
+      value: row.count,
+    })),
+  );
+  gauge(
+    'payguard_refunds_unresolved',
+    'Refunds without a final outcome.',
+    single(stats.unresolvedRefunds),
+  );
+  gauge(
+    'payguard_refunds_oldest_unresolved_age_seconds',
+    'Age of the oldest refund without a final outcome (0 when none).',
+    single(stats.oldestUnresolvedRefundAgeSeconds),
+  );
+  gauge(
+    'payguard_refunds_awaiting_operator',
+    'Unresolved refunds whose reconciliation lookups are exhausted.',
+    single(stats.refundsAwaitingOperator),
+  );
+  gauge(
+    'payguard_refund_result_conflicts',
+    'Definite provider answers that contradicted an already recorded refund outcome.',
+    single(stats.refundResultConflicts),
+  );
+  gauge(
     'payguard_webhook_events',
     'Retained provider webhook events by status and processing result.',
     stats.webhookEvents.map((row) => ({

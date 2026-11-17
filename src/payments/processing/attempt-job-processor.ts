@@ -12,6 +12,7 @@ import {
 } from '../../generated/prisma/enums.js';
 import type { ClaimedJob } from '../../outbox/outbox-store.js';
 import { OutboxStore } from '../../outbox/outbox-store.js';
+import { RefundJobProcessor } from '../../refunds/refund-job-processor.js';
 import { ProviderWebhookProcessor } from '../../webhooks/provider-webhook-processor.js';
 import {
   applyAttemptResolution,
@@ -24,11 +25,17 @@ import {
 } from '../payment-lifecycle.js';
 import {
   PAYMENT_PROVIDER,
-  ProviderTimeoutError,
   withProviderTimeout,
   type PaymentProvider,
   type ProviderLookupResult,
 } from '../providers/payment-provider.js';
+import {
+  elapsedMs,
+  jobFields,
+  knownLookupStatus,
+  providerErrorCategory,
+  retryLater,
+} from './job-support.js';
 
 interface PendingAttempt {
   id: string;
@@ -52,6 +59,7 @@ export class AttemptJobProcessor {
     private readonly outbox: OutboxStore,
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
     private readonly webhooks: ProviderWebhookProcessor,
+    private readonly refunds: RefundJobProcessor,
     config: ConfigService<CoreEnvironment, true>,
   ) {
     this.reconciliationDelaySeconds = config.get(
@@ -100,6 +108,13 @@ export class AttemptJobProcessor {
     // Webhook events must be classified even when the attempt already has an outcome.
     if (job.type === OutboxJobType.APPLY_WEBHOOK_EVENT) {
       await this.webhooks.process(job);
+      return;
+    }
+    if (
+      job.type === OutboxJobType.PROCESS_REFUND ||
+      job.type === OutboxJobType.RECONCILE_REFUND
+    ) {
+      await this.refunds.process(job);
       return;
     }
 
@@ -393,80 +408,10 @@ export class AttemptJobProcessor {
     });
   }
 
-  // Rescheduling and its history entry commit together. Only decisions about the payment are
-  // recorded: a lookup that could not decide, and any job given up on. Internal retries of other
-  // jobs are in the job's own run count and last error.
-  private async retryLater(
+  private retryLater(
     job: ClaimedJob,
     category: OutboxErrorCategory,
   ): Promise<void> {
-    const outcome = await this.prisma.$transaction(async (tx) => {
-      const result = await this.outbox.reschedule(tx, job, category);
-      const details = { jobType: job.type, category, runCount: job.runCount };
-      if (result === 'dead') {
-        await recordPaymentEvent(tx, {
-          paymentId: job.paymentId,
-          attemptId: job.attemptId,
-          type: PaymentEventType.JOB_DEAD,
-          source: PaymentEventSource.WORKER,
-          outboxJobId: job.id,
-          webhookEventId: job.webhookEventId,
-          details,
-        });
-      } else if (
-        result === 'rescheduled' &&
-        job.type === OutboxJobType.RECONCILE_ATTEMPT
-      ) {
-        await recordPaymentEvent(tx, {
-          paymentId: job.paymentId,
-          attemptId: job.attemptId,
-          type: PaymentEventType.RECONCILIATION_DEFERRED,
-          source: PaymentEventSource.WORKER,
-          outboxJobId: job.id,
-          details,
-        });
-      }
-      return result;
-    });
-    const fields = { ...jobFields(job), category, runCount: job.runCount };
-    if (outcome === 'dead') {
-      this.logger.error(
-        'Outbox job exhausted its runs; needs investigation',
-        fields,
-      );
-    } else if (outcome === 'rescheduled') {
-      this.logger.warn('Outbox job rescheduled', fields);
-    }
+    return retryLater(this.outbox, this.logger, job, category);
   }
-}
-
-function providerErrorCategory(error: unknown): OutboxErrorCategory {
-  return error instanceof ProviderTimeoutError
-    ? OutboxErrorCategory.PROVIDER_TIMEOUT
-    : OutboxErrorCategory.PROVIDER_ERROR;
-}
-
-function jobFields(job: ClaimedJob) {
-  return {
-    jobId: job.id,
-    jobType: job.type,
-    paymentId: job.paymentId,
-    attemptId: job.attemptId,
-  };
-}
-
-function elapsedMs(startedAt: number): number {
-  return Math.round(performance.now() - startedAt);
-}
-
-// Logged instead of the raw value so an unexpected provider answer cannot inject arbitrary text.
-function knownLookupStatus(lookup: ProviderLookupResult): string {
-  const known = [
-    'succeeded',
-    'declined',
-    'processing',
-    'not_found',
-    'unavailable',
-  ];
-  return known.includes(lookup.status) ? lookup.status : 'unrecognised';
 }

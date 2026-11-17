@@ -31,8 +31,10 @@ No database. They cover:
   fails authentication.
 - Payments: payment and attempt transitions, retry eligibility, provider-result mapping,
   request and listing-query validation through the real `ValidationPipe`, listing cursors,
-  idempotency keys and fingerprints, the simulator (including lookups and ambiguous submissions),
-  and controller status-code mapping.
+  idempotency keys and fingerprints, the simulator (including lookups, refunds and ambiguous
+  submissions), and controller status-code mapping.
+- Refunds: transitions, provider-result mapping, contradiction checks, the refundable amount and
+  every eligibility refusal, and diagnosis of an unresolved refund from its own jobs.
 - Processing: backoff, worker polling through failures, heartbeats, graceful shutdown waiting
   for the batch in flight, and the in-process starter honouring `OUTBOX_WORKER_ENABLED`.
 - Health: queue and worker reasons, and `unavailable` when their queries fail.
@@ -56,6 +58,15 @@ Against **real PostgreSQL**, with the deployed database privileges:
   genuinely concurrent requests sharing a key (`Promise.all`). Listing: merchant scoping, every
   filter, cursor pages that neither skip nor repeat a payment (including ones created in the same
   millisecond, and while new payments arrive), and invalid queries.
+- Refunds: full and partial refunds of the succeeded attempt (including after a retry), the
+  refundable limit counting pending refunds, refusals for pending and failed payments, declined
+  and unavailable refunds freeing their amount, validation, replays and `409` conflicts,
+  identical and competing refunds racing (`Promise.all`) without ever exceeding the payment,
+  cross-merchant `404`s, lost answers resolved by lookup without resubmission, resubmission only
+  on "not found", a possibly submitted refund looked up instead of resent, exhausted lookups
+  flagged for an operator and resolved after a requeue, the stale sweep, pruning that keeps a
+  pending refund's jobs, history and CLI output, and the database trigger and constraints that
+  enforce the limit and tie refund jobs to their refund.
 - Outbox: atomic creation (a database trigger forces a failure mid-transaction), competing
   workers, a claim skipping a locked row instead of waiting, lease recovery after a worker
   dies, lease fencing, duplicate delivery, internal-failure backoff, dead-lettering and requeue.

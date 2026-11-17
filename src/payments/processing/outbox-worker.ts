@@ -89,7 +89,15 @@ export class OutboxWorker implements BeforeApplicationShutdown {
         count: queued,
       });
     }
-    return queued;
+    const refunds = await this.outbox.enqueueStaleRefundReconciliations(
+      this.staleAfterSeconds,
+    );
+    if (refunds > 0) {
+      this.logger.warn('Queued reconciliation for stale pending refunds', {
+        count: refunds,
+      });
+    }
+    return queued + refunds;
   }
 
   async recordHeartbeat(): Promise<void> {

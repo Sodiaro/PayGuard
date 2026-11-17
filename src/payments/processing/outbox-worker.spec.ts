@@ -20,6 +20,7 @@ const job: ClaimedJob = {
   leaseToken: 'lease-1',
   requestId: null,
   webhookEventId: null,
+  refundId: null,
   reclaimed: false,
 };
 
@@ -36,6 +37,7 @@ function fakeOutbox(claim: () => Promise<ClaimedJob[]>) {
   const outbox = {
     claim,
     enqueueStaleReconciliations: () => Promise.resolve(0),
+    enqueueStaleRefundReconciliations: () => Promise.resolve(0),
     recordWorkerHeartbeat: (
       _id: string,
       progress: { jobsFinished: number },

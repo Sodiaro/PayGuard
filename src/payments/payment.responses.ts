@@ -62,6 +62,13 @@ export class PaymentResponse {
   })
   failureCode: PaymentFailureCode | null;
 
+  @ApiProperty({
+    example: 0,
+    description:
+      'Minor units returned by succeeded refunds; pending refunds are not included',
+  })
+  amountRefunded: number;
+
   @ApiProperty({ type: [PaymentAttemptResponse] })
   attempts: PaymentAttemptResponse[];
 

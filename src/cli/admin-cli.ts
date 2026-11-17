@@ -263,11 +263,13 @@ async function execute(
       const merchant = options.merchant
         ? await merchants.resolve(options.merchant)
         : undefined;
+      const filter = {
+        limit: integerOption(options, 'limit', 50, 1, 200),
+        merchantId: merchant?.id,
+      };
       printUnresolved(
-        await investigator.unresolved({
-          limit: integerOption(options, 'limit', 50, 1, 200),
-          merchantId: merchant?.id,
-        }),
+        await investigator.unresolved(filter),
+        await investigator.unresolvedRefunds(filter),
         io,
       );
       return;
@@ -375,6 +377,21 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
   io.out(
     `Settle time p50/p95, 1h (s):    ${formatSeconds(stats.settleSecondsP50)} / ${formatSeconds(stats.settleSecondsP95)}`,
   );
+  io.out('Refunds:');
+  if (stats.refunds.length === 0) io.out('  none');
+  for (const row of stats.refunds) {
+    io.out(
+      `  ${row.status.padEnd(10)} ${(row.failureCode ?? '-').padEnd(21)} ${row.count}`,
+    );
+  }
+  io.out(`Unresolved refunds:             ${stats.unresolvedRefunds}`);
+  io.out(
+    `Oldest unresolved refund (s):   ${stats.oldestUnresolvedRefundAgeSeconds ?? '-'}`,
+  );
+  io.out(
+    `Refunds awaiting an operator:   ${stats.refundsAwaitingOperator} (lookups exhausted; see payments:unresolved)`,
+  );
+  io.out(`Contradicting refund answers:   ${stats.refundResultConflicts}`);
   if (stats.pendingErrors.length > 0) {
     io.out('Last error of unfinished jobs:');
     for (const row of stats.pendingErrors) {

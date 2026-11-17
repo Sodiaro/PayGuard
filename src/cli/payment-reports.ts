@@ -3,13 +3,47 @@ import type {
   PaymentInvestigation,
   UnresolvedAttempt,
   UnresolvedDiagnosis,
+  UnresolvedRefund,
 } from '../payments/payment-investigation.js';
 import type { AdminCliOutput } from './admin-cli.js';
 
 export function printUnresolved(
   attempts: UnresolvedAttempt[],
+  refunds: UnresolvedRefund[],
   io: AdminCliOutput,
   now = new Date(),
+): void {
+  printUnresolvedAttempts(attempts, io, now);
+  if (refunds.length === 0) return;
+  const blocked = refunds.filter((refund) => refund.diagnosis.needsOperator);
+  io.out('');
+  io.out(
+    `Unresolved refunds, oldest first (${refunds.length} shown, ${blocked.length} need an operator):`,
+  );
+  for (const refund of refunds) {
+    io.out(
+      [
+        `  age=${secondsBetween(refund.createdAt, now)}s`,
+        `payment=${refund.paymentId}`,
+        `refund=${refund.refundId} (${refund.merchantSlug})`,
+        `submitted=${refund.submitted ? 'yes' : 'no'}`,
+        describeDiagnosis(refund.diagnosis, now),
+        `resultConflicts=${refund.resultConflicts}`,
+      ].join('  '),
+    );
+  }
+  if (blocked.length > 0) {
+    io.out('');
+    io.out(
+      'reconciliation_exhausted: confirm the refund with the provider by refund ID, then requeue its dead RECONCILE_REFUND job (outbox:requeue).',
+    );
+  }
+}
+
+function printUnresolvedAttempts(
+  attempts: UnresolvedAttempt[],
+  io: AdminCliOutput,
+  now: Date,
 ): void {
   if (attempts.length === 0) {
     io.out('No unresolved attempts.');
@@ -51,6 +85,9 @@ export function printInvestigation(
   );
   const label = (attemptId: string | null) =>
     attemptId ? `#${attemptNumber.get(attemptId) ?? '?'}` : '-';
+  const refundNumber = new Map(
+    payment.refunds.map((refund, index) => [refund.id, index + 1]),
+  );
 
   io.out(
     `Payment ${payment.id}  ${payment.status}  ${payment.amount.toString()} ${payment.currency}  reference=${payment.reference ?? '-'}`,
@@ -74,6 +111,21 @@ export function printInvestigation(
   }
 
   io.out('');
+  io.out('Refunds:');
+  if (payment.refunds.length === 0) io.out('  none');
+  for (const refund of payment.refunds) {
+    io.out(
+      `  R${refundNumber.get(refund.id)} ${refund.id}  ${refund.status}  ${refund.amount.toString()} ${payment.currency}  of attempt ${label(refund.attemptId)}  failure=${refund.failureCode ?? '-'}  providerReference=${refund.providerReference ?? '-'}  reference=${refund.reference ?? '-'}  created ${iso(refund.createdAt)}  submitted ${iso(refund.submittedAt)}  completed ${iso(refund.completedAt)}`,
+    );
+    for (const job of refund.outboxJobs) {
+      io.out(`      job ${job.id}  ${describeJob(job)}`);
+    }
+    if (refund.diagnosis) {
+      io.out(`      unresolved: ${describeDiagnosis(refund.diagnosis, now)}`);
+    }
+  }
+
+  io.out('');
   io.out('Provider webhook events:');
   if (payment.webhookEvents.length === 0) io.out('  none');
   for (const event of payment.webhookEvents) {
@@ -91,6 +143,7 @@ export function printInvestigation(
       event.source.padEnd(17),
       event.type.padEnd(24),
       `attempt ${label(event.attemptId)}`,
+      event.refundId && `refund R${refundNumber.get(event.refundId) ?? '?'}`,
       transition(
         'payment',
         event.paymentStatusBefore,
@@ -123,6 +176,17 @@ export function printInvestigation(
           )
           .join('; ')}.`,
   );
+  const pendingRefunds = payment.refunds.filter((refund) => refund.diagnosis);
+  if (pendingRefunds.length > 0) {
+    io.out(
+      `Refunds unresolved: ${pendingRefunds
+        .map(
+          (refund) =>
+            `R${refundNumber.get(refund.id)} is ${refund.diagnosis!.state}${refund.diagnosis!.needsOperator ? ' and needs an operator' : ''}`,
+        )
+        .join('; ')}.`,
+    );
+  }
 }
 
 function describeDiagnosis(diagnosis: UnresolvedDiagnosis, now: Date): string {

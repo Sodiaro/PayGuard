@@ -12,6 +12,8 @@ import {
   PaymentFailureCode,
   ProviderWebhookEventResult,
   ProviderWebhookEventStatus,
+  RefundFailureCode,
+  RefundStatus,
 } from '../generated/prisma/enums.js';
 import { recordAuditEvent } from '../audit/operator-audit.js';
 import {
@@ -30,6 +32,7 @@ export interface ClaimedJob {
   leaseToken: string;
   requestId: string | null;
   webhookEventId: string | null;
+  refundId: string | null;
   // The previous claim's lease expired without the job finishing, i.e. a worker died or stalled.
   reclaimed: boolean;
 }
@@ -37,11 +40,18 @@ export interface ClaimedJob {
 export interface EnqueueJob {
   type: OutboxJobType;
   paymentId: string;
+  // For refund jobs, the charge being refunded.
   attemptId: string;
   delaySeconds?: number;
   requestId?: string | null;
   webhookEventId?: string;
+  refundId?: string;
 }
+
+const LOOKUP_JOB_TYPES: ReadonlySet<OutboxJobType> = new Set([
+  OutboxJobType.RECONCILE_ATTEMPT,
+  OutboxJobType.RECONCILE_REFUND,
+]);
 
 export type RescheduleOutcome = 'rescheduled' | 'dead' | 'lease_lost';
 
@@ -75,6 +85,15 @@ export interface OutboxStats {
   attemptsAwaitingOperator: number;
   // Definite provider answers that contradicted an outcome already recorded.
   attemptResultConflicts: number;
+  refunds: {
+    status: RefundStatus;
+    failureCode: RefundFailureCode | null;
+    count: number;
+  }[];
+  unresolvedRefunds: number;
+  oldestUnresolvedRefundAgeSeconds: number | null;
+  refundsAwaitingOperator: number;
+  refundResultConflicts: number;
 }
 
 type Db = Prisma.TransactionClient;
@@ -98,8 +117,8 @@ export class OutboxStore {
     });
   }
 
-  // A no-op when the attempt already has a job of this type (or, for webhook jobs, the event
-  // already has one): re-enqueueing never duplicates work. Returns whether a job was created.
+  // A no-op when the attempt (or refund) already has a job of this type, or, for webhook jobs, the
+  // event already has one: re-enqueueing never duplicates work. Returns whether a job was created.
   //
   // Every time that decides when a job may run (available_at here and in reschedule/requeue,
   // locked_until in claim) is computed by PostgreSQL, which also judges it in claim. An
@@ -108,7 +127,8 @@ export class OutboxStore {
   async enqueue(db: Db, job: EnqueueJob): Promise<boolean> {
     const created = await db.$executeRaw`
       INSERT INTO outbox_jobs
-        (id, type, payment_id, attempt_id, available_at, request_id, webhook_event_id, updated_at)
+        (id, type, payment_id, attempt_id, available_at, request_id, webhook_event_id, refund_id,
+         updated_at)
       VALUES (
         uuidv7(),
         ${job.type}::outbox_job_type,
@@ -117,6 +137,7 @@ export class OutboxStore {
         now() + ${job.delaySeconds ?? 0} * interval '1 second',
         ${job.requestId ?? null},
         ${job.webhookEventId ?? null}::uuid,
+        ${job.refundId ?? null}::uuid,
         now()
       )
       ON CONFLICT DO NOTHING`;
@@ -136,6 +157,7 @@ export class OutboxStore {
         lease_token: string;
         request_id: string | null;
         webhook_event_id: string | null;
+        refund_id: string | null;
         reclaimed: boolean;
       }[]
     >`
@@ -164,7 +186,7 @@ export class OutboxStore {
       FROM due
       WHERE job.id = due.id
       RETURNING job.id, job.type, job.payment_id, job.attempt_id, job.run_count,
-                job.lease_token, job.request_id, job.webhook_event_id,
+                job.lease_token, job.request_id, job.webhook_event_id, job.refund_id,
                 due.previous_status = 'PROCESSING' AS reclaimed`;
 
     return rows.map((row) => ({
@@ -176,6 +198,7 @@ export class OutboxStore {
       leaseToken: row.lease_token,
       requestId: row.request_id,
       webhookEventId: row.webhook_event_id,
+      refundId: row.refund_id,
       reclaimed: row.reclaimed,
     }));
   }
@@ -229,6 +252,39 @@ export class OutboxStore {
     return dead ? 'dead' : 'rescheduled';
   }
 
+  // reschedule, committed together with its history entry. Only decisions about the payment are
+  // recorded: a lookup that could not decide, and any job given up on. Internal retries of other
+  // jobs are in the job's own run count and last error.
+  async rescheduleWithHistory(
+    job: ClaimedJob,
+    category: OutboxErrorCategory,
+  ): Promise<RescheduleOutcome> {
+    return this.prisma.$transaction(async (tx) => {
+      const result = await this.reschedule(tx, job, category);
+      const event = {
+        paymentId: job.paymentId,
+        attemptId: job.attemptId,
+        refundId: job.refundId,
+        source: PaymentEventSource.WORKER,
+        outboxJobId: job.id,
+        details: { jobType: job.type, category, runCount: job.runCount },
+      };
+      if (result === 'dead') {
+        await recordPaymentEvent(tx, {
+          ...event,
+          type: PaymentEventType.JOB_DEAD,
+          webhookEventId: job.webhookEventId,
+        });
+      } else if (result === 'rescheduled' && LOOKUP_JOB_TYPES.has(job.type)) {
+        await recordPaymentEvent(tx, {
+          ...event,
+          type: PaymentEventType.RECONCILIATION_DEFERRED,
+        });
+      }
+      return result;
+    });
+  }
+
   // Safety net for attempts left PENDING without live work, such as attempts created before the
   // outbox existed or whose processing job died. Attempts that already have a reconciliation job,
   // including a DEAD one, are left alone so dead work stays visible instead of looping.
@@ -259,6 +315,51 @@ export class OutboxStore {
         created.map((job) => ({
           paymentId: job.payment_id,
           attemptId: job.attempt_id,
+          type: PaymentEventType.RECONCILIATION_SCHEDULED,
+          source: PaymentEventSource.WORKER,
+          outboxJobId: job.id,
+          details: { reason: 'pending_without_live_job' },
+        })),
+      );
+      return created.length;
+    });
+  }
+
+  // The same safety net for refunds left PENDING without live work.
+  async enqueueStaleRefundReconciliations(
+    olderThanSeconds: number,
+  ): Promise<number> {
+    return this.prisma.$transaction(async (tx) => {
+      const created = await tx.$queryRaw<
+        {
+          id: string;
+          payment_id: string;
+          attempt_id: string;
+          refund_id: string;
+        }[]
+      >`
+        INSERT INTO outbox_jobs
+          (id, type, payment_id, attempt_id, refund_id, available_at, updated_at)
+        SELECT uuidv7(), 'RECONCILE_REFUND', refund.payment_id, refund.attempt_id, refund.id,
+               now(), now()
+        FROM refunds AS refund
+        WHERE refund.status = 'PENDING'
+          AND refund.created_at < now() - ${olderThanSeconds} * interval '1 second'
+          AND NOT EXISTS (
+            SELECT 1 FROM outbox_jobs AS job
+            WHERE job.refund_id = refund.id
+              AND (job.status IN ('QUEUED', 'PROCESSING') OR job.type = 'RECONCILE_REFUND')
+          )
+        ORDER BY refund.created_at
+        LIMIT ${STALE_SWEEP_BATCH}
+        ON CONFLICT DO NOTHING
+        RETURNING id, payment_id, attempt_id, refund_id`;
+      await recordPaymentEvents(
+        tx,
+        created.map((job) => ({
+          paymentId: job.payment_id,
+          attemptId: job.attempt_id,
+          refundId: job.refund_id,
           type: PaymentEventType.RECONCILIATION_SCHEDULED,
           source: PaymentEventSource.WORKER,
           outboxJobId: job.id,
@@ -306,6 +407,7 @@ export class OutboxStore {
           paymentId: true,
           attemptId: true,
           webhookEventId: true,
+          refundId: true,
           runCount: true,
           lastError: true,
         },
@@ -320,6 +422,7 @@ export class OutboxStore {
       const details = {
         jobType: job.type,
         attemptId: job.attemptId,
+        ...(job.refundId && { refundId: job.refundId }),
         previousRunCount: job.runCount,
         lastError: job.lastError,
       };
@@ -333,6 +436,7 @@ export class OutboxStore {
       await recordPaymentEvent(tx, {
         paymentId: job.paymentId,
         attemptId: job.attemptId,
+        refundId: job.refundId,
         type: PaymentEventType.JOB_REQUEUED,
         source: PaymentEventSource.OPERATOR,
         actor,
@@ -404,9 +508,9 @@ export class OutboxStore {
     });
   }
 
-  // Deletes COMPLETED jobs whose attempt has a final outcome, in small batches so no statement
-  // holds locks for long. Jobs of unresolved attempts are kept: their history explains how the
-  // attempt got where it is. Returns the number of rows deleted.
+  // Deletes COMPLETED jobs whose attempt (and refund, for refund jobs) has a final outcome, in
+  // small batches so no statement holds locks for long. Jobs of unresolved work are kept: their
+  // history explains how it got where it is. Returns the number of rows deleted.
   async pruneCompletedJobs(
     olderThanDays: number,
     batchSize: number,
@@ -419,9 +523,11 @@ export class OutboxStore {
           SELECT job.id
           FROM outbox_jobs AS job
           JOIN payment_attempts AS attempt ON attempt.id = job.attempt_id
+          LEFT JOIN refunds AS refund ON refund.id = job.refund_id
           WHERE job.status = 'COMPLETED'
             AND job.completed_at < now() - ${olderThanDays} * interval '1 day'
             AND attempt.status <> 'PENDING'
+            AND (refund.id IS NULL OR refund.status <> 'PENDING')
           LIMIT ${batchSize}
         )`;
       deleted += batch;
@@ -453,7 +559,7 @@ export class OutboxStore {
   }
 
   async stats(): Promise<OutboxStats> {
-    const [jobs, pendingErrors, attempts, webhookEvents, [timing]] =
+    const [jobs, pendingErrors, attempts, webhookEvents, refunds, [timing]] =
       await Promise.all([
         this.prisma.outboxJob.groupBy({
           by: ['type', 'status'],
@@ -480,6 +586,11 @@ export class OutboxStore {
           _sum: { duplicateDeliveries: true, conflictingDeliveries: true },
           orderBy: [{ status: 'asc' }, { result: 'asc' }],
         }),
+        this.prisma.refund.groupBy({
+          by: ['status', 'failureCode'],
+          _count: { _all: true },
+          orderBy: [{ status: 'asc' }, { failureCode: 'asc' }],
+        }),
         this.prisma.$queryRaw<
           {
             dead_jobs: number;
@@ -494,6 +605,10 @@ export class OutboxStore {
             settle_p95_seconds: number | null;
             attempts_awaiting_operator: number;
             attempt_result_conflicts: number;
+            unresolved_refunds: number;
+            oldest_unresolved_refund_age_seconds: number | null;
+            refunds_awaiting_operator: number;
+            refund_result_conflicts: number;
           }[]
         >`
         SELECT
@@ -523,7 +638,17 @@ export class OutboxStore {
                 WHERE job.attempt_id = attempt.id AND job.type = 'RECONCILE_ATTEMPT'
                   AND job.status = 'DEAD')) AS attempts_awaiting_operator,
           (SELECT count(*)::int FROM payment_events
-            WHERE type = ${PaymentEventType.RESULT_CONFLICT}) AS attempt_result_conflicts`,
+            WHERE type = ${PaymentEventType.RESULT_CONFLICT}) AS attempt_result_conflicts,
+          (SELECT count(*)::int FROM refunds WHERE status = 'PENDING') AS unresolved_refunds,
+          (SELECT floor(extract(epoch FROM now() - min(created_at)))::int FROM refunds
+            WHERE status = 'PENDING') AS oldest_unresolved_refund_age_seconds,
+          (SELECT count(*)::int FROM refunds AS refund
+            WHERE refund.status = 'PENDING'
+              AND EXISTS (SELECT 1 FROM outbox_jobs AS job
+                WHERE job.refund_id = refund.id AND job.type = 'RECONCILE_REFUND'
+                  AND job.status = 'DEAD')) AS refunds_awaiting_operator,
+          (SELECT count(*)::int FROM payment_events
+            WHERE type = ${PaymentEventType.REFUND_RESULT_CONFLICT}) AS refund_result_conflicts`,
       ]);
 
     return {
@@ -554,6 +679,16 @@ export class OutboxStore {
       settleSecondsP95: timing.settle_p95_seconds,
       attemptsAwaitingOperator: timing.attempts_awaiting_operator,
       attemptResultConflicts: timing.attempt_result_conflicts,
+      refunds: refunds.map((row) => ({
+        status: row.status,
+        failureCode: row.failureCode,
+        count: row._count._all,
+      })),
+      unresolvedRefunds: timing.unresolved_refunds,
+      oldestUnresolvedRefundAgeSeconds:
+        timing.oldest_unresolved_refund_age_seconds,
+      refundsAwaitingOperator: timing.refunds_awaiting_operator,
+      refundResultConflicts: timing.refund_result_conflicts,
       webhookEvents: webhookEvents.map((row) => ({
         status: row.status,
         result: row.result,

@@ -5,6 +5,7 @@ import {
   OutboxJobType,
   PaymentAttemptStatus,
   ProviderWebhookEventResult,
+  RefundStatus,
   type OutboxErrorCategory,
 } from '../generated/prisma/enums.js';
 import { PaymentEventType } from './payment-events.js';
@@ -39,20 +40,33 @@ export interface UnresolvedDiagnosis {
   nextRunAt: Date | null;
 }
 
+const JOB_TYPES = {
+  attempt: {
+    submission: OutboxJobType.PROCESS_ATTEMPT,
+    lookup: OutboxJobType.RECONCILE_ATTEMPT,
+  },
+  refund: {
+    submission: OutboxJobType.PROCESS_REFUND,
+    lookup: OutboxJobType.RECONCILE_REFUND,
+  },
+} as const;
+
+// Attempts and refunds share the same submission/lookup job pattern. Jobs of the other kind (a
+// charge's refund jobs, webhook jobs) are ignored.
 export function diagnoseUnresolved(
   jobs: readonly JobView[],
+  kind: keyof typeof JOB_TYPES = 'attempt',
 ): UnresolvedDiagnosis {
-  const attemptJobs = jobs.filter(
-    (job) => job.type !== OutboxJobType.APPLY_WEBHOOK_EVENT,
+  const types = JOB_TYPES[kind];
+  const ownJobs = jobs.filter(
+    (job) => job.type === types.submission || job.type === types.lookup,
   );
-  const running = attemptJobs.find(
+  const running = ownJobs.find(
     (job) => job.status === OutboxJobStatus.PROCESSING,
   );
   if (running) return diagnosis('in_progress', running, false);
 
-  const lookup = attemptJobs.find(
-    (job) => job.type === OutboxJobType.RECONCILE_ATTEMPT,
-  );
+  const lookup = ownJobs.find((job) => job.type === types.lookup);
   if (lookup?.status === OutboxJobStatus.DEAD) {
     return diagnosis('reconciliation_exhausted', lookup, true);
   }
@@ -64,9 +78,7 @@ export function diagnoseUnresolved(
     );
   }
 
-  const submission = attemptJobs.find(
-    (job) => job.type === OutboxJobType.PROCESS_ATTEMPT,
-  );
+  const submission = ownJobs.find((job) => job.type === types.submission);
   if (submission?.status === OutboxJobStatus.QUEUED) {
     return diagnosis(
       submission.runCount > 0 ? 'submission_retrying' : 'awaiting_submission',
@@ -202,6 +214,26 @@ export class PaymentInvestigator {
             submittedAt: true,
             completedAt: true,
             outboxJobs: {
+              where: { refundId: null },
+              orderBy: { createdAt: 'asc' },
+              select: JOB_FIELDS,
+            },
+          },
+        },
+        refunds: {
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: {
+            id: true,
+            attemptId: true,
+            amount: true,
+            status: true,
+            failureCode: true,
+            providerReference: true,
+            reference: true,
+            createdAt: true,
+            submittedAt: true,
+            completedAt: true,
+            outboxJobs: {
               orderBy: { createdAt: 'asc' },
               select: JOB_FIELDS,
             },
@@ -214,6 +246,7 @@ export class PaymentInvestigator {
             type: true,
             source: true,
             attemptId: true,
+            refundId: true,
             paymentStatusBefore: true,
             paymentStatusAfter: true,
             attemptStatusBefore: true,
@@ -259,8 +292,54 @@ export class PaymentInvestigator {
             ? diagnoseUnresolved(attempt.outboxJobs)
             : null,
       })),
+      refunds: payment.refunds.map((refund) => ({
+        ...refund,
+        diagnosis:
+          refund.status === RefundStatus.PENDING
+            ? diagnoseUnresolved(refund.outboxJobs, 'refund')
+            : null,
+      })),
       webhookEvents,
     };
+  }
+
+  async unresolvedRefunds(options: { limit: number; merchantId?: string }) {
+    const refunds = await this.prisma.refund.findMany({
+      where: {
+        status: RefundStatus.PENDING,
+        ...(options.merchantId && { merchantId: options.merchantId }),
+      },
+      orderBy: { createdAt: 'asc' },
+      take: options.limit,
+      select: {
+        id: true,
+        paymentId: true,
+        createdAt: true,
+        submittedAt: true,
+        merchant: { select: { slug: true } },
+        outboxJobs: { select: JOB_FIELDS },
+      },
+    });
+    const resultConflicts = await this.prisma.paymentEvent.groupBy({
+      by: ['refundId'],
+      where: {
+        refundId: { in: refunds.map((refund) => refund.id) },
+        type: PaymentEventType.REFUND_RESULT_CONFLICT,
+      },
+      _count: { _all: true },
+    });
+
+    return refunds.map((refund) => ({
+      paymentId: refund.paymentId,
+      merchantSlug: refund.merchant.slug,
+      refundId: refund.id,
+      createdAt: refund.createdAt,
+      submitted: refund.submittedAt !== null,
+      diagnosis: diagnoseUnresolved(refund.outboxJobs, 'refund'),
+      resultConflicts:
+        resultConflicts.find((row) => row.refundId === refund.id)?._count
+          ._all ?? 0,
+    }));
   }
 }
 
@@ -269,4 +348,7 @@ export type PaymentInvestigation = NonNullable<
 >;
 export type UnresolvedAttempt = Awaited<
   ReturnType<PaymentInvestigator['unresolved']>
+>[number];
+export type UnresolvedRefund = Awaited<
+  ReturnType<PaymentInvestigator['unresolvedRefunds']>
 >[number];

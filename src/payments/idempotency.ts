@@ -42,3 +42,17 @@ export function fingerprintRetryRequest(paymentId: string): string {
   const canonical = JSON.stringify(['payments.retry.v1', paymentId]);
   return createHash('sha256').update(canonical, 'utf8').digest('hex');
 }
+
+// An omitted amount ("everything refundable") is its own request, distinct from any explicit one.
+export function fingerprintRefundRequest(
+  paymentId: string,
+  request: { amount?: number; reference?: string },
+): string {
+  const canonical = JSON.stringify([
+    'refunds.create.v1',
+    paymentId,
+    request.amount ?? null,
+    request.reference ?? null,
+  ]);
+  return createHash('sha256').update(canonical, 'utf8').digest('hex');
+}

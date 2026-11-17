@@ -80,6 +80,7 @@ describe('Payments API (PostgreSQL)', () => {
         status: 'PENDING',
         reference: 'order_10042',
         failureCode: null,
+        amountRefunded: 0,
         attempts: [
           {
             id: expect.any(String),

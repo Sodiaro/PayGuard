@@ -7,6 +7,8 @@ import {
   PaymentFailureCode,
   ProviderWebhookEventResult,
   ProviderWebhookEventStatus,
+  RefundFailureCode,
+  RefundStatus,
 } from '../generated/prisma/enums.js';
 import type { OutboxStats } from '../outbox/outbox-store.js';
 import { renderPrometheusMetrics } from './ops-metrics.js';
@@ -57,6 +59,18 @@ const stats: OutboxStats = {
   webhookConflictingDeliveries: 1,
   attemptsAwaitingOperator: 1,
   attemptResultConflicts: 0,
+  refunds: [
+    { status: RefundStatus.SUCCEEDED, failureCode: null, count: 4 },
+    {
+      status: RefundStatus.FAILED,
+      failureCode: RefundFailureCode.DECLINED,
+      count: 1,
+    },
+  ],
+  unresolvedRefunds: 1,
+  oldestUnresolvedRefundAgeSeconds: 30,
+  refundsAwaitingOperator: 0,
+  refundResultConflicts: 0,
 };
 
 describe('renderPrometheusMetrics', () => {
@@ -96,6 +110,10 @@ describe('renderPrometheusMetrics', () => {
     expect(output).toContain('payguard_webhook_conflicting_deliveries 1');
     expect(output).toContain('payguard_payment_attempts_awaiting_operator 1');
     expect(output).toContain('payguard_payment_attempt_result_conflicts 0');
+    expect(output).toContain(
+      'payguard_refunds{status="FAILED",failure_code="DECLINED"} 1',
+    );
+    expect(output).toContain('payguard_refunds_unresolved 1');
   });
 
   it('uses only bounded labels, never identifiers', () => {

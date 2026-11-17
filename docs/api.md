@@ -11,6 +11,7 @@ limits and errors. With `SWAGGER_ENABLED=true` the same endpoints are browsable 
 - [Authentication](#authentication)
 - [Merchant endpoints](#merchant-endpoints)
 - [Payments](#payments)
+- [Refunds](#refunds)
 - [Idempotency](#idempotency)
 - [Currencies and amounts](#currencies-and-amounts)
 - [Provider webhooks](#provider-webhooks)
@@ -74,6 +75,7 @@ and one `PENDING` attempt without a reference):
   "status": "SUCCEEDED",
   "reference": "order_10042",
   "failureCode": null,
+  "amountRefunded": 0,
   "attempts": [
     {
       "id": "01a16b6d-bf72-73ea-83b1-f39d1c06083f",
@@ -108,6 +110,8 @@ returned.
 **Statuses.** Payments and attempts are `PENDING`, `SUCCEEDED` or `FAILED`; see
 [the lifecycle](architecture.md#payment-lifecycle). A failed payment carries `failureCode`
 `DECLINED` (the provider refused the payment) or `PROVIDER_UNAVAILABLE` (nothing was attempted).
+Refunds do not change a payment's status: a refunded payment stays `SUCCEEDED`, and
+`amountRefunded` reports what its succeeded refunds returned.
 
 **Listing.** `GET /v1/payments` returns `{ "data": [...], "nextCursor": "..." }`, where each item
 has the same shape as `GET /v1/payments/:id`. Query parameters, all optional and combined with AND:
@@ -131,29 +135,89 @@ retried. Otherwise the retry is refused with `409` and one of the reasons `payme
 `attempt_in_progress`, `failure_not_retryable` or `attempt_limit_reached`. A `PENDING` payment is
 still being processed or reconciled and cannot be retried into a second charge.
 
+## Refunds
+
+| Method and path                 | Description                                                              |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| `POST /v1/payments/:id/refunds` | Refund all or part of a `SUCCEEDED` payment. Requires `Idempotency-Key`. |
+| `GET /v1/payments/:id/refunds`  | The payment's refunds, oldest first. 404 for anyone else's payment.      |
+| `GET /v1/refunds/:id`           | A refund owned by the caller. 404 for anyone else's or none.             |
+
+Like payments, refunds are asynchronous: the `POST` returns `202 Accepted` with the refund
+`PENDING`, and a worker submits it to the provider against the payment's succeeded attempt. Its
+outcome appears on `GET /v1/refunds/:id`. A refund whose answer was lost stays `PENDING` until a
+provider lookup establishes it; it is submitted again (under the same refund ID, the provider's
+idempotency key) only if the provider has no record of it.
+
+Request body, all optional. The currency is always the payment's and is not accepted:
+
+| Field       | Type    | Rules                                                                                    |
+| ----------- | ------- | ---------------------------------------------------------------------------------------- |
+| `amount`    | integer | Minor units, `1` to `1000000000000`. Omitted: everything still refundable.               |
+| `reference` | string  | 1-64 of `A-Z a-z 0-9 . _ : / # -`. Your own label; not unique, not used for idempotency. |
+
+```json
+{
+  "id": "01a17c2e-4b10-7a3d-9e61-5d0c8f2b7a14",
+  "paymentId": "01a16b6d-bf6d-765f-98fb-39c95d75fe23",
+  "amount": 150000,
+  "currency": "NGN",
+  "status": "SUCCEEDED",
+  "reference": "return_552",
+  "providerReference": "simrf_4d2a9c0e7b1f3a5c8e6d0b2f",
+  "failureCode": null,
+  "createdAt": "2026-11-16T10:00:00.000Z",
+  "completedAt": "2026-11-16T10:00:01.004Z"
+}
+```
+
+- **Limit.** Pending and succeeded refunds together never exceed the payment's amount. A database
+  trigger enforces it even under concurrent requests, so two refunds racing for the same remainder
+  cannot both be accepted.
+- **Statuses.** `PENDING`, `SUCCEEDED` or `FAILED`. A failed refund carries `failureCode`
+  `DECLINED` or `PROVIDER_UNAVAILABLE`; it returned nothing and frees its amount for a new refund.
+  A failed refund is not retried: create a new one with a new key.
+- **Refused refunds** answer `409` with one of the reasons `payment_not_succeeded`,
+  `nothing_left_to_refund` or `amount_exceeds_refundable`. Nothing is created.
+
+| Status | When                                                                                               |
+| ------ | -------------------------------------------------------------------------------------------------- |
+| `202`  | Refund created and queued, `PENDING`.                                                              |
+| `200`  | Replay of an earlier request with the same key; header `Idempotent-Replayed: true`. Current state. |
+| `400`  | Invalid body or `Idempotency-Key` (field-level `details`), bad payment id.                         |
+| `404`  | Payment (or refund) does not exist or belongs to another merchant.                                 |
+| `409`  | `Idempotency-Key` already used with a different request, or the refund is refused (above).         |
+| `429`  | Rate limit exceeded; refunds share the per-merchant limit with payment creations and retries.      |
+
 ## Idempotency
 
-Both `POST` operations need an `Idempotency-Key` header: 1-255 visible ASCII characters, unique per
-operation you intend to perform (a UUID is ideal). Creation keys and retry keys are separate
-namespaces, so reusing a value across the two never makes either request ambiguous.
+Every `POST` that creates something needs an `Idempotency-Key` header: 1-255 visible ASCII
+characters, unique per operation you intend to perform (a UUID is ideal). Creation, retry and
+refund keys are separate namespaces, so reusing a value across them never makes a request
+ambiguous.
 
 | Operation | Stored in                                            | Unique per | Same request means                     |
 | --------- | ---------------------------------------------------- | ---------- | -------------------------------------- |
 | Create    | `payments.idempotency_key`                           | merchant   | same `amount`, `currency`, `reference` |
 | Retry     | `payment_retry_requests` (one row per retry attempt) | merchant   | same payment ID                        |
+| Refund    | `refunds.idempotency_key`                            | merchant   | same payment ID, `amount`, `reference` |
 
 - **Same key, same request:** `200` with `Idempotent-Replayed: true` and the payment's **current**
   state, which may have moved on since the first response (e.g. `PENDING` → `SUCCEEDED`). No
   payment, attempt or job is created and nothing more is queued for the provider.
 - **Same key, different request:** `409 Conflict`. Requests are compared by a SHA-256 fingerprint
   of a versioned canonical form built from the validated input:
-  `["payments.create.v1", amount, currency, reference ?? null]` or
-  `["payments.retry.v1", paymentId]`. JSON key order and whitespace do not matter.
+  `["payments.create.v1", amount, currency, reference ?? null]`,
+  `["payments.retry.v1", paymentId]` or
+  `["refunds.create.v1", paymentId, amount ?? null, reference ?? null]` (so a full refund, with no
+  amount, is a different request from any explicit amount). JSON key order and whitespace do not
+  matter.
 - **Concurrency:** unique constraints on `(merchant_id, idempotency_key)` decide races. Concurrent
   creations with one key race on the insert; the losers hit the constraint and are answered from
-  the winner's row. Retries additionally lock the payment row (`SELECT ... FOR UPDATE`), so
-  concurrent retries of one payment run one at a time: with the same key the later ones replay,
-  with different keys they find the payment no longer `FAILED` and get `409`.
+  the winner's row. Retries and refunds additionally lock the payment row
+  (`SELECT ... FOR UPDATE`), so concurrent retries or refunds of one payment run one at a time:
+  with the same key the later ones replay, with different keys they see the effect of the earlier
+  ones (a payment no longer `FAILED`, less left to refund) and may get `409`.
 - **Retention:** keys never expire.
 
 ## Currencies and amounts
@@ -248,10 +312,10 @@ delayed lookup runs, which then finds nothing left to do.
 
 ## Rate limiting
 
-| Limit                                   | Key       | Default | Applies to                                                      |
-| --------------------------------------- | --------- | ------- | --------------------------------------------------------------- |
-| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks        |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments` and `/retry` combined, after authentication |
+| Limit                                   | Key       | Default | Applies to                                                                  |
+| --------------------------------------- | --------- | ------- | --------------------------------------------------------------------------- |
+| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks                    |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments`, `/retry` and `/refunds` combined, after authentication |
 
 - Token buckets allow a burst up to the limit, then refill steadily. Over the limit, the response
   is `429` with `Retry-After: <seconds>` and the standard error body.

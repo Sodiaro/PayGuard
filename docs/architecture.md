@@ -41,6 +41,8 @@ src/
 │                           # payment history writer, read-only investigation queries
 │   ├── processing/         # Outbox worker, process/reconcile job handlers, in-process starter
 │   └── providers/          # PaymentProvider port, the simulated provider and its webhooks
+├── refunds/                # /v1/payments/:id/refunds and /v1/refunds, refund lifecycle, and the
+│                           # refund job processor the worker runs
 ├── webhooks/               # /v1/webhooks intake: raw body, signature, event schema, inbox, and
 │                           # the processor and policy the worker uses to apply stored events
 ├── outbox/                 # Outbox job store: enqueue, claim, fencing, heartbeats, stats, pruning
@@ -199,6 +201,44 @@ Together these give at-most-one charge per attempt only if the provider honours 
 key and answers lookups consistently once a submission's timeout has passed. The simulator
 behaves that way; a real provider must be verified to.
 
+## Refunds
+
+A **refund** returns all or part of a payment's succeeded charge. It is its own record (`refunds`),
+pointing at the payment and at the attempt that succeeded, and it never changes the payment's
+status: a refunded payment stays `SUCCEEDED` and reports `amountRefunded`.
+
+```
+Refund:  PENDING ──► SUCCEEDED (terminal)
+            └──────► FAILED    (terminal; frees its amount, never retried or reopened)
+
+POST /v1/payments/:id/refunds ──► one transaction: lock payment, check refundable amount,
+                                  refund (PENDING) + PROCESS_REFUND job ──► 202
+worker ──► marks refund submitted ──► provider.processRefund(refundId, charge reference)
+       ──► definite answer: refund outcome + job COMPLETED, in one transaction
+       ──► no answer: RECONCILE_REFUND job (delayed) ──► provider.lookupRefund(refundId)
+```
+
+- **Same discipline as attempts.** Refund jobs use the same outbox, leases, fencing, backoff,
+  dead-lettering and requeue, and the same rules: the refund is marked `submitted_at` before the
+  provider is called, a redelivered job for a possibly submitted refund goes to a lookup, a refund
+  is resubmitted (under the same refund ID, the provider's idempotency key) only when the
+  provider has no record of it, and a definite answer that contradicts a recorded outcome is
+  recorded as `refund.result_conflict` and changes nothing. The stale sweep covers pending refunds
+  without live work too. Refund jobs carry the refund's ID and, as their attempt, the charge being
+  refunded; they are unique per `(refund, type)`.
+- **Never more than the payment.** Pending and succeeded refunds count against the payment's
+  amount; failed ones do not. The API checks this under a row lock on the payment, so concurrent
+  refunds of one payment are serialized. The database enforces it independently: the
+  `refunds_within_payment_amount` trigger locks the payment row on every insert and refuses a
+  refund that would exceed the amount, or that does not match a succeeded attempt of its own
+  payment, merchant and currency.
+- **Failed refunds are final.** `DECLINED` (the provider refused) or `PROVIDER_UNAVAILABLE`
+  (nothing was attempted). The merchant creates a new refund, with a new key, for the money that
+  is still refundable.
+- **History:** `refund.created`, `refund.submitted`, `refund.outcome_unknown`, `refund.resolved`
+  and `refund.result_conflict` go to the payment's history with the refund's ID, alongside the
+  generic deferred, scheduled, dead and requeued events; refund statuses are in their details.
+
 ## Worker deployment
 
 The same worker code runs in one of two places:
@@ -337,12 +377,12 @@ type lookup prefix    secret: 32 random bytes, base64url
 Each process connects with only the privileges it needs. None of these roles is a superuser, can
 create roles or databases, replicate, or bypass row security:
 
-| Role                           | Kind                         | Used by                            | Can                                                                                                                        |
-| ------------------------------ | ---------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                            |
-| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, jobs, events; update only the columns its state changes touch |
-| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                  |
-| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                           |
+| Role                           | Kind                         | Used by                            | Can                                                                                                                                 |
+| ------------------------------ | ---------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                                     |
+| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, refunds, jobs, events; update only the columns its state changes touch |
+| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                           |
+| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                                    |
 
 What the roles cannot do is the point:
 
@@ -353,9 +393,10 @@ What the roles cannot do is the point:
   `session_replication_role`, create tables, or grant itself anything.
 - **The runtime role is narrow.** It cannot delete any row or change amounts, ownership, keys or
   merchant status.
-- **The operator role is narrow too.** It cannot change payments or attempts.
+- **The operator role is narrow too.** It cannot change payments, attempts or refunds.
 
-Privileges are granted by migrations (`20261026120000_runtime_and_operator_privileges`), so they
+Privileges are granted by migrations (`20261026120000_runtime_and_operator_privileges`, and each
+later migration for the tables it adds), so they
 travel with the schema, and `test/database-privileges.e2e-spec.ts` checks every one of these
 against PostgreSQL and pins the exact grant list. **Every migration that adds a table must grant on
 it**; the privilege test fails otherwise. Provisioning and password rotation are in
@@ -397,7 +438,7 @@ the history to write-once storage if tamper evidence is required.
 ## Limitations
 
 - **Simulated payments only, so no production deployment.** There is no real provider integration,
-  card handling, capture, refund or payout. The simulator is refused under `NODE_ENV=production`,
+  card handling, capture or payout; refunds go to the simulator too. The simulator is refused under `NODE_ENV=production`,
   so the API and worker cannot run in production until a real provider is added. A real
   `PaymentProvider` would need at least:
   - an idempotency key per submission (the attempt ID) that the provider honours across retries;
@@ -412,7 +453,11 @@ the history to write-once storage if tamper evidence is required.
     and confirmation that its events echo the attempt ID and the charged amount and currency;
   - PCI DSS scope review before any card data could pass through the system.
 - **No exactly-once guarantee; at most one charge per attempt depends on the provider.** See
-  [What is and is not guaranteed](#what-is-and-is-not-guaranteed).
+  [What is and is not guaranteed](#what-is-and-is-not-guaranteed). The same holds for refunds,
+  keyed by refund ID.
+- **Refund outcomes come from submission answers and lookups only.** The provider webhook schema
+  covers payment events; provider refund events are not accepted. Refunds cannot be cancelled
+  once created.
 - **Automatic reconciliation is bounded.** After `OUTBOX_MAX_RUNS` inconclusive lookups the
   payment stays `PENDING` and needs an operator. The window is about 13 minutes with the defaults.
 - **The in-process worker shares the API process** (the default outside Compose). A heavy backlog

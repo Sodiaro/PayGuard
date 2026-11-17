@@ -240,6 +240,14 @@ describe('Database roles and privileges (PostgreSQL)', () => {
       'provider_webhook_events: UPDATE (processed_at)',
       'provider_webhook_events: UPDATE (result)',
       'provider_webhook_events: UPDATE (status)',
+      'refunds: INSERT',
+      'refunds: SELECT',
+      'refunds: UPDATE (completed_at)',
+      'refunds: UPDATE (failure_code)',
+      'refunds: UPDATE (provider_reference)',
+      'refunds: UPDATE (status)',
+      'refunds: UPDATE (submitted_at)',
+      'refunds: UPDATE (updated_at)',
     ]);
     expect(await grants('payguard_operator')).toEqual([
       'merchant_api_keys: INSERT',
@@ -265,6 +273,7 @@ describe('Database roles and privileges (PostgreSQL)', () => {
       'payment_retry_requests: SELECT',
       'payments: SELECT',
       'provider_webhook_events: SELECT',
+      'refunds: SELECT',
     ]);
     // Login roles hold nothing directly; they act only through their group.
     expect(await grants('payguard_app')).toEqual([]);

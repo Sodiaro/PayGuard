@@ -623,6 +623,7 @@ describe('Payment lifecycle history and investigation (PostgreSQL)', () => {
     const response = await api.get(acme, payment.id).expect(200);
     expect(Object.keys(response.body as object).sort()).toEqual([
       'amount',
+      'amountRefunded',
       'attempts',
       'createdAt',
       'currency',

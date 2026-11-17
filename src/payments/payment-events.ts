@@ -23,6 +23,13 @@ export const PaymentEventType = {
   JOB_DEAD: 'outbox_job.dead',
   JOB_REQUEUED: 'outbox_job.requeued',
   WEBHOOK_NOT_APPLIED: 'webhook.not_applied',
+  // Refund events carry the refund's ID and, as attemptId, the charge being refunded. Refunds do
+  // not change the payment's status, so their own statuses are in details.
+  REFUND_CREATED: 'refund.created',
+  REFUND_SUBMITTED: 'refund.submitted',
+  REFUND_OUTCOME_UNKNOWN: 'refund.outcome_unknown',
+  REFUND_RESOLVED: 'refund.resolved',
+  REFUND_RESULT_CONFLICT: 'refund.result_conflict',
 } as const;
 
 export type PaymentEventType =
@@ -31,6 +38,7 @@ export type PaymentEventType =
 export interface PaymentEventInput {
   paymentId: string;
   attemptId?: string | null;
+  refundId?: string | null;
   type: PaymentEventType;
   source: PaymentEventSource;
   paymentStatusBefore?: PaymentStatus | null;
@@ -66,6 +74,7 @@ function toRow(event: PaymentEventInput): Prisma.PaymentEventCreateManyInput {
   return {
     paymentId: event.paymentId,
     attemptId: event.attemptId ?? null,
+    refundId: event.refundId ?? null,
     type: event.type,
     source: event.source,
     paymentStatusBefore: event.paymentStatusBefore ?? null,
