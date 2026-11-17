@@ -4,7 +4,9 @@ import { requestContext } from '../../common/logging/request-context.js';
 import type { CoreEnvironment } from '../../config/environment.js';
 import { PrismaService } from '../../database/prisma.service.js';
 import type { Prisma } from '../../generated/prisma/client.js';
+import { PaymentActionJobProcessor } from '../../captures/payment-action-job-processor.js';
 import {
+  CaptureMethod,
   OutboxErrorCategory,
   OutboxJobType,
   PaymentAttemptStatus,
@@ -42,7 +44,12 @@ interface PendingAttempt {
   id: string;
   paymentId: string;
   submittedAt: Date | null;
-  payment: { merchantId: string; amount: bigint; currency: string };
+  payment: {
+    merchantId: string;
+    amount: bigint;
+    currency: string;
+    captureMethod: CaptureMethod;
+  };
 }
 
 type UnknownOutcomeHandler = (category: OutboxErrorCategory) => Promise<void>;
@@ -62,6 +69,7 @@ export class AttemptJobProcessor {
     private readonly webhooks: ProviderWebhookProcessor,
     private readonly refunds: RefundJobProcessor,
     private readonly deliveries: MerchantEventDeliveryProcessor,
+    private readonly actions: PaymentActionJobProcessor,
     config: ConfigService<CoreEnvironment, true>,
   ) {
     this.reconciliationDelaySeconds = config.get(
@@ -123,6 +131,13 @@ export class AttemptJobProcessor {
       await this.deliveries.process(job);
       return;
     }
+    if (
+      job.type === OutboxJobType.PROCESS_PAYMENT_ACTION ||
+      job.type === OutboxJobType.RECONCILE_PAYMENT_ACTION
+    ) {
+      await this.actions.process(job);
+      return;
+    }
 
     const attempt = await this.prisma.paymentAttempt.findFirst({
       where: { id: job.attemptId, status: PaymentAttemptStatus.PENDING },
@@ -131,7 +146,12 @@ export class AttemptJobProcessor {
         paymentId: true,
         submittedAt: true,
         payment: {
-          select: { merchantId: true, amount: true, currency: true },
+          select: {
+            merchantId: true,
+            amount: true,
+            currency: true,
+            captureMethod: true,
+          },
         },
       },
     });
@@ -204,7 +224,10 @@ export class AttemptJobProcessor {
     const startedAt = performance.now();
     try {
       lookup = await withProviderTimeout(
-        this.provider.lookupPayment({ attemptId: attempt.id }),
+        this.provider.lookupPayment({
+          attemptId: attempt.id,
+          capture: attempt.payment.captureMethod === CaptureMethod.AUTOMATIC,
+        }),
       );
     } catch (error) {
       await this.retryLater(job, providerErrorCategory(error));
@@ -218,25 +241,34 @@ export class AttemptJobProcessor {
 
     switch (lookup.status) {
       case 'succeeded':
+      case 'authorized':
+      case 'declined': {
+        let resolution: AttemptResolution;
+        try {
+          resolution = resolveAttempt(
+            lookup.status === 'declined'
+              ? {
+                  outcome: 'declined',
+                  providerReference: lookup.providerReference,
+                }
+              : {
+                  outcome: lookup.status,
+                  providerReference: lookup.providerReference,
+                },
+            attempt.payment.captureMethod,
+          );
+        } catch {
+          // An answer that does not fit the capture method is no answer: ask again later.
+          await this.retryLater(job, OutboxErrorCategory.PROVIDER_ERROR);
+          return;
+        }
         await this.recordAndComplete(
           job,
-          resolveAttempt({
-            outcome: 'succeeded',
-            providerReference: lookup.providerReference,
-          }),
+          resolution,
           PaymentEventSource.PROVIDER_LOOKUP,
         );
         return;
-      case 'declined':
-        await this.recordAndComplete(
-          job,
-          resolveAttempt({
-            outcome: 'declined',
-            providerReference: lookup.providerReference,
-          }),
-          PaymentEventSource.PROVIDER_LOOKUP,
-        );
-        return;
+      }
       case 'processing':
         await this.retryLater(job, OutboxErrorCategory.OUTCOME_PROCESSING);
         return;
@@ -268,9 +300,10 @@ export class AttemptJobProcessor {
           merchantId: attempt.payment.merchantId,
           amount: Number(attempt.payment.amount),
           currency: attempt.payment.currency,
+          capture: attempt.payment.captureMethod === CaptureMethod.AUTOMATIC,
         }),
       );
-      resolution = resolveAttempt(result);
+      resolution = resolveAttempt(result, attempt.payment.captureMethod);
     } catch (error) {
       const category = providerErrorCategory(error);
       this.logger.warn('Payment submission ended without a definite outcome', {

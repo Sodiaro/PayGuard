@@ -28,6 +28,7 @@ API-only settings and the CLI needs no provider.
 | `MIGRATION_DATABASE_URL`                                                         | migrations            | required        | Connection as the schema owner (`payguard_owner`), used only by `npm run db:migrate:*`         |
 | `PAYMENT_SIMULATOR_OUTCOME`                                                      | all                   | `SUCCEEDED`     | Simulator result for every payment: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                     |
 | `PAYMENT_SIMULATOR_REFUND_OUTCOME`                                               | all                   | `SUCCEEDED`     | Simulator result for every refund: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`                      |
+| `PAYMENT_SIMULATOR_CAPTURE_OUTCOME`                                              | all                   | `SUCCEEDED`     | Simulator result for every capture and void: `SUCCEEDED`, `DECLINED`, `UNAVAILABLE`            |
 | `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS`                                        | all                   | `false`         | `true`: submissions (payments and refunds) are processed but time out; lookups decide          |
 | `OUTBOX_POLL_INTERVAL_MS`                                                        | all                   | `1000`          | Idle delay between outbox polls (100-60000)                                                    |
 | `OUTBOX_LEASE_SECONDS`                                                           | all                   | `60`            | How long a claimed job is owned before another worker may take it (≥ 30)                       |
@@ -88,6 +89,11 @@ in [architecture.md](architecture.md#database-roles).
 Refunds follow `PAYMENT_SIMULATOR_REFUND_OUTCOME` the same way, independently of the payment
 outcome: `SUCCEEDED` (reference `simrf_<24 hex>`), `DECLINED` (`FAILED`, `failureCode: DECLINED`)
 or `UNAVAILABLE` (`FAILED`, `failureCode: PROVIDER_UNAVAILABLE`, no reference).
+
+For a manual-capture payment, `SUCCEEDED` in `PAYMENT_SIMULATOR_OUTCOME` means the attempt is
+authorized (the payment becomes `AUTHORIZED`), and its webhook is `payment.authorized`. Captures
+and voids then follow `PAYMENT_SIMULATOR_CAPTURE_OUTCOME` (references `simcp_` and `simvd_`); a
+declined or unavailable one leaves the payment `AUTHORIZED`.
 
 With `PAYMENT_SIMULATOR_AMBIGUOUS_SUBMISSIONS=true`, every submission, payment or refund, is
 treated as processed but its answer times out. Payments and refunds then stay `PENDING` until

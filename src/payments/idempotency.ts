@@ -21,18 +21,37 @@ export interface CanonicalPaymentRequest {
   amount: number;
   currency: string;
   reference?: string | null;
+  captureMethod?: 'AUTOMATIC' | 'MANUAL';
 }
 
 // Fingerprints are stored with each payment, so any change to this canonical form must bump the
-// version tag; otherwise replays of existing keys would start returning 409.
+// version tag; otherwise replays of existing keys would start returning 409. Automatic capture,
+// explicit or by default, keeps the v1 form, so payments created before manual capture existed
+// still replay.
 export function fingerprintPaymentRequest(
   request: CanonicalPaymentRequest,
 ): string {
+  const fields = [request.amount, request.currency, request.reference ?? null];
+  const canonical = JSON.stringify(
+    request.captureMethod === 'MANUAL'
+      ? ['payments.create.v2', ...fields, 'MANUAL']
+      : ['payments.create.v1', ...fields],
+  );
+  return createHash('sha256').update(canonical, 'utf8').digest('hex');
+}
+
+// Capture and void have no reference; a capture without an amount captures the whole
+// authorization and is its own request, distinct from any explicit amount.
+export function fingerprintPaymentActionRequest(
+  paymentId: string,
+  type: 'CAPTURE' | 'VOID',
+  amount?: number,
+): string {
   const canonical = JSON.stringify([
-    'payments.create.v1',
-    request.amount,
-    request.currency,
-    request.reference ?? null,
+    'payments.action.v1',
+    paymentId,
+    type,
+    amount ?? null,
   ]);
   return createHash('sha256').update(canonical, 'utf8').digest('hex');
 }

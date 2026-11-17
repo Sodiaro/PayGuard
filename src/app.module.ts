@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module.js';
+import { CapturesModule } from './captures/captures.module.js';
 import { RateLimitModule } from './common/rate-limit/rate-limit.module.js';
 import { apiConfigModule } from './config/app-config.module.js';
 import { DatabaseModule } from './database/database.module.js';
@@ -23,6 +24,7 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
     HealthModule,
     MerchantsModule,
     PaymentsModule,
+    CapturesModule,
     RefundsModule,
     MerchantWebhooksModule,
     PaymentProcessingModule,

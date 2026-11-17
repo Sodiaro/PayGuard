@@ -25,7 +25,7 @@ const TARGET_ATTEMPT_FIELDS = {
   failureCode: true,
   providerReference: true,
   submittedAt: true,
-  payment: { select: { amount: true, currency: true } },
+  payment: { select: { amount: true, currency: true, captureMethod: true } },
 } satisfies Prisma.PaymentAttemptSelect;
 
 class LeaseLostError extends Error {}

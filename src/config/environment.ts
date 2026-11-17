@@ -127,6 +127,12 @@ class SharedEnvironment {
   PAYMENT_SIMULATOR_REFUND_OUTCOME: SimulatorOutcome =
     SimulatorOutcome.Succeeded;
 
+  // Outcome of every simulated capture and void of an authorization.
+  @Expose()
+  @IsEnum(SimulatorOutcome)
+  PAYMENT_SIMULATOR_CAPTURE_OUTCOME: SimulatorOutcome =
+    SimulatorOutcome.Succeeded;
+
   @Expose()
   @StrictBoolean()
   @IsBoolean()

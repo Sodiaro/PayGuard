@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 import {
   ProviderTimeoutError,
   type PaymentProvider,
+  type ProviderActionLookupRequest,
+  type ProviderActionLookupResult,
+  type ProviderActionResult,
+  type ProviderCaptureRequest,
   type ProviderLookupRequest,
   type ProviderLookupResult,
   type ProviderPaymentRequest,
@@ -10,6 +14,7 @@ import {
   type ProviderRefundLookupResult,
   type ProviderRefundRequest,
   type ProviderRefundResult,
+  type ProviderVoidRequest,
 } from './payment-provider.js';
 
 export enum SimulatorOutcome {
@@ -18,19 +23,34 @@ export enum SimulatorOutcome {
   Unavailable = 'UNAVAILABLE',
 }
 
+export interface SimulatorOutcomes {
+  payment: SimulatorOutcome;
+  refund?: SimulatorOutcome;
+  // Captures and voids of authorizations.
+  action?: SimulatorOutcome;
+}
+
 // The outcome comes from operator configuration, never from the merchant's request. The simulated
-// ledger is a pure function of that configuration and the attempt or refund ID, so lookups give
-// the same answer after a restart; it assumes everything it is asked about was submitted.
+// ledger is a pure function of that configuration and the attempt, refund or action ID, so lookups
+// give the same answer after a restart; it assumes everything it is asked about was submitted.
 export class SimulatedPaymentProvider implements PaymentProvider {
   readonly id = 'simulator';
+  private readonly paymentOutcome: SimulatorOutcome;
+  private readonly refundOutcome: SimulatorOutcome;
+  private readonly actionOutcome: SimulatorOutcome;
 
-  // With ambiguousSubmissions, every submission (payment or refund) is processed but its answer
-  // is lost to a timeout, leaving the outcome to be recovered through a lookup.
+  // With ambiguousSubmissions, every submission (payment, refund, capture or void) is processed
+  // but its answer is lost to a timeout, leaving the outcome to be recovered through a lookup.
   constructor(
-    private readonly outcome: SimulatorOutcome,
+    outcomes: SimulatorOutcome | SimulatorOutcomes,
     private readonly ambiguousSubmissions = false,
-    private readonly refundOutcome = SimulatorOutcome.Succeeded,
-  ) {}
+  ) {
+    const resolved =
+      typeof outcomes === 'string' ? { payment: outcomes } : outcomes;
+    this.paymentOutcome = resolved.payment;
+    this.refundOutcome = resolved.refund ?? SimulatorOutcome.Succeeded;
+    this.actionOutcome = resolved.action ?? SimulatorOutcome.Succeeded;
+  }
 
   processPayment(
     request: ProviderPaymentRequest,
@@ -38,26 +58,33 @@ export class SimulatedPaymentProvider implements PaymentProvider {
     if (this.ambiguousSubmissions) {
       return Promise.reject(new ProviderTimeoutError());
     }
+    const result = submissionResult(
+      this.paymentOutcome,
+      referenceFor(request.attemptId),
+    );
     return Promise.resolve(
-      submissionResult(this.outcome, referenceFor(request.attemptId)),
+      result.outcome === 'succeeded' && !request.capture
+        ? { outcome: 'authorized', providerReference: result.providerReference }
+        : result,
     );
   }
 
   lookupPayment(request: ProviderLookupRequest): Promise<ProviderLookupResult> {
+    const result = lookupResult(
+      this.paymentOutcome,
+      referenceFor(request.attemptId),
+    );
     return Promise.resolve(
-      lookupResult(this.outcome, referenceFor(request.attemptId)),
+      result.status === 'succeeded' && !request.capture
+        ? { status: 'authorized', providerReference: result.providerReference }
+        : result,
     );
   }
 
   processRefund(request: ProviderRefundRequest): Promise<ProviderRefundResult> {
-    if (this.ambiguousSubmissions) {
-      return Promise.reject(new ProviderTimeoutError());
-    }
-    return Promise.resolve(
-      submissionResult(
-        this.refundOutcome,
-        refundReferenceFor(request.refundId),
-      ),
+    return this.submitAction(
+      this.refundOutcome,
+      refundReferenceFor(request.refundId),
     );
   }
 
@@ -68,12 +95,49 @@ export class SimulatedPaymentProvider implements PaymentProvider {
       lookupResult(this.refundOutcome, refundReferenceFor(request.refundId)),
     );
   }
+
+  capturePayment(
+    request: ProviderCaptureRequest,
+  ): Promise<ProviderActionResult> {
+    return this.submitAction(
+      this.actionOutcome,
+      actionReferenceFor(request.actionId, 'capture'),
+    );
+  }
+
+  voidPayment(request: ProviderVoidRequest): Promise<ProviderActionResult> {
+    return this.submitAction(
+      this.actionOutcome,
+      actionReferenceFor(request.actionId, 'void'),
+    );
+  }
+
+  lookupPaymentAction(
+    request: ProviderActionLookupRequest,
+  ): Promise<ProviderActionLookupResult> {
+    return Promise.resolve(
+      lookupResult(
+        this.actionOutcome,
+        actionReferenceFor(request.actionId, request.type),
+      ),
+    );
+  }
+
+  private submitAction(
+    outcome: SimulatorOutcome,
+    providerReference: string,
+  ): Promise<ProviderActionResult> {
+    if (this.ambiguousSubmissions) {
+      return Promise.reject(new ProviderTimeoutError());
+    }
+    return Promise.resolve(submissionResult(outcome, providerReference));
+  }
 }
 
 function submissionResult(
   outcome: SimulatorOutcome,
   providerReference: string,
-): ProviderPaymentResult {
+): ProviderActionResult {
   switch (outcome) {
     case SimulatorOutcome.Succeeded:
       return { outcome: 'succeeded', providerReference };
@@ -87,7 +151,7 @@ function submissionResult(
 function lookupResult(
   outcome: SimulatorOutcome,
   providerReference: string,
-): ProviderLookupResult {
+): ProviderActionLookupResult {
   switch (outcome) {
     case SimulatorOutcome.Succeeded:
       return { status: 'succeeded', providerReference };
@@ -104,4 +168,12 @@ export function referenceFor(attemptId: string): string {
 
 export function refundReferenceFor(refundId: string): string {
   return `simrf_${createHash('sha256').update(refundId).digest('hex').slice(0, 24)}`;
+}
+
+export function actionReferenceFor(
+  actionId: string,
+  type: 'capture' | 'void',
+): string {
+  const prefix = type === 'capture' ? 'simcp' : 'simvd';
+  return `${prefix}_${createHash('sha256').update(actionId).digest('hex').slice(0, 24)}`;
 }

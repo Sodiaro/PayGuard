@@ -1,4 +1,5 @@
 import {
+  CaptureMethod,
   PaymentAttemptStatus,
   PaymentFailureCode,
   PaymentStatus,
@@ -7,13 +8,20 @@ import type { ProviderPaymentResult } from './providers/payment-provider.js';
 
 // Every status write is a conditional update whose WHERE clause is derived from these tables, so
 // an unlisted transition cannot happen even under concurrency. FAILED -> PENDING is reserved for
-// retries, which start a new attempt.
+// retries, which start a new attempt. AUTHORIZED is reached only with manual capture, and leaves
+// only through a capture (SUCCEEDED) or a void (CANCELED).
 export const PAYMENT_TRANSITIONS: Readonly<
   Record<PaymentStatus, readonly PaymentStatus[]>
 > = {
-  [PaymentStatus.PENDING]: [PaymentStatus.SUCCEEDED, PaymentStatus.FAILED],
+  [PaymentStatus.PENDING]: [
+    PaymentStatus.SUCCEEDED,
+    PaymentStatus.FAILED,
+    PaymentStatus.AUTHORIZED,
+  ],
   [PaymentStatus.FAILED]: [PaymentStatus.PENDING],
+  [PaymentStatus.AUTHORIZED]: [PaymentStatus.SUCCEEDED, PaymentStatus.CANCELED],
   [PaymentStatus.SUCCEEDED]: [],
+  [PaymentStatus.CANCELED]: [],
 };
 
 export const ATTEMPT_TRANSITIONS: Readonly<
@@ -64,16 +72,41 @@ export interface AttemptResolution {
   failureCode: PaymentFailureCode | null;
 }
 
+export class CaptureMethodMismatchError extends Error {
+  constructor(outcome: string, captureMethod: CaptureMethod) {
+    super(
+      `Provider answered "${outcome}" for a ${captureMethod} capture payment`,
+    );
+  }
+}
+
 // "Unavailable" means the provider refused the request without processing it; it must never be
-// recorded as a decline.
+// recorded as a decline. A succeeded authorization is a succeeded attempt that leaves the payment
+// AUTHORIZED. A charge reported for a manual payment, or an authorization for an automatic one, is
+// not an outcome PayGuard asked for, so it is treated as no definite answer (the error), never
+// recorded.
 export function resolveAttempt(
   result: ProviderPaymentResult,
+  captureMethod: CaptureMethod,
 ): AttemptResolution {
   switch (result.outcome) {
     case 'succeeded':
+      if (captureMethod !== CaptureMethod.AUTOMATIC) {
+        throw new CaptureMethodMismatchError(result.outcome, captureMethod);
+      }
       return {
         attemptStatus: PaymentAttemptStatus.SUCCEEDED,
         paymentStatus: PaymentStatus.SUCCEEDED,
+        providerReference: result.providerReference,
+        failureCode: null,
+      };
+    case 'authorized':
+      if (captureMethod !== CaptureMethod.MANUAL) {
+        throw new CaptureMethodMismatchError(result.outcome, captureMethod);
+      }
+      return {
+        attemptStatus: PaymentAttemptStatus.SUCCEEDED,
+        paymentStatus: PaymentStatus.AUTHORIZED,
         providerReference: result.providerReference,
         failureCode: null,
       };

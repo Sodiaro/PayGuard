@@ -270,6 +270,7 @@ async function execute(
       printUnresolved(
         await investigator.unresolved(filter),
         await investigator.unresolvedRefunds(filter),
+        await investigator.unresolvedActions(filter),
         io,
       );
       return;
@@ -392,6 +393,16 @@ function printOutboxStats(stats: OutboxStats, io: AdminCliOutput): void {
     `Refunds awaiting an operator:   ${stats.refundsAwaitingOperator} (lookups exhausted; see payments:unresolved)`,
   );
   io.out(`Contradicting refund answers:   ${stats.refundResultConflicts}`);
+  io.out(`Authorized, awaiting capture:   ${stats.authorizedPayments}`);
+  io.out('Captures and voids:');
+  if (stats.paymentActions.length === 0) io.out('  none');
+  for (const row of stats.paymentActions) {
+    io.out(`  ${row.type.padEnd(10)} ${row.status.padEnd(10)} ${row.count}`);
+  }
+  io.out(`Unresolved captures and voids:  ${stats.unresolvedPaymentActions}`);
+  io.out(
+    `Captures/voids awaiting an operator: ${stats.paymentActionsAwaitingOperator}`,
+  );
   io.out('Merchant events by delivery status:');
   if (stats.merchantEventDeliveries.length === 0) io.out('  none');
   for (const row of stats.merchantEventDeliveries) {

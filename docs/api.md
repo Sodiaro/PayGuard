@@ -44,12 +44,13 @@ There are deliberately no HTTP endpoints for registering merchants or managing k
 
 ## Payments
 
-| Method and path               | Description                                                                       |
-| ----------------------------- | --------------------------------------------------------------------------------- |
-| `POST /v1/payments`           | Create a payment and queue its first attempt. Requires `Idempotency-Key`.         |
-| `POST /v1/payments/:id/retry` | Queue a new attempt for an eligible `FAILED` payment. Requires `Idempotency-Key`. |
-| `GET /v1/payments`            | The caller's payments, newest first, filtered and paginated (see below).          |
-| `GET /v1/payments/:id`        | A payment owned by the caller, with its attempts. 404 for anyone else's or none.  |
+| Method and path                          | Description                                                                            |
+| ---------------------------------------- | -------------------------------------------------------------------------------------- |
+| `POST /v1/payments`                      | Create a payment and queue its first attempt. Requires `Idempotency-Key`.              |
+| `POST /v1/payments/:id/retry`            | Queue a new attempt for an eligible `FAILED` payment. Requires `Idempotency-Key`.      |
+| `POST /v1/payments/:id/capture`, `/void` | Capture or void a manual-capture authorization; see [Manual capture](#manual-capture). |
+| `GET /v1/payments`                       | The caller's payments, newest first, filtered and paginated (see below).               |
+| `GET /v1/payments/:id`                   | A payment owned by the caller, with its attempts. 404 for anyone else's or none.       |
 
 Processing is asynchronous: both `POST` operations return `202 Accepted` with the payment
 `PENDING`, and the outcome appears on `GET /v1/payments/:id` once a worker has processed it
@@ -59,11 +60,12 @@ Processing is asynchronous: both `POST` operations return `202 Accepted` with th
 Request body. Only these fields are accepted; anything else, such as `merchantId`, `status` or
 provider data, is rejected with 400:
 
-| Field       | Type    | Rules                                                                                              |
-| ----------- | ------- | -------------------------------------------------------------------------------------------------- |
-| `amount`    | integer | Minor units, `1` to `1000000000000`. JSON numbers only, never strings or decimals.                 |
-| `currency`  | string  | One of the [supported ISO 4217 codes](#currencies-and-amounts), uppercase.                         |
-| `reference` | string  | Optional, 1-64 of `A-Z a-z 0-9 . _ : / # -`. Your own label; not unique, not used for idempotency. |
+| Field           | Type    | Rules                                                                                              |
+| --------------- | ------- | -------------------------------------------------------------------------------------------------- |
+| `amount`        | integer | Minor units, `1` to `1000000000000`. JSON numbers only, never strings or decimals.                 |
+| `currency`      | string  | One of the [supported ISO 4217 codes](#currencies-and-amounts), uppercase.                         |
+| `reference`     | string  | Optional, 1-64 of `A-Z a-z 0-9 . _ : / # -`. Your own label; not unique, not used for idempotency. |
+| `captureMethod` | string  | Optional: `AUTOMATIC` (default) charges on submission; `MANUAL` only authorizes.                   |
 
 A processed payment, as returned by `GET` (a new payment looks the same with `status: "PENDING"`
 and one `PENDING` attempt without a reference):
@@ -74,9 +76,12 @@ and one `PENDING` attempt without a reference):
   "amount": 500000,
   "currency": "NGN",
   "status": "SUCCEEDED",
+  "captureMethod": "AUTOMATIC",
   "reference": "order_10042",
   "failureCode": null,
+  "amountCaptured": 500000,
   "amountRefunded": 0,
+  "actions": [],
   "attempts": [
     {
       "id": "01a16b6d-bf72-73ea-83b1-f39d1c06083f",
@@ -108,18 +113,20 @@ and one `PENDING` attempt without a reference):
 Internal fields such as the idempotency key, request fingerprint and raw provider data are never
 returned.
 
-**Statuses.** Payments and attempts are `PENDING`, `SUCCEEDED` or `FAILED`; see
+**Statuses.** Payments are `PENDING`, `SUCCEEDED` or `FAILED`, and with manual capture also
+`AUTHORIZED` and `CANCELED`; attempts are `PENDING`, `SUCCEEDED` or `FAILED`. See
 [the lifecycle](architecture.md#payment-lifecycle). A failed payment carries `failureCode`
 `DECLINED` (the provider refused the payment) or `PROVIDER_UNAVAILABLE` (nothing was attempted).
-Refunds do not change a payment's status: a refunded payment stays `SUCCEEDED`, and
-`amountRefunded` reports what its succeeded refunds returned.
+`amountCaptured` is what a `SUCCEEDED` payment charged (`null` otherwise). Refunds do not change a
+payment's status: a refunded payment stays `SUCCEEDED`, and `amountRefunded` reports what its
+succeeded refunds returned.
 
 **Listing.** `GET /v1/payments` returns `{ "data": [...], "nextCursor": "..." }`, where each item
 has the same shape as `GET /v1/payments/:id`. Query parameters, all optional and combined with AND:
 
 | Parameter     | Rules                                                                             |
 | ------------- | --------------------------------------------------------------------------------- |
-| `status`      | `PENDING`, `SUCCEEDED` or `FAILED`                                                |
+| `status`      | `PENDING`, `SUCCEEDED`, `FAILED`, `AUTHORIZED` or `CANCELED`                      |
 | `reference`   | Exact match on the merchant's reference                                           |
 | `createdFrom` | ISO 8601; payments created at or after this time                                  |
 | `createdTo`   | ISO 8601; payments created before this time                                       |
@@ -135,6 +142,35 @@ malformed one, an unknown parameter or a repeated one is a `400` with field `det
 retried. Otherwise the retry is refused with `409` and one of the reasons `payment_not_failed`,
 `attempt_in_progress`, `failure_not_retryable` or `attempt_limit_reached`. A `PENDING` payment is
 still being processed or reconciled and cannot be retried into a second charge.
+
+## Manual capture
+
+Created with `"captureMethod": "MANUAL"`, a payment is only **authorized**: the provider holds the
+funds, and the payment becomes `AUTHORIZED` instead of `SUCCEEDED`. The merchant then either
+captures it or voids it.
+
+| Method and path                 | Body                 | Result once processed                                     |
+| ------------------------------- | -------------------- | --------------------------------------------------------- |
+| `POST /v1/payments/:id/capture` | `{"amount": 400000}` | `SUCCEEDED`, `amountCaptured` = the amount; rest released |
+| `POST /v1/payments/:id/capture` | `{}`                 | `SUCCEEDED`, the whole authorization captured             |
+| `POST /v1/payments/:id/void`    | none                 | `CANCELED`, the authorization released                    |
+
+- Both require an `Idempotency-Key`, return `202` with the payment (still `AUTHORIZED`) and the new
+  action `PENDING` in its `actions`, and are processed asynchronously like payments: marked
+  submitted before the provider is called, looked up when the answer is lost, and resubmitted under
+  the same action ID only if the provider has no record of it.
+- **Once.** An authorization is captured or voided once, and only one capture or void can be in
+  flight at a time. A **declined** or **unavailable** action (`FAILED`, with `failureCode`) leaves
+  the payment `AUTHORIZED`, so it can be captured or voided again with a new key.
+- **Refused** with `409` and a reason: `payment_not_authorized` (an automatic payment, or one not
+  `AUTHORIZED` now), `action_in_progress`, or `amount_exceeds_authorized`.
+- **Refunds** apply to the captured amount only: a payment captured for 400000 can be refunded up
+  to 400000, and an `AUTHORIZED` or `CANCELED` payment cannot be refunded (void it instead).
+- `actions` on the payment lists every capture and void: `id`, `type` (`CAPTURE` or `VOID`),
+  `amount` (captures only), `status`, `providerReference`, `failureCode`, `createdAt`,
+  `completedAt`.
+- A declined authorization is `FAILED` and can be retried; the new attempt is also manual.
+- Authorizations do not expire in the simulator; a real provider's would.
 
 ## Refunds
 
@@ -197,19 +233,21 @@ characters, unique per operation you intend to perform (a UUID is ideal). Creati
 refund keys are separate namespaces, so reusing a value across them never makes a request
 ambiguous.
 
-| Operation | Stored in                                            | Unique per | Same request means                     |
-| --------- | ---------------------------------------------------- | ---------- | -------------------------------------- |
-| Create    | `payments.idempotency_key`                           | merchant   | same `amount`, `currency`, `reference` |
-| Retry     | `payment_retry_requests` (one row per retry attempt) | merchant   | same payment ID                        |
-| Refund    | `refunds.idempotency_key`                            | merchant   | same payment ID, `amount`, `reference` |
+| Operation      | Stored in                                            | Unique per | Same request means                     |
+| -------------- | ---------------------------------------------------- | ---------- | -------------------------------------- |
+| Create         | `payments.idempotency_key`                           | merchant   | same `amount`, `currency`, `reference` |
+| Retry          | `payment_retry_requests` (one row per retry attempt) | merchant   | same payment ID                        |
+| Refund         | `refunds.idempotency_key`                            | merchant   | same payment ID, `amount`, `reference` |
+| Capture / void | `payment_actions.idempotency_key`                    | merchant   | same payment ID, action, `amount`      |
 
 - **Same key, same request:** `200` with `Idempotent-Replayed: true` and the payment's **current**
   state, which may have moved on since the first response (e.g. `PENDING` → `SUCCEEDED`). No
   payment, attempt or job is created and nothing more is queued for the provider.
 - **Same key, different request:** `409 Conflict`. Requests are compared by a SHA-256 fingerprint
   of a versioned canonical form built from the validated input:
-  `["payments.create.v1", amount, currency, reference ?? null]`,
-  `["payments.retry.v1", paymentId]` or
+  `["payments.create.v1", amount, currency, reference ?? null]` (with manual capture,
+  `["payments.create.v2", amount, currency, reference ?? null, "MANUAL"]`),
+  `["payments.retry.v1", paymentId]`, `["payments.action.v1", paymentId, type, amount ?? null]` or
   `["refunds.create.v1", paymentId, amount ?? null, reference ?? null]` (so a full refund, with no
   amount, is a different request from any explicit amount). JSON key order and whitespace do not
   matter.
@@ -263,8 +301,11 @@ example after a lost response) is an update and returns no secret: rotate to get
 rotation, deliveries are signed with both the new and the previous secret for 24 hours, so you can
 deploy the new secret without rejecting deliveries meanwhile.
 
-**Events.** `payment.succeeded`, `payment.failed`, `refund.succeeded` and `refund.failed`, recorded
-in the same transaction as the outcome. A delivery's body is the event:
+**Events.** `payment.succeeded`, `payment.failed`, `refund.succeeded` and `refund.failed`, and
+for manual capture `payment.authorized`, `payment.canceled` (voided), `payment.capture_failed` and
+`payment.void_failed` (the provider refused it; the payment stays `AUTHORIZED`). A capture's
+success is `payment.succeeded`. Each is recorded in the same transaction as the outcome. A
+delivery's body is the event:
 
 ```json
 {
@@ -349,14 +390,14 @@ X-Simulator-Signature: t=1792843200,v1=5f2c...e81a   (64 lowercase hex character
 }
 ```
 
-| Field                     | Meaning                                                                                        |
-| ------------------------- | ---------------------------------------------------------------------------------------------- |
-| `id`                      | The provider's stable event ID (`evt_` + 8-64 letters or digits); the same on every redelivery |
-| `type`                    | `payment.succeeded`, `payment.declined` or `payment.processing` (informational only)           |
-| `createdAt`               | When the provider created the event (ISO 8601, UTC)                                            |
-| `data.attemptId`          | The idempotency reference PayGuard sent with the submission, i.e. the attempt ID               |
-| `data.providerReference`  | The provider's own reference for the attempt                                                   |
-| `data.amount`, `currency` | What the provider charged; compared with the payment, never used to change it                  |
+| Field                     | Meaning                                                                                                                                                                                                                                                                    |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                      | The provider's stable event ID (`evt_` + 8-64 letters or digits); the same on every redelivery                                                                                                                                                                             |
+| `type`                    | `payment.succeeded`, `payment.authorized` (manual capture), `payment.declined` or `payment.processing` (informational only). A charge reported for a manual-capture attempt, or an authorization for an automatic one, is recorded as `DATA_MISMATCH` and left to a lookup |
+| `createdAt`               | When the provider created the event (ISO 8601, UTC)                                                                                                                                                                                                                        |
+| `data.attemptId`          | The idempotency reference PayGuard sent with the submission, i.e. the attempt ID                                                                                                                                                                                           |
+| `data.providerReference`  | The provider's own reference for the attempt                                                                                                                                                                                                                               |
+| `data.amount`, `currency` | What the provider charged; compared with the payment, never used to change it                                                                                                                                                                                              |
 
 The event carries no payment ID, merchant ID or status, and any undeclared field is rejected: the
 attempt, its payment and its merchant come from PayGuard's records.
@@ -401,10 +442,10 @@ delayed lookup runs, which then finds nothing left to do.
 
 ## Rate limiting
 
-| Limit                                   | Key       | Default | Applies to                                                                                              |
-| --------------------------------------- | --------- | ------- | ------------------------------------------------------------------------------------------------------- |
-| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks                                                |
-| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments`, `/retry`, `/refunds` and `/v1/events/:id/redeliver` combined, after authentication |
+| Limit                                   | Key       | Default | Applies to                                                                                                                   |
+| --------------------------------------- | --------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `RATE_LIMIT_IP_PER_MINUTE`              | client IP | 300/min | every route except `/health*`, **before** API-key checks                                                                     |
+| `RATE_LIMIT_PAYMENT_CREATES_PER_MINUTE` | merchant  | 60/min  | `POST /v1/payments`, `/retry`, `/capture`, `/void`, `/refunds` and `/v1/events/:id/redeliver` combined, after authentication |
 
 - Token buckets allow a burst up to the limit, then refill steadily. Over the limit, the response
   is `429` with `Retry-After: <seconds>` and the standard error body.

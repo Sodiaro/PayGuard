@@ -36,6 +36,7 @@ export function jobFields(job: ClaimedJob) {
     paymentId: job.paymentId,
     attemptId: job.attemptId,
     ...(job.refundId && { refundId: job.refundId }),
+    ...(job.paymentActionId && { paymentActionId: job.paymentActionId }),
   };
 }
 
@@ -47,6 +48,7 @@ export function elapsedMs(startedAt: number): number {
 export function knownLookupStatus(lookup: ProviderLookupResult): string {
   const known = [
     'succeeded',
+    'authorized',
     'declined',
     'processing',
     'not_found',

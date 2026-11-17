@@ -1,10 +1,12 @@
 import {
   PaymentAttemptStatus,
   ProviderWebhookEventResult,
+  type CaptureMethod,
   type PaymentFailureCode,
 } from '../generated/prisma/enums.js';
 import { matchesRecordedOutcome } from '../payments/attempt-outcomes.js';
 import {
+  CaptureMethodMismatchError,
   resolveAttempt,
   type AttemptResolution,
 } from '../payments/payment-lifecycle.js';
@@ -22,7 +24,7 @@ export interface WebhookTargetAttempt {
   failureCode: PaymentFailureCode | null;
   providerReference: string | null;
   submittedAt: Date | null;
-  payment: { amount: bigint; currency: string };
+  payment: { amount: bigint; currency: string; captureMethod: CaptureMethod };
 }
 
 export type WebhookDecision =
@@ -65,7 +67,17 @@ export function decideWebhookEvent(
     );
   }
 
-  const resolution = resolutionFor(event);
+  let resolution: AttemptResolution | null;
+  try {
+    resolution = resolutionFor(event, attempt.payment.captureMethod);
+  } catch (error) {
+    // A charge reported for an authorization-only payment, or the reverse.
+    if (!(error instanceof CaptureMethodMismatchError)) throw error;
+    return record(
+      ProviderWebhookEventResult.DATA_MISMATCH,
+      pendingAndSubmitted,
+    );
+  }
   if (!resolution) return record(ProviderWebhookEventResult.NO_ACTION, false);
 
   if (attempt.status === PaymentAttemptStatus.PENDING) {
@@ -81,18 +93,26 @@ export function decideWebhookEvent(
 
 // Only terminal event types carry an outcome; payment.processing is informational, so a late one
 // can never move an attempt backwards.
-function resolutionFor(event: StoredWebhookEvent): AttemptResolution | null {
+function resolutionFor(
+  event: StoredWebhookEvent,
+  captureMethod: CaptureMethod,
+): AttemptResolution | null {
   switch (event.eventType) {
     case 'payment.succeeded':
-      return resolveAttempt({
-        outcome: 'succeeded',
-        providerReference: event.providerReference,
-      });
+      return resolveAttempt(
+        { outcome: 'succeeded', providerReference: event.providerReference },
+        captureMethod,
+      );
+    case 'payment.authorized':
+      return resolveAttempt(
+        { outcome: 'authorized', providerReference: event.providerReference },
+        captureMethod,
+      );
     case 'payment.declined':
-      return resolveAttempt({
-        outcome: 'declined',
-        providerReference: event.providerReference,
-      });
+      return resolveAttempt(
+        { outcome: 'declined', providerReference: event.providerReference },
+        captureMethod,
+      );
     default:
       return null;
   }

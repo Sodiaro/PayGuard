@@ -1,6 +1,7 @@
 import type {
   JobView,
   PaymentInvestigation,
+  UnresolvedAction,
   UnresolvedAttempt,
   UnresolvedDiagnosis,
   UnresolvedRefund,
@@ -10,10 +11,12 @@ import type { AdminCliOutput } from './admin-cli.js';
 export function printUnresolved(
   attempts: UnresolvedAttempt[],
   refunds: UnresolvedRefund[],
+  actions: UnresolvedAction[],
   io: AdminCliOutput,
   now = new Date(),
 ): void {
   printUnresolvedAttempts(attempts, io, now);
+  printUnresolvedActions(actions, io, now);
   if (refunds.length === 0) return;
   const blocked = refunds.filter((refund) => refund.diagnosis.needsOperator);
   io.out('');
@@ -36,6 +39,36 @@ export function printUnresolved(
     io.out('');
     io.out(
       'reconciliation_exhausted: confirm the refund with the provider by refund ID, then requeue its dead RECONCILE_REFUND job (outbox:requeue).',
+    );
+  }
+}
+
+function printUnresolvedActions(
+  actions: UnresolvedAction[],
+  io: AdminCliOutput,
+  now: Date,
+): void {
+  if (actions.length === 0) return;
+  const blocked = actions.filter((action) => action.diagnosis.needsOperator);
+  io.out('');
+  io.out(
+    `Unresolved captures and voids, oldest first (${actions.length} shown, ${blocked.length} need an operator):`,
+  );
+  for (const action of actions) {
+    io.out(
+      [
+        `  age=${secondsBetween(action.createdAt, now)}s`,
+        `payment=${action.paymentId}`,
+        `${action.type.toLowerCase()}=${action.actionId} (${action.merchantSlug})`,
+        `submitted=${action.submitted ? 'yes' : 'no'}`,
+        describeDiagnosis(action.diagnosis, now),
+      ].join('  '),
+    );
+  }
+  if (blocked.length > 0) {
+    io.out('');
+    io.out(
+      'reconciliation_exhausted: confirm the capture or void with the provider by action ID, then requeue its dead RECONCILE_PAYMENT_ACTION job (outbox:requeue).',
     );
   }
 }
@@ -88,9 +121,12 @@ export function printInvestigation(
   const refundNumber = new Map(
     payment.refunds.map((refund, index) => [refund.id, index + 1]),
   );
+  const actionNumber = new Map(
+    payment.actions.map((action, index) => [action.id, index + 1]),
+  );
 
   io.out(
-    `Payment ${payment.id}  ${payment.status}  ${payment.amount.toString()} ${payment.currency}  reference=${payment.reference ?? '-'}`,
+    `Payment ${payment.id}  ${payment.status}  ${payment.amount.toString()} ${payment.currency}  capture=${payment.captureMethod}  reference=${payment.reference ?? '-'}`,
   );
   io.out(
     `  merchant ${payment.merchant.slug} (${payment.merchant.id}, ${payment.merchant.status})  created ${iso(payment.createdAt)}  updated ${iso(payment.updatedAt)}`,
@@ -107,6 +143,21 @@ export function printInvestigation(
     }
     if (attempt.diagnosis) {
       io.out(`      unresolved: ${describeDiagnosis(attempt.diagnosis, now)}`);
+    }
+  }
+
+  io.out('');
+  io.out('Captures and voids:');
+  if (payment.actions.length === 0) io.out('  none');
+  for (const action of payment.actions) {
+    io.out(
+      `  A${actionNumber.get(action.id)} ${action.id}  ${action.type} ${action.status}  amount=${action.amount?.toString() ?? '-'}  of attempt ${label(action.attemptId)}  failure=${action.failureCode ?? '-'}  providerReference=${action.providerReference ?? '-'}  created ${iso(action.createdAt)}  submitted ${iso(action.submittedAt)}  completed ${iso(action.completedAt)}`,
+    );
+    for (const job of action.outboxJobs) {
+      io.out(`      job ${job.id}  ${describeJob(job)}`);
+    }
+    if (action.diagnosis) {
+      io.out(`      unresolved: ${describeDiagnosis(action.diagnosis, now)}`);
     }
   }
 
@@ -169,6 +220,8 @@ export function printInvestigation(
       event.type.padEnd(24),
       `attempt ${label(event.attemptId)}`,
       event.refundId && `refund R${refundNumber.get(event.refundId) ?? '?'}`,
+      event.paymentActionId &&
+        `action A${actionNumber.get(event.paymentActionId) ?? '?'}`,
       transition(
         'payment',
         event.paymentStatusBefore,
@@ -201,6 +254,17 @@ export function printInvestigation(
           )
           .join('; ')}.`,
   );
+  const pendingActions = payment.actions.filter((action) => action.diagnosis);
+  if (pendingActions.length > 0) {
+    io.out(
+      `Captures and voids unresolved: ${pendingActions
+        .map(
+          (action) =>
+            `A${actionNumber.get(action.id)} is ${action.diagnosis!.state}${action.diagnosis!.needsOperator ? ' and needs an operator' : ''}`,
+        )
+        .join('; ')}.`,
+    );
+  }
   const pendingRefunds = payment.refunds.filter((refund) => refund.diagnosis);
   if (pendingRefunds.length > 0) {
     io.out(

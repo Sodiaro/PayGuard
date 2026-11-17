@@ -33,10 +33,16 @@ export function createPaymentProvider(
       const refundOutcome = config.get('PAYMENT_SIMULATOR_REFUND_OUTCOME', {
         infer: true,
       });
+      const actionOutcome = config.get('PAYMENT_SIMULATOR_CAPTURE_OUTCOME', {
+        infer: true,
+      });
       new Logger('PaymentProviderModule').warn(
-        `Payments use the simulated provider (outcome: ${outcome}, refund outcome: ${refundOutcome}, ambiguous submissions: ${ambiguous}); no real money is moved`,
+        `Payments use the simulated provider (outcome: ${outcome}, refund outcome: ${refundOutcome}, capture/void outcome: ${actionOutcome}, ambiguous submissions: ${ambiguous}); no real money is moved`,
       );
-      return new SimulatedPaymentProvider(outcome, ambiguous, refundOutcome);
+      return new SimulatedPaymentProvider(
+        { payment: outcome, refund: refundOutcome, action: actionOutcome },
+        ambiguous,
+      );
     }
     default:
       throw new Error('PAYMENT_PROVIDER does not name a supported provider');

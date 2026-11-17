@@ -1,15 +1,16 @@
 import type { Prisma } from '../generated/prisma/client.js';
-import type {
-  PaymentAttemptStatus,
-  PaymentEventSource,
-  PaymentFailureCode,
+import {
+  PaymentStatus,
+  type PaymentAttemptStatus,
+  type PaymentEventSource,
+  type PaymentFailureCode,
 } from '../generated/prisma/enums.js';
 import { recordPaymentOutcomeEvent } from '../merchant-webhooks/merchant-events.js';
 import { PaymentStateConflictError } from './payment-errors.js';
 import { PaymentEventType, recordPaymentEvent } from './payment-events.js';
 import {
   attemptStatusesThatCanBecome,
-  paymentStatusesThatCanBecome,
+  canTransitionPayment,
   type AttemptResolution,
 } from './payment-lifecycle.js';
 
@@ -21,8 +22,9 @@ export interface ResolutionProvenance {
 }
 
 // Applies a definite outcome to an attempt and its payment within the caller's transaction, and
-// records it in the payment's history and as a merchant event in the same transaction. Returns false when the attempt
-// already has an outcome, so a late, duplicate or racing result never overwrites a terminal state.
+// records it in the payment's history and as a merchant event in the same transaction. Returns
+// false when the attempt already has an outcome, so a late, duplicate or racing result never
+// overwrites a terminal state.
 export async function applyAttemptResolution(
   tx: Prisma.TransactionClient,
   attemptId: string,
@@ -42,9 +44,12 @@ export async function applyAttemptResolution(
   });
   if (!attempt) return false;
 
-  const paymentSources = paymentStatusesThatCanBecome(resolution.paymentStatus);
+  // An attempt only ever resolves a PENDING payment; AUTHORIZED -> SUCCEEDED belongs to captures.
+  if (!canTransitionPayment(PaymentStatus.PENDING, resolution.paymentStatus)) {
+    throw new PaymentStateConflictError(attempt.paymentId);
+  }
   const payment = await tx.payment.updateMany({
-    where: { id: attempt.paymentId, status: { in: paymentSources } },
+    where: { id: attempt.paymentId, status: PaymentStatus.PENDING },
     data: { status: resolution.paymentStatus },
   });
   if (payment.count !== 1)
@@ -55,10 +60,10 @@ export async function applyAttemptResolution(
     attemptId,
     type: PaymentEventType.ATTEMPT_RESOLVED,
     source: provenance.source,
-    // The guarded updates above admit exactly one source status each (PENDING).
+    // The guarded attempt update admits exactly one source status (PENDING).
     attemptStatusBefore: onlySource(attemptSources),
     attemptStatusAfter: resolution.attemptStatus,
-    paymentStatusBefore: onlySource(paymentSources),
+    paymentStatusBefore: PaymentStatus.PENDING,
     paymentStatusAfter: resolution.paymentStatus,
     outboxJobId: provenance.outboxJobId,
     webhookEventId: provenance.webhookEventId,

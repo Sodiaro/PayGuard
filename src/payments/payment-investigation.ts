@@ -3,6 +3,7 @@ import { PrismaService } from '../database/prisma.service.js';
 import {
   OutboxJobStatus,
   OutboxJobType,
+  PaymentActionStatus,
   PaymentAttemptStatus,
   ProviderWebhookEventResult,
   RefundStatus,
@@ -48,6 +49,10 @@ const JOB_TYPES = {
   refund: {
     submission: OutboxJobType.PROCESS_REFUND,
     lookup: OutboxJobType.RECONCILE_REFUND,
+  },
+  action: {
+    submission: OutboxJobType.PROCESS_PAYMENT_ACTION,
+    lookup: OutboxJobType.RECONCILE_PAYMENT_ACTION,
   },
 } as const;
 
@@ -197,6 +202,7 @@ export class PaymentInvestigator {
         amount: true,
         currency: true,
         status: true,
+        captureMethod: true,
         reference: true,
         createdAt: true,
         updatedAt: true,
@@ -214,7 +220,11 @@ export class PaymentInvestigator {
             submittedAt: true,
             completedAt: true,
             outboxJobs: {
-              where: { refundId: null, merchantEventId: null },
+              where: {
+                refundId: null,
+                merchantEventId: null,
+                paymentActionId: null,
+              },
               orderBy: { createdAt: 'asc' },
               select: JOB_FIELDS,
             },
@@ -230,6 +240,25 @@ export class PaymentInvestigator {
             failureCode: true,
             providerReference: true,
             reference: true,
+            createdAt: true,
+            submittedAt: true,
+            completedAt: true,
+            outboxJobs: {
+              orderBy: { createdAt: 'asc' },
+              select: JOB_FIELDS,
+            },
+          },
+        },
+        actions: {
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: {
+            id: true,
+            attemptId: true,
+            type: true,
+            amount: true,
+            status: true,
+            failureCode: true,
+            providerReference: true,
             createdAt: true,
             submittedAt: true,
             completedAt: true,
@@ -263,6 +292,7 @@ export class PaymentInvestigator {
             source: true,
             attemptId: true,
             refundId: true,
+            paymentActionId: true,
             paymentStatusBefore: true,
             paymentStatusAfter: true,
             attemptStatusBefore: true,
@@ -315,8 +345,44 @@ export class PaymentInvestigator {
             ? diagnoseUnresolved(refund.outboxJobs, 'refund')
             : null,
       })),
+      actions: payment.actions.map((action) => ({
+        ...action,
+        diagnosis:
+          action.status === PaymentActionStatus.PENDING
+            ? diagnoseUnresolved(action.outboxJobs, 'action')
+            : null,
+      })),
       webhookEvents,
     };
+  }
+
+  async unresolvedActions(options: { limit: number; merchantId?: string }) {
+    const actions = await this.prisma.paymentAction.findMany({
+      where: {
+        status: PaymentActionStatus.PENDING,
+        ...(options.merchantId && { merchantId: options.merchantId }),
+      },
+      orderBy: { createdAt: 'asc' },
+      take: options.limit,
+      select: {
+        id: true,
+        type: true,
+        paymentId: true,
+        createdAt: true,
+        submittedAt: true,
+        merchant: { select: { slug: true } },
+        outboxJobs: { select: JOB_FIELDS },
+      },
+    });
+    return actions.map((action) => ({
+      paymentId: action.paymentId,
+      merchantSlug: action.merchant.slug,
+      actionId: action.id,
+      type: action.type,
+      createdAt: action.createdAt,
+      submitted: action.submittedAt !== null,
+      diagnosis: diagnoseUnresolved(action.outboxJobs, 'action'),
+    }));
   }
 
   async unresolvedRefunds(options: { limit: number; merchantId?: string }) {
@@ -367,4 +433,7 @@ export type UnresolvedAttempt = Awaited<
 >[number];
 export type UnresolvedRefund = Awaited<
   ReturnType<PaymentInvestigator['unresolvedRefunds']>
+>[number];
+export type UnresolvedAction = Awaited<
+  ReturnType<PaymentInvestigator['unresolvedActions']>
 >[number];

@@ -30,6 +30,13 @@ export const PaymentEventType = {
   REFUND_OUTCOME_UNKNOWN: 'refund.outcome_unknown',
   REFUND_RESOLVED: 'refund.resolved',
   REFUND_RESULT_CONFLICT: 'refund.result_conflict',
+  // Captures and voids of an authorization carry the action's ID and its type in details, and,
+  // as attemptId, the authorization. A succeeded one records the payment's status change.
+  ACTION_CREATED: 'action.created',
+  ACTION_SUBMITTED: 'action.submitted',
+  ACTION_OUTCOME_UNKNOWN: 'action.outcome_unknown',
+  ACTION_RESOLVED: 'action.resolved',
+  ACTION_RESULT_CONFLICT: 'action.result_conflict',
 } as const;
 
 export type PaymentEventType =
@@ -39,6 +46,7 @@ export interface PaymentEventInput {
   paymentId: string;
   attemptId?: string | null;
   refundId?: string | null;
+  paymentActionId?: string | null;
   type: PaymentEventType;
   source: PaymentEventSource;
   paymentStatusBefore?: PaymentStatus | null;
@@ -75,6 +83,7 @@ function toRow(event: PaymentEventInput): Prisma.PaymentEventCreateManyInput {
     paymentId: event.paymentId,
     attemptId: event.attemptId ?? null,
     refundId: event.refundId ?? null,
+    paymentActionId: event.paymentActionId ?? null,
     type: event.type,
     source: event.source,
     paymentStatusBefore: event.paymentStatusBefore ?? null,

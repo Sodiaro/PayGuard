@@ -1,11 +1,13 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   PaymentAttemptStatus as Attempt,
+  CaptureMethod,
   PaymentFailureCode,
   PaymentStatus as Payment,
 } from '../generated/prisma/enums.js';
 import {
   attemptStatusesThatCanBecome,
+  CaptureMethodMismatchError,
   canTransitionAttempt,
   canTransitionPayment,
   MAX_ATTEMPTS_PER_PAYMENT,
@@ -19,7 +21,13 @@ describe('payment transitions', () => {
   it.each([
     [Payment.PENDING, Payment.SUCCEEDED, true],
     [Payment.PENDING, Payment.FAILED, true],
+    [Payment.PENDING, Payment.AUTHORIZED, true],
     [Payment.FAILED, Payment.PENDING, true],
+    [Payment.AUTHORIZED, Payment.SUCCEEDED, true],
+    [Payment.AUTHORIZED, Payment.CANCELED, true],
+    [Payment.AUTHORIZED, Payment.FAILED, false],
+    [Payment.AUTHORIZED, Payment.PENDING, false],
+    [Payment.PENDING, Payment.CANCELED, false],
     [Payment.SUCCEEDED, Payment.FAILED, false],
     [Payment.SUCCEEDED, Payment.PENDING, false],
     [Payment.FAILED, Payment.SUCCEEDED, false],
@@ -28,21 +36,28 @@ describe('payment transitions', () => {
     expect(canTransitionPayment(from, to)).toBe(allowed);
   });
 
-  it('treats SUCCEEDED as terminal', () => {
-    for (const to of Object.values(Payment)) {
-      expect(canTransitionPayment(Payment.SUCCEEDED, to)).toBe(false);
-    }
-  });
+  it.each([Payment.SUCCEEDED, Payment.CANCELED])(
+    'treats %s as terminal',
+    (terminal) => {
+      for (const to of Object.values(Payment)) {
+        expect(canTransitionPayment(terminal, to)).toBe(false);
+      }
+    },
+  );
 
   it('derives the conditional-update guards from the same table', () => {
     expect(paymentStatusesThatCanBecome(Payment.SUCCEEDED)).toEqual([
       Payment.PENDING,
+      Payment.AUTHORIZED,
     ]);
     expect(paymentStatusesThatCanBecome(Payment.FAILED)).toEqual([
       Payment.PENDING,
     ]);
     expect(paymentStatusesThatCanBecome(Payment.PENDING)).toEqual([
       Payment.FAILED,
+    ]);
+    expect(paymentStatusesThatCanBecome(Payment.CANCELED)).toEqual([
+      Payment.AUTHORIZED,
     ]);
   });
 });
@@ -64,9 +79,14 @@ describe('attempt transitions', () => {
 });
 
 describe('resolveAttempt', () => {
+  const { AUTOMATIC, MANUAL } = CaptureMethod;
+
   it('maps a success to SUCCEEDED on both records', () => {
     expect(
-      resolveAttempt({ outcome: 'succeeded', providerReference: 'sim_1' }),
+      resolveAttempt(
+        { outcome: 'succeeded', providerReference: 'sim_1' },
+        AUTOMATIC,
+      ),
     ).toEqual({
       attemptStatus: Attempt.SUCCEEDED,
       paymentStatus: Payment.SUCCEEDED,
@@ -75,18 +95,50 @@ describe('resolveAttempt', () => {
     });
   });
 
-  it('maps a decline to FAILED with DECLINED', () => {
+  it('maps an authorization to a succeeded attempt and an AUTHORIZED payment', () => {
     expect(
-      resolveAttempt({ outcome: 'declined', providerReference: 'sim_2' }),
-    ).toMatchObject({
-      attemptStatus: Attempt.FAILED,
-      paymentStatus: Payment.FAILED,
-      failureCode: PaymentFailureCode.DECLINED,
+      resolveAttempt(
+        { outcome: 'authorized', providerReference: 'sim_1' },
+        MANUAL,
+      ),
+    ).toEqual({
+      attemptStatus: Attempt.SUCCEEDED,
+      paymentStatus: Payment.AUTHORIZED,
+      providerReference: 'sim_1',
+      failureCode: null,
     });
   });
 
+  it.each([
+    ['a charge for a manual-capture payment', 'succeeded', MANUAL],
+    ['an authorization for an automatic payment', 'authorized', AUTOMATIC],
+  ] as const)(
+    'refuses %s, which PayGuard never asked for',
+    (_case, outcome, captureMethod) => {
+      expect(() =>
+        resolveAttempt({ outcome, providerReference: 'sim_1' }, captureMethod),
+      ).toThrow(CaptureMethodMismatchError);
+    },
+  );
+
+  it.each([AUTOMATIC, MANUAL])(
+    'maps a decline to FAILED with DECLINED for %s capture',
+    (captureMethod) => {
+      expect(
+        resolveAttempt(
+          { outcome: 'declined', providerReference: 'sim_2' },
+          captureMethod,
+        ),
+      ).toMatchObject({
+        attemptStatus: Attempt.FAILED,
+        paymentStatus: Payment.FAILED,
+        failureCode: PaymentFailureCode.DECLINED,
+      });
+    },
+  );
+
   it('never reports an outage as a decline', () => {
-    expect(resolveAttempt({ outcome: 'unavailable' })).toEqual({
+    expect(resolveAttempt({ outcome: 'unavailable' }, AUTOMATIC)).toEqual({
       attemptStatus: Attempt.FAILED,
       paymentStatus: Payment.FAILED,
       providerReference: null,
@@ -96,7 +148,7 @@ describe('resolveAttempt', () => {
 
   it('refuses outcomes it does not recognise instead of guessing', () => {
     const bogus = { outcome: 'maybe' } as unknown as ProviderPaymentResult;
-    expect(() => resolveAttempt(bogus)).toThrow(
+    expect(() => resolveAttempt(bogus, AUTOMATIC)).toThrow(
       /Unrecognised provider outcome/,
     );
   });

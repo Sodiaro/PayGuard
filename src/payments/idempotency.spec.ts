@@ -1,9 +1,44 @@
 import { describe, expect, it } from '@jest/globals';
+import { createHash } from 'node:crypto';
 import {
+  fingerprintPaymentActionRequest,
   fingerprintPaymentRequest,
   fingerprintRefundRequest,
   idempotencyKeyProblem,
 } from './idempotency.js';
+
+describe('fingerprintPaymentRequest and capture', () => {
+  const order = { amount: 500000, currency: 'NGN', reference: 'order_1' };
+
+  it('keeps automatic capture, explicit or by default, on the original v1 form', () => {
+    expect(
+      fingerprintPaymentRequest({ ...order, captureMethod: 'AUTOMATIC' }),
+    ).toBe(fingerprintPaymentRequest(order));
+    expect(fingerprintPaymentRequest(order)).toBe(
+      createHash('sha256')
+        .update(
+          JSON.stringify(['payments.create.v1', 500000, 'NGN', 'order_1']),
+        )
+        .digest('hex'),
+    );
+  });
+
+  it('distinguishes a manual-capture request from the same automatic one', () => {
+    expect(
+      fingerprintPaymentRequest({ ...order, captureMethod: 'MANUAL' }),
+    ).not.toBe(fingerprintPaymentRequest(order));
+  });
+
+  it('distinguishes captures, partial captures and voids', () => {
+    const paymentId = '01a16b6d-bf6d-765f-98fb-39c95d75fe23';
+    const fingerprints = [
+      fingerprintPaymentActionRequest(paymentId, 'CAPTURE'),
+      fingerprintPaymentActionRequest(paymentId, 'CAPTURE', 100),
+      fingerprintPaymentActionRequest(paymentId, 'VOID'),
+    ];
+    expect(new Set(fingerprints).size).toBe(3);
+  });
+});
 
 describe('fingerprintRefundRequest', () => {
   const paymentId = '01a16b6d-bf6d-765f-98fb-39c95d75fe23';

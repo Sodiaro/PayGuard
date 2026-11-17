@@ -47,13 +47,15 @@ export function simulatedWebhookEvent(
   };
 }
 
-// UNAVAILABLE means nothing was processed, so the provider has nothing to notify.
+// UNAVAILABLE means nothing was processed, so the provider has nothing to notify. A success of a
+// manual-capture attempt is an authorization.
 export function webhookTypeForOutcome(
   outcome: SimulatorOutcome,
+  capture = true,
 ): ProviderWebhookEventType | null {
   switch (outcome) {
     case SimulatorOutcome.Succeeded:
-      return 'payment.succeeded';
+      return capture ? 'payment.succeeded' : 'payment.authorized';
     case SimulatorOutcome.Declined:
       return 'payment.declined';
     case SimulatorOutcome.Unavailable:

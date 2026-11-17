@@ -20,6 +20,7 @@ import {
 
 export const PROVIDER_WEBHOOK_EVENT_TYPES = [
   'payment.succeeded',
+  'payment.authorized',
   'payment.declined',
   'payment.processing',
 ] as const;

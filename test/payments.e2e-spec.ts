@@ -78,9 +78,12 @@ describe('Payments API (PostgreSQL)', () => {
         amount: 500000,
         currency: 'NGN',
         status: 'PENDING',
+        captureMethod: 'AUTOMATIC',
         reference: 'order_10042',
         failureCode: null,
+        amountCaptured: null,
         amountRefunded: 0,
+        actions: [],
         attempts: [
           {
             id: expect.any(String),
@@ -132,6 +135,7 @@ describe('Payments API (PostgreSQL)', () => {
           merchantId: acme.merchantId,
           amount: 500000,
           currency: 'NGN',
+          capture: true,
         },
       ]);
       await expect(jobsOf(prisma)).resolves.toEqual([

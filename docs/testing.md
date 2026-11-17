@@ -35,6 +35,9 @@ No database. They cover:
   submissions), and controller status-code mapping.
 - Refunds: transitions, provider-result mapping, contradiction checks, the refundable amount and
   every eligibility refusal, and diagnosis of an unresolved refund from its own jobs.
+- Manual capture: the payment transitions through `AUTHORIZED`, authorizations versus charges for
+  each capture method, capture and void eligibility, and fingerprints that keep automatic capture
+  on its original form.
 - Merchant webhooks: secret generation and encryption (tampering, another merchant, another key),
   the target policy for every non-public range and URL form, the delivery client against a local
   server (status mapping, timeouts, refused connections, no redirects, blocked addresses and host
@@ -72,6 +75,13 @@ Against **real PostgreSQL**, with the deployed database privileges:
   flagged for an operator and resolved after a requeue, the stale sweep, pruning that keeps a
   pending refund's jobs, history and CLI output, and the database trigger and constraints that
   enforce the limit and tie refund jobs to their refund.
+- Manual capture: authorization instead of a charge (and via a provider `payment.authorized`
+  webhook, with `payment.succeeded` distrusted), automatic capture unchanged and replaying as
+  before, retry of a declined authorization; full and partial captures with refunds limited to the
+  captured amount; voids; every refusal; a declined capture leaving the payment authorized;
+  replays and `409`s; a capture and a void racing with exactly one accepted; cross-merchant
+  `404`s; lost answers resolved by lookup and resubmission only on "not found"; history, merchant
+  events and CLI output; and the trigger and indexes that bound actions.
 - Merchant webhooks, against a receiver on 127.0.0.1: endpoint creation with a secret shown once
   and stored encrypted, updates, URL validation, rotation with both secrets signing during the
   overlap and only the new one after it, merchant isolation; events recorded without delivery when

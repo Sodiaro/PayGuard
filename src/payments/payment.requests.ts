@@ -11,7 +11,7 @@ import {
   Min,
   ValidateBy,
 } from 'class-validator';
-import { PaymentStatus } from '../generated/prisma/enums.js';
+import { CaptureMethod, PaymentStatus } from '../generated/prisma/enums.js';
 import {
   MAX_PAYMENT_AMOUNT,
   SUPPORTED_CURRENCY_CODES,
@@ -57,6 +57,18 @@ export class CreatePaymentRequest {
   @IsString()
   @Matches(REFERENCE_FORMAT, { message: REFERENCE_MESSAGE })
   reference?: string;
+
+  @ApiPropertyOptional({
+    enum: CaptureMethod,
+    default: CaptureMethod.AUTOMATIC,
+    description:
+      'MANUAL only authorizes the payment; capture or void it later with /capture or /void.',
+  })
+  @IsOptional()
+  @IsIn(Object.values(CaptureMethod), {
+    message: `captureMethod must be one of: ${Object.values(CaptureMethod).join(', ')}`,
+  })
+  captureMethod?: CaptureMethod;
 }
 
 // The cursor format is shared by every keyset listing on (createdAt, id).

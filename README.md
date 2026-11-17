@@ -31,6 +31,10 @@ moves; see [Limitations](#limitations).
   provider is called. A timeout or unrecognised answer leaves it `PENDING` and schedules a lookup;
   the attempt is resubmitted only if the provider reports no record of it, and then under the same
   attempt ID, which is the provider-side idempotency key.
+- **Authorize now, capture later.** A payment can be created with manual capture: it is only
+  authorized, then captured (fully or in part) or voided once, through the same outbox and
+  lookups. A database trigger and partial unique indexes allow one capture or void in flight and
+  one success per authorization, so a capture and a void can never both happen.
 - **Refunds that cannot exceed the charge.** Full and partial refunds of a succeeded payment go
   through the same outbox, submission marker and lookups as payments. Pending and succeeded
   refunds together are kept within the payment's amount by a row lock in the API and, independently,
@@ -134,6 +138,9 @@ returns `409`. A failed payment can be retried with `POST /v1/payments/{id}/retr
 attempt under its own idempotency key. `GET /v1/payments` lists a merchant's payments, newest
 first, filtered by status, reference or creation time and paginated by cursor.
 
+With `"captureMethod": "MANUAL"` the payment stops at `AUTHORIZED`; `POST /v1/payments/{id}/capture`
+(optionally with a smaller `amount`) charges it, and `POST /v1/payments/{id}/void` releases it.
+
 A succeeded payment can be refunded in full or in part with `POST /v1/payments/{id}/refunds`
 (body `{"amount": 150000}`, or empty for everything still refundable), again with an
 `Idempotency-Key`. The refund is processed asynchronously like a payment; its outcome is on
@@ -174,8 +181,9 @@ any real provider behaves. Details: [docs/testing.md](docs/testing.md).
 
 ## Limitations
 
-- **Simulated payments only.** There is no real provider integration, card handling, capture or
-  payout, refunds go to the simulator too, and no money moves. The simulator is refused when `NODE_ENV=production`, so
+- **Simulated payments only.** There is no real provider integration, card handling or payout;
+  refunds, captures and voids go to the simulator too, and no money moves. Authorizations never
+  expire in the simulator. The simulator is refused when `NODE_ENV=production`, so
   the API and worker cannot run in production until a real provider is implemented.
 - **At most one charge per attempt depends on the provider** deduplicating by attempt ID and
   answering lookups consistently. The simulator does by construction; a real provider would have

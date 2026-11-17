@@ -4,6 +4,7 @@ import { isUniqueViolation } from '../database/prisma-errors.js';
 import { PrismaService } from '../database/prisma.service.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import {
+  CaptureMethod,
   OutboxJobType,
   PaymentAttemptStatus,
   PaymentEventSource,
@@ -87,13 +88,14 @@ export class PaymentsService {
             amount: BigInt(request.amount),
             currency: request.currency,
             reference: request.reference ?? null,
+            captureMethod: request.captureMethod ?? CaptureMethod.AUTOMATIC,
             idempotencyKey,
             requestFingerprint,
             attempts: {
               create: { attemptNumber: 1, provider: this.provider.id },
             },
           },
-          include: PAYMENT_VIEW_INCLUDE,
+          include: { attempts: true },
         });
         await this.outbox.enqueue(tx, {
           type: OutboxJobType.PROCESS_ATTEMPT,
@@ -108,7 +110,7 @@ export class PaymentsService {
           source: PaymentEventSource.MERCHANT,
           paymentStatusAfter: PaymentStatus.PENDING,
           attemptStatusAfter: PaymentAttemptStatus.PENDING,
-          details: { attemptNumber: 1 },
+          details: { attemptNumber: 1, captureMethod: payment.captureMethod },
         });
         return payment.id;
       });
@@ -157,7 +159,7 @@ export class PaymentsService {
 
         const payment = await tx.payment.findUniqueOrThrow({
           where: { id: paymentId },
-          include: PAYMENT_VIEW_INCLUDE,
+          include: { attempts: { orderBy: { attemptNumber: 'asc' } } },
         });
         const eligibility = retryEligibility(payment, payment.attempts);
         if (!eligibility.eligible) {
@@ -285,11 +287,18 @@ export class PaymentsService {
     attemptId: string,
     result: ProviderPaymentResult,
   ): Promise<boolean> {
-    return this.prisma.$transaction((tx) =>
-      applyAttemptResolution(tx, attemptId, resolveAttempt(result), {
-        source: PaymentEventSource.PROVIDER_RESPONSE,
-      }),
-    );
+    return this.prisma.$transaction(async (tx) => {
+      const { payment } = await tx.paymentAttempt.findUniqueOrThrow({
+        where: { id: attemptId },
+        select: { payment: { select: { captureMethod: true } } },
+      });
+      return applyAttemptResolution(
+        tx,
+        attemptId,
+        resolveAttempt(result, payment.captureMethod),
+        { source: PaymentEventSource.PROVIDER_RESPONSE },
+      );
+    });
   }
 
   private async requireForMerchant(

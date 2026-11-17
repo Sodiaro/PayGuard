@@ -1,5 +1,6 @@
 import { describe, expect, it } from '@jest/globals';
 import {
+  CaptureMethod,
   PaymentAttemptStatus,
   PaymentFailureCode,
   PaymentStatus,
@@ -29,9 +30,23 @@ const attempt = (
   failureCode: null,
   providerReference: null,
   submittedAt: new Date(),
-  payment: { amount: 500000n, currency: 'NGN' },
+  payment: {
+    amount: 500000n,
+    currency: 'NGN',
+    captureMethod: CaptureMethod.AUTOMATIC,
+  },
   ...overrides,
 });
+
+const manual = (overrides: Partial<WebhookTargetAttempt> = {}) =>
+  attempt({
+    payment: {
+      amount: 500000n,
+      currency: 'NGN',
+      captureMethod: CaptureMethod.MANUAL,
+    },
+    ...overrides,
+  });
 
 const succeeded = attempt({
   status: PaymentAttemptStatus.SUCCEEDED,
@@ -54,6 +69,48 @@ const record = (result: ProviderWebhookEventResult, reconcile = false) => ({
 });
 
 describe('decideWebhookEvent', () => {
+  it('applies an authorization to a pending manual-capture attempt', () => {
+    expect(
+      decideWebhookEvent(event({ eventType: 'payment.authorized' }), manual()),
+    ).toEqual({
+      action: 'apply',
+      resolution: {
+        attemptStatus: PaymentAttemptStatus.SUCCEEDED,
+        paymentStatus: PaymentStatus.AUTHORIZED,
+        providerReference: 'sim_reference',
+        failureCode: null,
+      },
+    });
+  });
+
+  it.each([
+    ['a charge for a manual-capture attempt', 'payment.succeeded', manual()],
+    [
+      'an authorization for an automatic attempt',
+      'payment.authorized',
+      attempt(),
+    ],
+  ])(
+    'distrusts %s and asks the provider instead',
+    (_case, eventType, target) => {
+      expect(decideWebhookEvent(event({ eventType }), target)).toEqual(
+        record(ProviderWebhookEventResult.DATA_MISMATCH, true),
+      );
+    },
+  );
+
+  it('recognises a repeated authorization as already applied', () => {
+    expect(
+      decideWebhookEvent(
+        event({ eventType: 'payment.authorized' }),
+        manual({
+          status: PaymentAttemptStatus.SUCCEEDED,
+          providerReference: 'sim_reference',
+        }),
+      ),
+    ).toEqual(record(ProviderWebhookEventResult.ALREADY_APPLIED));
+  });
+
   it('applies a terminal event to a pending attempt through the lifecycle resolution', () => {
     expect(decideWebhookEvent(event(), attempt())).toEqual({
       action: 'apply',

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { DatabaseModule } from '../../database/database.module.js';
 import { OutboxModule } from '../../outbox/outbox.module.js';
+import { PaymentActionJobProcessor } from '../../captures/payment-action-job-processor.js';
 import { MerchantEventDeliveryProcessor } from '../../merchant-webhooks/merchant-event-delivery-processor.js';
 import { RefundJobProcessor } from '../../refunds/refund-job-processor.js';
 import { ProviderWebhookProcessor } from '../../webhooks/provider-webhook-processor.js';
@@ -17,6 +18,7 @@ import { OutboxWorker } from './outbox-worker.js';
     ProviderWebhookProcessor,
     RefundJobProcessor,
     MerchantEventDeliveryProcessor,
+    PaymentActionJobProcessor,
     OutboxWorker,
   ],
   exports: [OutboxWorker],

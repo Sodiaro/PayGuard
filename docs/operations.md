@@ -57,16 +57,18 @@ request. `merchant:suspend` blocks all of a merchant's keys at once while you in
 # failure code, oldest unresolved attempt, lookup runs, retries, settle-time p50/p95 over the last
 # hour, the last error category of unfinished jobs, attempts awaiting an operator, contradicting
 # provider answers, refunds by status and failure code with the unresolved ones and those awaiting
-# an operator, merchant events by delivery status, webhook events by status and result with
+# an operator, authorized payments awaiting capture, captures and voids by type and status with
+# the unresolved ones and those awaiting an operator, merchant events by delivery status, webhook events by status and result with
 # duplicate and conflicting deliveries, every known worker (active, silent or stopped), and the
 # dead jobs.
 npm run admin -- ops:status
 
-# Every unresolved attempt and refund, oldest first, with why it is not progressing (see below).
+# Every unresolved attempt, capture or void, and refund, oldest first, with why it is not
+# progressing (see below).
 npm run admin -- payments:unresolved [--merchant acme] [--limit 50]
 
-# One payment: attempts, refunds, merchant events and their delivery, their jobs, webhook
-# events, full history and a verdict.
+# One payment: attempts, captures and voids, refunds, merchant events and their delivery, their
+# jobs, webhook events, full history and a verdict.
 npm run admin -- payment:inspect --payment <payment-id>
 
 # Put a DEAD job back in the queue with a fresh run budget (after fixing the cause). Audited.
@@ -86,6 +88,10 @@ provider calls. Provider error messages and payloads are never logged or stored.
   against the payment's refundable amount. Confirm it with the provider by refund ID, then requeue
   the job. A dead `PROCESS_REFUND` job is handled like a dead `PROCESS_ATTEMPT` job; the stale
   sweep queues a lookup for its refund.
+- **A dead `RECONCILE_PAYMENT_ACTION` job** means a capture or void has no definite outcome; the
+  payment stays `AUTHORIZED` and no other capture or void can start. Confirm it with the provider
+  by action ID, then requeue the job. A dead `PROCESS_PAYMENT_ACTION` job is handled like a dead
+  `PROCESS_ATTEMPT` job.
 - **Merchant webhook deliveries that fail** are the merchant's to fix: after its retries the event
   is `FAILED` and its job `COMPLETED`, never `DEAD`, and the merchant redelivers it with
   `POST /v1/events/:id/redeliver`. `payment:inspect` shows each event's delivery status, attempts,
@@ -136,6 +142,11 @@ for operators only: the merchant API does not expose it.
 | `refund.outcome_unknown`   | `WORKER`                                                     | No definite answer (or redelivered after submission); lookup scheduled                                         |
 | `refund.resolved`          | `PROVIDER_RESPONSE` or `PROVIDER_LOOKUP`                     | The refund's outcome, with its before/after statuses, provider reference and failure code in details           |
 | `refund.result_conflict`   | `PROVIDER_RESPONSE` or `PROVIDER_LOOKUP`                     | A definite answer contradicting the recorded refund outcome: both, nothing changed                             |
+| `action.created`           | `MERCHANT`                                                   | A capture or void created `PENDING` against the authorization (type in details)                                |
+| `action.submitted`         | `WORKER`                                                     | The action marked as possibly sent, just before the provider call                                              |
+| `action.outcome_unknown`   | `WORKER`                                                     | No definite answer (or redelivered after submission); lookup scheduled                                         |
+| `action.resolved`          | `PROVIDER_RESPONSE` or `PROVIDER_LOOKUP`                     | The action's outcome; when it succeeded, also `AUTHORIZED` → `SUCCEEDED` or `CANCELED`                         |
+| `action.result_conflict`   | `PROVIDER_RESPONSE` or `PROVIDER_LOOKUP`                     | A definite answer contradicting the recorded action outcome: both, nothing changed                             |
 
 Refund events, and the deferred, scheduled, dead and requeued events of refund jobs, carry the
 refund's ID and, as their attempt, the charge being refunded. Refunds never change the payment's
@@ -148,8 +159,8 @@ constraint allows an actor only on `OPERATOR` events and requires one there, so 
 and human actions cannot be confused. Operator actions are still recorded in
 `operator_audit_events` as well; `payment_events` places them in the payment's timeline.
 
-`payments:unresolved` lists `PENDING` attempts, then `PENDING` refunds, each with a state derived
-from its own jobs:
+`payments:unresolved` lists `PENDING` attempts, then `PENDING` captures and voids, then `PENDING`
+refunds, each with a state derived from its own jobs:
 
 | State                      | Meaning                                                                  | Operator action                       |
 | -------------------------- | ------------------------------------------------------------------------ | ------------------------------------- |
@@ -229,6 +240,10 @@ short-window increases rather than on lifetime totals.
 | `payguard_refunds_awaiting_operator`                      |                            | Unresolved refunds whose lookups are exhausted                       |
 | `payguard_refund_result_conflicts`                        |                            | Provider answers that contradicted a recorded refund outcome         |
 | `payguard_merchant_events`                                | `status`                   | Merchant events by delivery status (`none`: no endpoint enabled)     |
+| `payguard_payments_authorized`                            |                            | Manual-capture payments awaiting capture or void                     |
+| `payguard_payment_actions`                                | `type`, `status`           | Captures and voids by type and status                                |
+| `payguard_payment_actions_unresolved`                     |                            | Captures and voids still `PENDING`                                   |
+| `payguard_payment_actions_awaiting_operator`              |                            | Unresolved captures and voids whose lookups are exhausted            |
 | `payguard_payment_attempt_settle_seconds`                 | `quantile` (`0.5`, `0.95`) | Creation-to-outcome time of attempts settled in the last hour        |
 | `payguard_workers_active`                                 |                            | Workers with a heartbeat in the last 30 s                            |
 | `payguard_worker_last_heartbeat_age_seconds`              |                            | Newest heartbeat age (`-1`: no worker has ever reported)             |
@@ -261,6 +276,7 @@ to observed traffic.
 | `payguard_webhook_events{status="RECEIVED"}`                                                    | > 0 for 10 minutes   | Stored events are not being processed                                  |
 | `payguard_payment_attempts_awaiting_operator > 0`                                               | immediately          | Outcomes nothing automatic will establish; see `payments:unresolved`   |
 | `payguard_refunds_awaiting_operator > 0`                                                        | immediately          | The same for refunds                                                   |
+| `payguard_payment_actions_awaiting_operator > 0`                                                | immediately          | The same for captures and voids                                        |
 | Increase in `payguard_refund_result_conflicts`                                                  | > 0                  | The provider contradicted a recorded refund; investigate the payment   |
 | Increase in `payguard_payment_attempt_result_conflicts`                                         | > 0                  | The provider contradicted itself or a webhook; investigate the payment |
 
@@ -293,16 +309,16 @@ npm run admin -- audit:list [--limit 50]   # newest first, default 20, at most 2
 
 Nothing is deleted automatically. The defaults keep everything:
 
-| Data                                                                    | Retention                                                                                                                                                    |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Payments, attempts, refunds, merchant events, idempotency keys, retries | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment.                                     |
-| Audit events                                                            | Indefinitely, and the table rejects deletes                                                                                                                  |
-| Payment history (`payment_events`)                                      | Indefinitely, and the table rejects deletes. Grows by a few rows per attempt, plus one per inconclusive lookup (bounded by `OUTBOX_MAX_RUNS` per run budget) |
-| Provider webhook events                                                 | Indefinitely: deduplication depends on them, so deleting one would let a replayed delivery be accepted again                                                 |
-| Merchants and API keys                                                  | Indefinitely; merchants are suspended and keys revoked, never deleted                                                                                        |
-| `COMPLETED` outbox jobs of attempts with a final outcome                | Prunable on demand                                                                                                                                           |
-| Worker heartbeat rows                                                   | Prunable on demand                                                                                                                                           |
-| `DEAD` jobs and jobs of `PENDING` attempts                              | Never pruned: they are the evidence for unresolved work                                                                                                      |
+| Data                                                                                        | Retention                                                                                                                                                    |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Payments, attempts, captures and voids, refunds, merchant events, idempotency keys, retries | Indefinitely. They are the financial record, and deleting an idempotency key would let a replay create a second payment.                                     |
+| Audit events                                                                                | Indefinitely, and the table rejects deletes                                                                                                                  |
+| Payment history (`payment_events`)                                                          | Indefinitely, and the table rejects deletes. Grows by a few rows per attempt, plus one per inconclusive lookup (bounded by `OUTBOX_MAX_RUNS` per run budget) |
+| Provider webhook events                                                                     | Indefinitely: deduplication depends on them, so deleting one would let a replayed delivery be accepted again                                                 |
+| Merchants and API keys                                                                      | Indefinitely; merchants are suspended and keys revoked, never deleted                                                                                        |
+| `COMPLETED` outbox jobs of attempts with a final outcome                                    | Prunable on demand                                                                                                                                           |
+| Worker heartbeat rows                                                                       | Prunable on demand                                                                                                                                           |
+| `DEAD` jobs and jobs of `PENDING` attempts                                                  | Never pruned: they are the evidence for unresolved work                                                                                                      |
 
 ```bash
 npm run admin -- maintenance:prune --completed-jobs-days 30 [--workers-days 30] [--batch-size 1000]

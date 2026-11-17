@@ -5,6 +5,7 @@ import {
   type CoreEnvironment,
 } from '../config/environment.js';
 import { PrismaService } from '../database/prisma.service.js';
+import { CaptureMethod } from '../generated/prisma/enums.js';
 import {
   SIMULATOR_SIGNATURE_HEADER,
   signSimulatedWebhook,
@@ -57,7 +58,6 @@ export class SimulatedWebhookSender {
     if (!secret) {
       throw new SimulatorWebhookError('SIMULATOR_WEBHOOK_SECRET is not set');
     }
-    const type = this.eventType(input.type);
     const url = webhookUrl(input.baseUrl);
     if (!UUID_FORMAT.test(input.attemptId)) {
       throw new SimulatorWebhookError('--attempt must be an attempt ID');
@@ -68,7 +68,9 @@ export class SimulatedWebhookSender {
       select: {
         id: true,
         createdAt: true,
-        payment: { select: { amount: true, currency: true } },
+        payment: {
+          select: { amount: true, currency: true, captureMethod: true },
+        },
       },
     });
     if (!attempt) {
@@ -76,6 +78,10 @@ export class SimulatedWebhookSender {
         `No simulator attempt with id ${input.attemptId}`,
       );
     }
+    const type = this.eventType(
+      input.type,
+      attempt.payment.captureMethod === CaptureMethod.AUTOMATIC,
+    );
 
     // The event's creation time is the attempt's, fixed from the start, so sending again (before
     // or after the worker submits it) redelivers the same event, a duplicate, as a provider retry
@@ -125,7 +131,10 @@ export class SimulatedWebhookSender {
     };
   }
 
-  private eventType(requested: string | undefined): ProviderWebhookEventType {
+  private eventType(
+    requested: string | undefined,
+    capture: boolean,
+  ): ProviderWebhookEventType {
     if (requested !== undefined) {
       if (
         !(PROVIDER_WEBHOOK_EVENT_TYPES as readonly string[]).includes(requested)
@@ -138,6 +147,7 @@ export class SimulatedWebhookSender {
     }
     const type = webhookTypeForOutcome(
       this.config.get('PAYMENT_SIMULATOR_OUTCOME', { infer: true }),
+      capture,
     );
     if (!type) {
       throw new SimulatorWebhookError(

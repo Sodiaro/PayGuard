@@ -1,5 +1,9 @@
 import { ApiProperty } from '@nestjs/swagger';
 import {
+  CaptureMethod,
+  PaymentActionFailureCode,
+  PaymentActionStatus,
+  PaymentActionType,
   PaymentAttemptStatus,
   PaymentFailureCode,
   PaymentStatus,
@@ -39,6 +43,40 @@ export class PaymentAttemptResponse {
   completedAt: Date | null;
 }
 
+export class PaymentActionResponse {
+  @ApiProperty({ format: 'uuid' })
+  id: string;
+
+  @ApiProperty({ enum: PaymentActionType })
+  type: PaymentActionType;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 400000,
+    description: 'Captures only: the amount captured',
+  })
+  amount: number | null;
+
+  @ApiProperty({
+    enum: PaymentActionStatus,
+    description: 'PENDING means the outcome is not known yet.',
+  })
+  status: PaymentActionStatus;
+
+  @ApiProperty({ type: String, nullable: true })
+  providerReference: string | null;
+
+  @ApiProperty({ enum: PaymentActionFailureCode, nullable: true })
+  failureCode: PaymentActionFailureCode | null;
+
+  @ApiProperty()
+  createdAt: Date;
+
+  @ApiProperty({ type: Date, nullable: true })
+  completedAt: Date | null;
+}
+
 export class PaymentResponse {
   @ApiProperty({ format: 'uuid' })
   id: string;
@@ -49,8 +87,15 @@ export class PaymentResponse {
   @ApiProperty({ enum: SUPPORTED_CURRENCY_CODES, example: 'NGN' })
   currency: string;
 
-  @ApiProperty({ enum: PaymentStatus })
+  @ApiProperty({
+    enum: PaymentStatus,
+    description:
+      'AUTHORIZED and CANCELED occur only with manual capture: authorized and awaiting capture, or voided.',
+  })
   status: PaymentStatus;
+
+  @ApiProperty({ enum: CaptureMethod })
+  captureMethod: CaptureMethod;
 
   @ApiProperty({ type: String, nullable: true, example: 'order_10042' })
   reference: string | null;
@@ -63,6 +108,15 @@ export class PaymentResponse {
   failureCode: PaymentFailureCode | null;
 
   @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 500000,
+    description:
+      'Minor units charged once the payment SUCCEEDED: the amount, or with manual capture the captured amount',
+  })
+  amountCaptured: number | null;
+
+  @ApiProperty({
     example: 0,
     description:
       'Minor units returned by succeeded refunds; pending refunds are not included',
@@ -71,6 +125,12 @@ export class PaymentResponse {
 
   @ApiProperty({ type: [PaymentAttemptResponse] })
   attempts: PaymentAttemptResponse[];
+
+  @ApiProperty({
+    type: [PaymentActionResponse],
+    description: 'Captures and voids of a manual-capture payment, oldest first',
+  })
+  actions: PaymentActionResponse[];
 
   @ApiProperty()
   createdAt: Date;

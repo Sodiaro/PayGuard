@@ -139,6 +139,29 @@ export function renderPrometheusMetrics(
     single(stats.refundResultConflicts),
   );
   gauge(
+    'payguard_payments_authorized',
+    'Manual-capture payments authorized and awaiting capture or void.',
+    single(stats.authorizedPayments),
+  );
+  gauge(
+    'payguard_payment_actions',
+    'Captures and voids by type and status.',
+    stats.paymentActions.map((row) => ({
+      labels: { type: row.type, status: row.status },
+      value: row.count,
+    })),
+  );
+  gauge(
+    'payguard_payment_actions_unresolved',
+    'Captures and voids without a final outcome.',
+    single(stats.unresolvedPaymentActions),
+  );
+  gauge(
+    'payguard_payment_actions_awaiting_operator',
+    'Unresolved captures and voids whose reconciliation lookups are exhausted.',
+    single(stats.paymentActionsAwaitingOperator),
+  );
+  gauge(
     'payguard_merchant_events',
     'Merchant events by delivery status (none: no endpoint was enabled).',
     stats.merchantEventDeliveries.map((row) => ({

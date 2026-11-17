@@ -41,6 +41,8 @@ src/
 │                           # payment history writer, read-only investigation queries
 │   ├── processing/         # Outbox worker, process/reconcile job handlers, in-process starter
 │   └── providers/          # PaymentProvider port, the simulated provider and its webhooks
+├── captures/               # /v1/payments/:id/capture and /void, payment action lifecycle, and the
+│                           # capture/void job processor the worker runs
 ├── refunds/                # /v1/payments/:id/refunds and /v1/refunds, refund lifecycle, and the
 │                           # refund job processor the worker runs
 ├── merchant-webhooks/      # /v1/webhook-endpoint and /v1/events, event recording, secret
@@ -83,9 +85,12 @@ provider. Payments and attempts are separate tables, so a payment can gain more 
 ```
 Payment:  PENDING ──► SUCCEEDED (terminal)
              │
-             └──────► FAILED ──► PENDING   (only through an explicit retry, which adds an attempt)
+             ├──────► FAILED ──► PENDING   (only through an explicit retry, which adds an attempt)
+             │
+             └──────► AUTHORIZED ──► SUCCEEDED (capture)   manual capture only
+                                └──► CANCELED  (void, terminal)
 
-Attempt:  PENDING ──► SUCCEEDED (terminal)
+Attempt:  PENDING ──► SUCCEEDED (terminal; for manual capture, the authorization)
              └──────► FAILED    (terminal)
 ```
 
@@ -97,7 +102,8 @@ Attempt:  PENDING ──► SUCCEEDED (terminal)
 - The transition tables in `src/payments/payment-lifecycle.ts` are the only definition of allowed
   changes. Every status write is a conditional `UPDATE ... WHERE status IN (allowed sources)`
   derived from them, inside one transaction for the attempt and its payment, so a late or
-  duplicate provider result cannot overwrite a terminal state.
+  duplicate provider result cannot overwrite a terminal state. An attempt's outcome only ever
+  moves a payment out of `PENDING`; `AUTHORIZED` is left only by a capture or a void.
 - **Retry eligibility** (`retryEligibility()`): a `FAILED` payment with no attempt in flight,
   whose latest failure is retryable (both codes are; a decline may be resolved by the customer),
   and with fewer than 3 attempts (`MAX_ATTEMPTS_PER_PAYMENT`). Otherwise the retry is refused with
@@ -202,6 +208,42 @@ failure:
 Together these give at-most-one charge per attempt only if the provider honours its idempotency
 key and answers lookups consistently once a submission's timeout has passed. The simulator
 behaves that way; a real provider must be verified to.
+
+## Manual capture
+
+A payment created with `captureMethod: MANUAL` is submitted with `capture: false`: the provider
+answers `authorized`, the attempt `SUCCEEDED` and the payment becomes `AUTHORIZED`. A **payment
+action** (`payment_actions`) then captures or voids the authorization.
+
+```
+POST /:id/capture | /:id/void ──► one transaction: lock payment, check eligibility,
+                                   action (PENDING) + PROCESS_PAYMENT_ACTION job ──► 202
+worker ──► marks action submitted ──► provider.capturePayment / voidPayment(actionId, authorization)
+       ──► succeeded: action SUCCEEDED + payment AUTHORIZED ──► SUCCEEDED | CANCELED, one transaction
+       ──► declined / unavailable: action FAILED, payment stays AUTHORIZED
+       ──► no answer: RECONCILE_PAYMENT_ACTION (delayed) ──► provider.lookupPaymentAction(actionId)
+```
+
+- **Same discipline as attempts and refunds:** the same outbox, submission marker, lookups,
+  resubmission only on "not found" (under the same action ID), contradiction records
+  (`action.result_conflict`), stale sweep, dead-lettering and requeue.
+- **One at a time, once.** The partial unique indexes `payment_actions_one_pending_per_payment` and
+  `payment_actions_one_succeeded_per_payment` allow one action in flight and one success per
+  payment, so a capture and a void can never race at the provider. The
+  `payment_actions_match_authorization` trigger locks the payment row and refuses an action unless
+  the payment is a manual-capture payment that is `AUTHORIZED` now, the action targets its
+  succeeded attempt and its merchant, and a capture does not exceed the authorized amount.
+- **Captured amount.** `amountCaptured` is the payment's amount with automatic capture and the
+  succeeded capture's amount with manual capture. Refunds are limited by it, in the API and in the
+  `refunds_within_payment_amount` trigger.
+- **The capture method must match the answer.** A provider `succeeded` for a manual payment, or
+  `authorized` for an automatic one, is not an outcome PayGuard asked for: it is treated as no
+  definite answer (looked up again) and, from a webhook, recorded as `DATA_MISMATCH`.
+- **Fingerprints stay compatible.** Automatic capture, explicit or by default, keeps the
+  `payments.create.v1` canonical form, so keys used before manual capture existed still replay;
+  manual capture uses `v2`.
+- **Not modelled:** authorization expiry. A real provider's authorizations lapse after some days;
+  the simulator's never do, and nothing voids an old authorization automatically.
 
 ## Refunds
 
@@ -416,12 +458,12 @@ type lookup prefix    secret: 32 random bytes, base64url
 Each process connects with only the privileges it needs. None of these roles is a superuser, can
 create roles or databases, replicate, or bypass row security:
 
-| Role                           | Kind                         | Used by                            | Can                                                                                                                                            |
-| ------------------------------ | ---------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                                                |
-| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, refunds, endpoints, jobs, events; update only the columns its state changes touch |
-| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                                      |
-| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                                               |
+| Role                           | Kind                         | Used by                            | Can                                                                                                                                                                |
+| ------------------------------ | ---------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `payguard_owner`               | login                        | `npm run db:migrate:*`, `migrate`  | Own the schema and change it. Nothing else should connect as it                                                                                                    |
+| `payguard_runtime`             | group                        | API and worker, via `payguard_app` | Read what the application serves; insert payments, attempts, captures and voids, refunds, endpoints, jobs, events; update only the columns its state changes touch |
+| `payguard_operator`            | group                        | CLI, via `payguard_cli`            | Provision merchants and keys, inspect everything, requeue and prune jobs, append audit and history events                                                          |
+| `payguard_app`, `payguard_cli` | login, members of the groups | the processes above                | Nothing directly                                                                                                                                                   |
 
 What the roles cannot do is the point:
 
@@ -432,7 +474,8 @@ What the roles cannot do is the point:
   `session_replication_role`, create tables, or grant itself anything.
 - **The runtime role is narrow.** It cannot delete any row or change amounts, ownership, keys or
   merchant status.
-- **The operator role is narrow too.** It cannot change payments, attempts or refunds.
+- **The operator role is narrow too.** It cannot change payments, attempts, captures, voids or
+  refunds.
 
 Privileges are granted by migrations (`20261026120000_runtime_and_operator_privileges`, and each
 later migration for the tables it adds), so they
@@ -477,7 +520,10 @@ the history to write-once storage if tamper evidence is required.
 ## Limitations
 
 - **Simulated payments only, so no production deployment.** There is no real provider integration,
-  card handling, capture or payout; refunds go to the simulator too. The simulator is refused under `NODE_ENV=production`,
+  card handling or payout; refunds, captures and voids go to the simulator too.
+- **Manual capture is single and unbounded in time.** One capture per authorization (partial
+  captures release the rest), no incremental authorization, and no authorization expiry or
+  automatic void of stale authorizations. The simulator is refused under `NODE_ENV=production`,
   so the API and worker cannot run in production until a real provider is added. A real
   `PaymentProvider` would need at least:
   - an idempotency key per submission (the attempt ID) that the provider honours across retries;

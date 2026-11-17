@@ -31,6 +31,7 @@ model Merchant {
   refunds         Refund[]
   webhookEndpoint MerchantWebhookEndpoint?
   events          MerchantEvent[]
+  paymentActions  PaymentAction[]
 
   @@map("merchants")
 }
@@ -55,13 +56,25 @@ model MerchantApiKey {
   @@map("merchant_api_keys")
 }
 
-// Allowed transitions live in src/payments/payment-lifecycle.ts.
+// Allowed transitions live in src/payments/payment-lifecycle.ts. AUTHORIZED and CANCELED occur
+// only with manual capture.
 enum PaymentStatus {
   PENDING
   SUCCEEDED
   FAILED
+  AUTHORIZED
+  CANCELED
 
   @@map("payment_status")
+}
+
+// AUTOMATIC: the provider charges on submission. MANUAL: it only authorizes (holds the funds), and
+// the merchant captures or voids the authorization later.
+enum CaptureMethod {
+  AUTOMATIC
+  MANUAL
+
+  @@map("capture_method")
 }
 
 enum PaymentAttemptStatus {
@@ -80,14 +93,15 @@ enum PaymentFailureCode {
 }
 
 model Payment {
-  id         String        @id @default(uuid(7)) @db.Uuid
-  merchantId String        @map("merchant_id") @db.Uuid
+  id            String        @id @default(uuid(7)) @db.Uuid
+  merchantId    String        @map("merchant_id") @db.Uuid
   // Smallest currency unit (kobo, cents, yen...); BIGINT because INT caps at ~21M major units.
-  amount     BigInt
-  currency   String        @db.Char(3)
-  status     PaymentStatus @default(PENDING)
+  amount        BigInt
+  currency      String        @db.Char(3)
+  status        PaymentStatus @default(PENDING)
+  captureMethod CaptureMethod @default(AUTOMATIC) @map("capture_method")
   // Merchant's own reference (e.g. an order ID). Informational only: not unique, not used for idempotency.
-  reference  String?       @db.VarChar(64)
+  reference     String?       @db.VarChar(64)
 
   idempotencyKey     String @map("idempotency_key") @db.VarChar(255)
   // SHA-256 hex of the canonical request; see src/payments/idempotency.ts.
@@ -100,6 +114,7 @@ model Payment {
   attempts       PaymentAttempt[]
   retryRequests  PaymentRetryRequest[]
   refunds        Refund[]
+  actions        PaymentAction[]
   outboxJobs     OutboxJob[]
   events         PaymentEvent[]
   merchantEvents MerchantEvent[]
@@ -129,12 +144,72 @@ model PaymentAttempt {
   payment        Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   retryRequest   PaymentRetryRequest?
   refunds        Refund[]
+  actions        PaymentAction[]
   outboxJobs     OutboxJob[]
   events         PaymentEvent[]
   merchantEvents MerchantEvent[]
 
   @@unique([paymentId, attemptNumber])
   @@map("payment_attempts")
+}
+
+enum PaymentActionType {
+  CAPTURE
+  VOID
+
+  @@map("payment_action_type")
+}
+
+// Allowed transitions live in src/captures/payment-action-lifecycle.ts.
+enum PaymentActionStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+
+  @@map("payment_action_status")
+}
+
+enum PaymentActionFailureCode {
+  DECLINED
+  PROVIDER_UNAVAILABLE
+
+  @@map("payment_action_failure_code")
+}
+
+// A capture or void of a manual-capture payment's authorization (its succeeded attempt). The
+// payment_actions_match_authorization trigger and two partial unique indexes keep at most one in
+// flight and at most one succeeded per payment.
+model PaymentAction {
+  id                String                    @id @default(uuid(7)) @db.Uuid
+  merchantId        String                    @map("merchant_id") @db.Uuid
+  paymentId         String                    @map("payment_id") @db.Uuid
+  // The authorization being captured or voided.
+  attemptId         String                    @map("attempt_id") @db.Uuid
+  type              PaymentActionType
+  // Captures only: at most the authorized amount; any remainder is released.
+  amount            BigInt?
+  status            PaymentActionStatus       @default(PENDING)
+  providerReference String?                   @map("provider_reference") @db.VarChar(100)
+  failureCode       PaymentActionFailureCode? @map("failure_code")
+
+  idempotencyKey     String @map("idempotency_key") @db.VarChar(255)
+  requestFingerprint String @map("request_fingerprint") @db.Char(64)
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  // Set before the provider is first contacted; from then on the action is only looked up.
+  submittedAt DateTime? @map("submitted_at") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant   Merchant       @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  payment    Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt    PaymentAttempt @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  outboxJobs OutboxJob[]
+  events     PaymentEvent[]
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([paymentId])
+  @@map("payment_actions")
 }
 
 // Allowed transitions live in src/refunds/refund-lifecycle.ts.
@@ -291,6 +366,8 @@ enum OutboxJobType {
   PROCESS_REFUND
   RECONCILE_REFUND
   DELIVER_MERCHANT_EVENT
+  PROCESS_PAYMENT_ACTION
+  RECONCILE_PAYMENT_ACTION
 
   @@map("outbox_job_type")
 }
@@ -340,6 +417,8 @@ model OutboxJob {
   refundId        String?              @map("refund_id") @db.Uuid
   // Set only on DELIVER_MERCHANT_EVENT jobs: the event the job delivers.
   merchantEventId String?              @unique @map("merchant_event_id") @db.Uuid
+  // Set only on capture and void jobs, whose attempt is the authorization acted on.
+  paymentActionId String?              @map("payment_action_id") @db.Uuid
   createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
   completedAt     DateTime?            @map("completed_at") @db.Timestamptz(3)
@@ -349,14 +428,17 @@ model OutboxJob {
   webhookEvent  ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
   refund        Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
   merchantEvent MerchantEvent?        @relation(fields: [merchantEventId], references: [id], onDelete: Restrict)
+  paymentAction PaymentAction?        @relation(fields: [paymentActionId], references: [id], onDelete: Restrict)
 
-  // One job of each type per attempt (attempt jobs) or per refund (refund jobs), so re-enqueueing
-  // is a no-op: enforced by the partial unique indexes outbox_jobs_attempt_id_type_key and
-  // outbox_jobs_refund_id_type_key, created in migrations because Prisma cannot express them.
-  // Webhook and delivery jobs are unique per provider event or merchant event instead.
+  // One job of each type per attempt (attempt jobs), per refund (refund jobs) or per payment action
+  // (capture and void jobs), so re-enqueueing is a no-op: enforced by the partial unique indexes
+  // outbox_jobs_attempt_id_type_key, outbox_jobs_refund_id_type_key and
+  // outbox_jobs_payment_action_id_type_key, created in migrations because Prisma cannot express
+  // them. Webhook and delivery jobs are unique per provider event or merchant event instead.
   @@index([attemptId])
   @@index([paymentId])
   @@index([refundId])
+  @@index([paymentActionId])
   @@map("outbox_jobs")
 }
 
@@ -467,6 +549,7 @@ model PaymentEvent {
   paymentId           String                @map("payment_id") @db.Uuid
   attemptId           String?               @map("attempt_id") @db.Uuid
   refundId            String?               @map("refund_id") @db.Uuid
+  paymentActionId     String?               @map("payment_action_id") @db.Uuid
   type                String                @db.VarChar(64)
   source              PaymentEventSource
   paymentStatusBefore PaymentStatus?        @map("payment_status_before")
@@ -483,14 +566,16 @@ model PaymentEvent {
   // Wall-clock time of the write, not of the transaction start, so events order as they happened.
   createdAt           DateTime              @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(3)
 
-  payment      Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
-  attempt      PaymentAttempt?       @relation(fields: [attemptId], references: [id], onDelete: Restrict)
-  refund       Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
-  webhookEvent ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
+  payment       Payment               @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt       PaymentAttempt?       @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  refund        Refund?               @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  paymentAction PaymentAction?        @relation(fields: [paymentActionId], references: [id], onDelete: Restrict)
+  webhookEvent  ProviderWebhookEvent? @relation(fields: [webhookEventId], references: [id], onDelete: Restrict)
 
   @@index([paymentId, createdAt])
   @@index([attemptId])
   @@index([refundId])
+  @@index([paymentActionId])
   @@index([type, createdAt])
   @@map("payment_events")
 }

@@ -8,7 +8,7 @@ import {
 } from '../generated/prisma/enums.js';
 import { enqueueOutboxJob } from '../outbox/outbox-store.js';
 import {
-  PAYMENT_VIEW_INCLUDE,
+  loadPaymentView,
   toPaymentResponse,
 } from '../payments/payment-view.js';
 import { toRefundResponse } from '../refunds/refund-view.js';
@@ -16,32 +16,48 @@ import { toRefundResponse } from '../refunds/refund-view.js';
 export const MerchantEventType = {
   PAYMENT_SUCCEEDED: 'payment.succeeded',
   PAYMENT_FAILED: 'payment.failed',
+  PAYMENT_AUTHORIZED: 'payment.authorized',
+  PAYMENT_CANCELED: 'payment.canceled',
+  // A capture or void the provider refused; the payment stays AUTHORIZED.
+  PAYMENT_CAPTURE_FAILED: 'payment.capture_failed',
+  PAYMENT_VOID_FAILED: 'payment.void_failed',
   REFUND_SUCCEEDED: 'refund.succeeded',
   REFUND_FAILED: 'refund.failed',
 } as const;
+
+const PAYMENT_OUTCOME_EVENTS: Partial<
+  Record<PaymentStatus, MerchantEventType>
+> = {
+  [PaymentStatus.SUCCEEDED]: MerchantEventType.PAYMENT_SUCCEEDED,
+  [PaymentStatus.FAILED]: MerchantEventType.PAYMENT_FAILED,
+  [PaymentStatus.AUTHORIZED]: MerchantEventType.PAYMENT_AUTHORIZED,
+  [PaymentStatus.CANCELED]: MerchantEventType.PAYMENT_CANCELED,
+};
 
 export type MerchantEventType =
   (typeof MerchantEventType)[keyof typeof MerchantEventType];
 
 export const MERCHANT_EVENT_TYPES = Object.values(MerchantEventType);
 
-// Called with the transaction that records a payment's outcome, so the event (and its delivery job)
-// exists exactly when the outcome does. data is the payment as GET /v1/payments/:id would return it.
+// Called with the transaction that records a payment's outcome (an attempt's, or a capture's or
+// void's), so the event and its delivery job exist exactly when the outcome does. Without type, it
+// follows the payment's new status. data is the payment as GET /v1/payments/:id would return it.
 export async function recordPaymentOutcomeEvent(
   tx: Prisma.TransactionClient,
   paymentId: string,
   attemptId: string,
+  type?: MerchantEventType,
 ): Promise<void> {
-  const payment = await tx.payment.findUniqueOrThrow({
-    where: { id: paymentId },
-    include: PAYMENT_VIEW_INCLUDE,
-  });
+  const payment = await loadPaymentView(tx, paymentId);
+  const eventType = type ?? PAYMENT_OUTCOME_EVENTS[payment.status];
+  if (!eventType) {
+    throw new Error(
+      `Payment ${paymentId} is ${payment.status}, not an outcome`,
+    );
+  }
   await recordMerchantEvent(tx, {
     merchantId: payment.merchantId,
-    type:
-      payment.status === PaymentStatus.SUCCEEDED
-        ? MerchantEventType.PAYMENT_SUCCEEDED
-        : MerchantEventType.PAYMENT_FAILED,
+    type: eventType,
     paymentId,
     attemptId,
     data: toPaymentResponse(payment),

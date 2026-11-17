@@ -2,6 +2,8 @@ import { describe, expect, it } from '@jest/globals';
 import {
   MerchantEventDeliveryStatus,
   OutboxErrorCategory,
+  PaymentActionStatus,
+  PaymentActionType,
   OutboxJobStatus,
   OutboxJobType,
   PaymentAttemptStatus,
@@ -76,6 +78,16 @@ const stats: OutboxStats = {
     { status: MerchantEventDeliveryStatus.DELIVERED, count: 9 },
     { status: null, count: 2 },
   ],
+  paymentActions: [
+    {
+      type: PaymentActionType.CAPTURE,
+      status: PaymentActionStatus.SUCCEEDED,
+      count: 3,
+    },
+  ],
+  unresolvedPaymentActions: 0,
+  paymentActionsAwaitingOperator: 0,
+  authorizedPayments: 2,
 };
 
 describe('renderPrometheusMetrics', () => {
@@ -121,6 +133,10 @@ describe('renderPrometheusMetrics', () => {
     expect(output).toContain('payguard_refunds_unresolved 1');
     expect(output).toContain('payguard_merchant_events{status="DELIVERED"} 9');
     expect(output).toContain('payguard_merchant_events{status="none"} 2');
+    expect(output).toContain('payguard_payments_authorized 2');
+    expect(output).toContain(
+      'payguard_payment_actions{type="CAPTURE",status="SUCCEEDED"} 3',
+    );
   });
 
   it('uses only bounded labels, never identifiers', () => {

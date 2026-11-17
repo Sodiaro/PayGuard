@@ -18,6 +18,7 @@ import {
   PaymentEventType,
   recordPaymentEvent,
 } from '../payments/payment-events.js';
+import { capturedAmount } from '../payments/payment-view.js';
 import { RefundNotAllowedError } from './refund-errors.js';
 import { refundEligibility } from './refund-lifecycle.js';
 import { toRefundResponse } from './refund-view.js';
@@ -73,20 +74,31 @@ export class RefundsService {
         );
         if (sameKey) return { refund: sameKey, raced: true };
 
+        // One query per relation: see loadPaymentView.
         const payment = await tx.payment.findUniqueOrThrow({
           where: { id: paymentId },
-          select: {
-            status: true,
-            amount: true,
-            currency: true,
-            attempts: { select: { id: true, status: true } },
-            refunds: { select: { amount: true, status: true } },
-          },
+          select: { status: true, amount: true, currency: true },
         });
+        const attempts = await tx.paymentAttempt.findMany({
+          where: { paymentId },
+          select: { id: true, status: true },
+        });
+        const refunds = await tx.refund.findMany({
+          where: { paymentId },
+          select: { amount: true, status: true },
+        });
+        const actions = await tx.paymentAction.findMany({
+          where: { paymentId },
+          select: { type: true, status: true, amount: true },
+        });
+        // Only what was captured can be refunded: less than the amount after a partial capture.
         const eligibility = refundEligibility(
-          payment,
-          payment.attempts,
-          payment.refunds,
+          {
+            status: payment.status,
+            amount: capturedAmount({ ...payment, actions }) ?? payment.amount,
+          },
+          attempts,
+          refunds,
           request.amount === undefined ? null : BigInt(request.amount),
         );
         if (!eligibility.eligible) {

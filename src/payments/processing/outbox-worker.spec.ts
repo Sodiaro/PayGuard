@@ -22,6 +22,7 @@ const job: ClaimedJob = {
   webhookEventId: null,
   refundId: null,
   merchantEventId: null,
+  paymentActionId: null,
   reclaimed: false,
 };
 
@@ -39,6 +40,7 @@ function fakeOutbox(claim: () => Promise<ClaimedJob[]>) {
     claim,
     enqueueStaleReconciliations: () => Promise.resolve(0),
     enqueueStaleRefundReconciliations: () => Promise.resolve(0),
+    enqueueStaleActionReconciliations: () => Promise.resolve(0),
     recordWorkerHeartbeat: (
       _id: string,
       progress: { jobsFinished: number },
